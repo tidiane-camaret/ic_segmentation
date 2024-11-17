@@ -1,4 +1,5 @@
 """"
+Evaluating the SegGPT model on an in context segmentation task.
 https://github.com/baaivision/Painter/blob/main/SegGPT/SegGPT_inference/README.md
 """
 
