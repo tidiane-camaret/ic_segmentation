@@ -44,7 +44,7 @@ def get_args_parser():
     parser.add_argument('--device', type=str, help='cuda or cpu',
                         default='cuda')
     parser.add_argument('--output_dir', type=str, help='path to output',
-                        default='./')
+                        default='data/')
     return parser.parse_args()
 
 
@@ -65,6 +65,8 @@ if __name__ == '__main__':
     device = torch.device(args.device)
     model = prepare_model(args.ckpt_path, args.model, args.seg_type).to(device)
     print('Model loaded.')
+    args.prompt_image = [args.prompt_image]
+    args.prompt_target = [args.prompt_target]
 
     assert args.input_image or args.input_video and not (args.input_image and args.input_video)
     if args.input_image is not None:
