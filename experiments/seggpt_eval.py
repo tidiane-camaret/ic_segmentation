@@ -2,6 +2,9 @@
 Request cluster ressources 
 srun -p ml_gpu-rtx2080 --time=3:00:00 --pty bash
 
+activate environment 
+source .venv/bin/activate
+
 Evaluating the SegGPT model on an in context segmentation task.
 https://github.com/baaivision/Painter/blob/main/SegGPT/SegGPT_inference/README.md
 

@@ -19,3 +19,12 @@ def display_img_and_label (img, labels, slices=None):
         ax[0].axis('off')
         ax[1].axis('off')
     plt.show()
+
+
+def dice_coefficient(pred, target):
+    """Calculate Dice coefficient between prediction and target masks."""
+    smooth = 1e-5
+    pred = pred.flatten()
+    target = target.flatten()
+    intersection = (pred * target).sum()
+    return (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
