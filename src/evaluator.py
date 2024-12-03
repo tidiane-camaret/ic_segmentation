@@ -36,25 +36,18 @@ class SegmentationEvaluator:
         ])
 
     def dice_coefficient(self, pred, target):
-        """Calculate Dice coefficient.
+        """Calculate Dice coefficient ensuring same sizes."""
+        # Convert to numpy arrays
+        pred = np.array(pred)
+        target = np.array(target)
         
-        Args:
-            pred: Prediction mask (PIL Image or numpy array)
-            target: Target mask (PIL Image or numpy array)
-        """
-        # Convert to PIL if numpy arrays
-        if isinstance(pred, np.ndarray):
-            pred = Image.fromarray(pred.astype(np.uint8))
-        if isinstance(target, np.ndarray):
-            target = Image.fromarray(target.astype(np.uint8))
+        # If prediction is RGB, convert to grayscale by taking first channel
+        if len(pred.shape) == 3:
+            pred = pred[:, :, 0]  # Take first channel
         
-        # Ensure same size
-        target_size = target.size
-        pred = pred.resize(target_size, Image.NEAREST)
-        
-        # Convert to binary numpy arrays
-        pred = np.array(pred).astype(bool)
-        target = np.array(target).astype(bool)
+        # Convert to boolean
+        pred = pred.astype(bool)
+        target = target.astype(bool)
         
         # Flatten arrays
         pred = pred.flatten()
@@ -64,7 +57,44 @@ class SegmentationEvaluator:
         smooth = 1e-5
         intersection = (pred & target).sum()
         return (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
-
+    
+    def create_comparison_image(self, original_img, true_mask, pred_mask):
+        """Create a side-by-side comparison image.
+        
+        Args:
+            original_img: Path or PIL Image of the original image
+            true_mask: Path or PIL Image of the ground truth mask
+            pred_mask: PIL Image of the predicted mask
+        """
+        # Load images if paths are provided
+        if isinstance(original_img, (str, Path)):
+            original_img = Image.open(original_img).convert('RGB')
+        if isinstance(true_mask, (str, Path)):
+            true_mask = Image.open(true_mask).convert('L')
+        
+        # Convert masks to RGB for visualization
+        true_mask_rgb = Image.merge('RGB', (true_mask, true_mask, true_mask))
+        if pred_mask.mode != 'RGB':
+            pred_mask_rgb = Image.merge('RGB', (pred_mask, pred_mask, pred_mask))
+        else:
+            pred_mask_rgb = pred_mask
+        
+        # Ensure all images are the same size
+        width, height = original_img.size
+        true_mask_rgb = true_mask_rgb.resize((width, height), Image.NEAREST)
+        pred_mask_rgb = pred_mask_rgb.resize((width, height), Image.NEAREST)
+        
+        # Create a new image with three images side by side
+        new_width = width * 3
+        comparison = Image.new('RGB', (new_width, height))
+        
+        # Paste the images
+        comparison.paste(original_img, (0, 0))
+        comparison.paste(true_mask_rgb, (width, 0))
+        comparison.paste(pred_mask_rgb, (width * 2, 0))
+        
+        return comparison
+        
     def evaluate_pair(self, input_path, prompt_path, prompt_mask_path):
         """Evaluate a single test case."""
         # Load images
@@ -107,40 +137,50 @@ class SegmentationEvaluator:
                     
                     prompt_mask_path = dataset_path / 'masks' / prompt_image.with_suffix('.png').name
                     
-                    try:
-                        # Run prediction
-                        pred_mask, inf_time = self.evaluate_pair(
-                            str(test_image),
-                            str(prompt_image),
-                            str(prompt_mask_path)
-                        )
-                        
-                        # Calculate metrics
-                        dice = self.dice_coefficient(pred_mask, true_mask)
-                        
-                        # Store results
-                        image_metrics['dice_scores'].append(dice)
-                        image_metrics['inference_times'].append(inf_time)
-                        
-                        # Log to wandb
-                        wandb.log({
-                            'batch/dice_score': dice,
-                            'batch/inference_time': inf_time,
-                            'batch/test_image': test_image.name,
-                            'batch/prompt_image': prompt_image.name
-                        })
-                        
-                        # Save prediction if requested
-                        if results_dir:
-                            pred_path = results_dir / f"{test_image.stem}_prompt{j}.png"
-                            if isinstance(pred_mask, np.ndarray):
-                                pred_mask = Image.fromarray(pred_mask.astype(np.uint8))
-                            pred_mask.save(pred_path)
+                    #try:
+                    # Run prediction
+                    pred_mask, inf_time = self.evaluate_pair(
+                        str(test_image),
+                        str(prompt_image),
+                        str(prompt_mask_path)
+                    )
                     
+                    # Calculate metrics
+                    dice = self.dice_coefficient(pred_mask, true_mask)
+                    
+                    # Store results
+                    image_metrics['dice_scores'].append(dice)
+                    image_metrics['inference_times'].append(inf_time)
+                    
+                    comparison = self.create_comparison_image(
+                        test_image,
+                        test_mask_path,
+                        pred_mask
+                    )
+                    
+                    # Log to wandb
+                    wandb.log({
+                        'batch/dice_score': dice,
+                        'batch/inference_time': inf_time,
+                        'batch/test_image': test_image.name,
+                        'batch/prompt_image': prompt_image.name,
+                        'visualizations': wandb.Image(
+                            comparison,
+                            caption=f"Left: Original, Middle: Ground Truth, Right: Prediction (Dice: {dice:.3f})"
+                        )
+                    })
+                    
+                    # Save prediction if requested
+                    if results_dir:
+                        pred_path = results_dir / f"{test_image.stem}_prompt{j}.png"
+                        if isinstance(pred_mask, np.ndarray):
+                            pred_mask = Image.fromarray(pred_mask.astype(np.uint8))
+                        pred_mask.save(pred_path)
+                    """
                     except Exception as e:
                         print(f"Error processing {test_image.name} with prompt {prompt_image.name}: {str(e)}")
                         continue
-                
+                    """
                 # Only compute summary if we have results
                 if image_metrics['dice_scores']:
                     image_summary = {

@@ -17,7 +17,7 @@ seggpt_model = load_seggpt_model(
 )
     
 evaluator = SegmentationEvaluator(
-    model=seggpt_model, #baseline_model, #
+    model=seggpt_model, #, #baseline_model, 
     project_name="ic_segmentation",
     #entity="your_username"
 )
