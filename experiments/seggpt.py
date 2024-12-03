@@ -1,4 +1,10 @@
 """"
+Request cluster ressources 
+srun -p ml_gpu-rtx2080 --time=3:00:00 --pty bash
+
+activate environment 
+source .venv/bin/activate
+
 Evaluating the SegGPT model on an in context segmentation task.
 https://github.com/baaivision/Painter/blob/main/SegGPT/SegGPT_inference/README.md
 
@@ -30,21 +36,21 @@ def get_args_parser():
     parser.add_argument('--model', type=str, help='dir to ckpt',
                         default='seggpt_vit_large_patch16_input896x448')
     parser.add_argument('--input_image', type=str, help='path to input image to be tested',
-                        default='data/slice_30_img.jpg')
+                        default='data/mni_t1/images/slice_30.jpg')
     parser.add_argument('--input_video', type=str, help='path to input video to be tested',
                         default=None)
     parser.add_argument('--num_frames', type=int, help='number of prompt frames in video',
                         default=0)
     parser.add_argument('--prompt_image', type=str, nargs='+', help='path to prompt image',
-                        default='data/slice_31_img.jpg')
+                        default='data/mni_t1/images/slice_31.jpg')
     parser.add_argument('--prompt_target', type=str, nargs='+', help='path to prompt target',
-                        default='data/slice_31_labels.png')
+                        default='data/mni_t1/masks/slice_31.png')
     parser.add_argument('--seg_type', type=str, help='embedding for segmentation types', 
                         choices=['instance', 'semantic'], default='instance')
     parser.add_argument('--device', type=str, help='cuda or cpu',
                         default='cuda')
     parser.add_argument('--output_dir', type=str, help='path to output',
-                        default='data/')
+                        default='results/')
     return parser.parse_args()
 
 

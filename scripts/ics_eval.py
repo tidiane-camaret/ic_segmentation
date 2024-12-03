@@ -5,12 +5,19 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
-from src import SegmentationEvaluator, CopyPromptModel
+from src.evaluator import SegmentationEvaluator
+from src.segmentation_models import CopyPromptModel, load_seggpt_model
+
 
 # Use the baseline CopyPromptModel
 baseline_model = CopyPromptModel()
+seggpt_model = load_seggpt_model(
+    checkpoint_path='/home/ndirt/dev/radiology/Painter/SegGPT/SegGPT_inference/seggpt_vit_large.pth',
+    device='cuda'
+)
+    
 evaluator = SegmentationEvaluator(
-    model=baseline_model,
+    model=seggpt_model, #baseline_model, #
     project_name="ic_segmentation",
     #entity="your_username"
 )

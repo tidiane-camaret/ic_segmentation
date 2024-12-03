@@ -3,55 +3,9 @@ import numpy as np
 from pathlib import Path
 import time
 from PIL import Image
-from abc import ABC, abstractmethod
 
-class SegmentationModel(ABC):
-    """Abstract base class for segmentation models."""
-    
-    @abstractmethod
-    def predict(self, input_img, prompt_img, prompt_mask):
-        """Predict segmentation mask for input image given a prompt.
-        
-        Args:
-            input_img: PIL Image or numpy array of image to segment
-            prompt_img: PIL Image or numpy array of prompt image
-            prompt_mask: PIL Image or numpy array of prompt mask
-            
-        Returns:
-            numpy array: Predicted segmentation mask
-        """
-        pass
+from src.segmentation_models import SegmentationModel
 
-class CopyPromptModel(SegmentationModel):
-    """Baseline model that simply returns the prompt mask."""
-    
-    def predict(self, input_img, prompt_img, prompt_mask):
-        """Return the prompt mask resized to input image size."""
-        # Ensure input_img is PIL Image
-        if isinstance(input_img, np.ndarray):
-            input_img = Image.fromarray(input_img)
-            
-        # Ensure prompt_mask is PIL Image
-        if isinstance(prompt_mask, np.ndarray):
-            prompt_mask = Image.fromarray(prompt_mask.astype(np.uint8))
-            
-        # Get target size
-        target_size = input_img.size  # PIL size is (width, height)
-        
-        # Resize prompt mask to match input image size
-        return prompt_mask.resize(target_size, Image.NEAREST)
-
-    
-# Later, when SegGPT is ready, create a SegGPT wrapper:
-class SegGPTModel(SegmentationModel):
-    def __init__(self, model, device='cuda'):
-        self.model = model
-        self.device = device
-    
-    def predict(self, input_img, prompt_img, prompt_mask):
-        # Implement SegGPT-specific processing here
-        # This method should handle all the preprocessing and postprocessing
-        pass
 
 class SegmentationEvaluator:
     def __init__(self, model: SegmentationModel, project_name="segmentation-evaluation", 
