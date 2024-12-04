@@ -16,12 +16,10 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+3. Install dependencies
 
-4. For SegGPT support, add the (cloned Painter repo)[https://github.com/baaivision/Painter/] to your Python path:
+
+4. For SegGPT support, add the [cloned Painter repo](https://github.com/baaivision/Painter/) to your Python path:
 ```bash
 export PYTHONPATH="/path/to/Painter/SegGPT/SegGPT_inference:$PYTHONPATH"
 ```
@@ -93,10 +91,3 @@ srun -p ml_gpu-rtx2080 --time=3:00:00 --pty bash
 
 MIT
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-[Your citation info]
-```
