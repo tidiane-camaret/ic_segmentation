@@ -54,10 +54,10 @@ Integration with the SegGPT model for in-context segmentation.
 1. Data Preparation:
 ```bash
 # Explore the NIFTI files
-python scripts/read_nii_files.ipynb
+scripts/read_nii_files.ipynb
 
 # Create the evaluation dataset
-python scripts/create_dataset.ipynb
+scripts/create_dataset.ipynb
 ```
 
 2. Model Evaluation:
