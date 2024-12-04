@@ -88,8 +88,12 @@ class SegGPTModel(SegmentationModel):
             mode='nearest',
         ).permute(0, 2, 3, 1)[0].cpu().numpy()
         
-        # Return only the mask
-        return Image.fromarray((output * 255).astype(np.uint8))
+        # Convert to binary mask
+        output = output.mean(axis=-1)  # Average across RGB channels if present
+        output = (output > 0.5).astype(np.uint8) * 255  # Threshold and convert to 0-255 range
+        
+        # Return binary mask
+        return Image.fromarray(output, mode='L')  # 'L' mode for single-channel grayscale
 
 def load_seggpt_model(checkpoint_path, model_arch='seggpt_vit_large_patch16_input896x448', 
                      seg_type='instance', device='cuda'):

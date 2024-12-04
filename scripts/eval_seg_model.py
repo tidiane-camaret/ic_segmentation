@@ -11,6 +11,8 @@ from src.segmentation_models import CopyPromptModel, load_seggpt_model
 
 # Use the baseline CopyPromptModel
 baseline_model = CopyPromptModel()
+
+# Load the SegGPT model
 seggpt_model = load_seggpt_model(
     checkpoint_path='/home/ndirt/dev/radiology/Painter/SegGPT/SegGPT_inference/seggpt_vit_large.pth',
     device='cuda'
@@ -19,7 +21,6 @@ seggpt_model = load_seggpt_model(
 evaluator = SegmentationEvaluator(
     model=seggpt_model, #, #baseline_model, 
     project_name="ic_segmentation",
-    #entity="your_username"
 )
 
 # Run evaluation
