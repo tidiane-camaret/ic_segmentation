@@ -1,28 +1,102 @@
+# In-Context Medical Image Segmentation
 
-Request cluster ressources 
-srun -p ml_gpu-rtx2080 --time=3:00:00 --pty bash
+This repository contains a framework for evaluating and comparing different approaches to in-context medical image segmentation. The framework supports various models including simple baselines, fine-tuned models, and large foundation models like SegGPT.
 
-activate environment 
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/tidiane-camaret/ic_segmentation
+cd ic_segmentation
+```
+
+2. Create and activate a virtual environment:
+```bash
+python -m venv .venv
 source .venv/bin/activate
+```
 
-Evaluating the SegGPT model on an in context segmentation task.
-https://github.com/baaivision/Painter/blob/main/SegGPT/SegGPT_inference/README.md
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-run original script via command line:
-python seggpt_inference.py --input_image examples/brain_imgs/slice_31_img.jpg --prompt_image examples/brain_imgs/slice_30_img.jpg --prompt_target examples/brain_imgs/slice_30_labels.png --output_dir ./ --device cpu
+4. For SegGPT support, add the (cloned Painter repo)[https://github.com/baaivision/Painter/] to your Python path:
+```bash
+export PYTHONPATH="/path/to/Painter/SegGPT/SegGPT_inference:$PYTHONPATH"
+```
 
-export the path to the SegGPT_inference folder in order to import the necessary modules:
-export PYTHONPATH="/home/ndirt/dev/radiology/Painter/SegGPT/SegGPT_inference:$PYTHONPATH"
+## Project Structure
 
+```
+.
+├── src/                    # Source code
+│   ├── evaluator.py       # Evaluation framework
+│   └── segmentation_models.py            # Model implementations
+├── scripts/               # Utility scripts
+│   ├── read_nii_files.ipynb  # Data exploration
+│   ├── create_dataset.ipynb  # Dataset creation
+│   └── eval_seg_model.py  # Model evaluation
+└── data/                  # Dataset directory
+```
 
-scripts/read_nii_files.py
-read nii files and explore the data
+## Supported Models
 
-scripts/create_dataset.py
-create a dataset from the nii files (11 image/mask pairs)
+### CopyPrompt
+A baseline model that simply copies the prompt mask as the prediction.
 
-scripts/eval_seg_model.py
-evaluate multiple models on the dataset
-Copyprompt : simply copy the prompt mask as the output mask
-FineTunedmodel : fine-tuned a pre-trained segmentation model on the prompt image/mask pair
-SegGPTmodel : use the SegGPT model to generate the output mask in-context
+### FineTunedModel
+A model that fine-tunes a pre-trained segmentation model on each prompt image/mask pair before making predictions.
+
+### SegGPT
+Integration with the SegGPT model for in-context segmentation.
+
+## Usage
+
+1. Data Preparation:
+```bash
+# Explore the NIFTI files
+python scripts/read_nii_files.ipynb
+
+# Create the evaluation dataset
+python scripts/create_dataset.ipynb
+```
+
+2. Model Evaluation:
+```bash
+# Run evaluation on all models
+python scripts/eval_seg_model.py
+```
+
+## Evaluation Metrics
+
+The framework provides:
+- Dice coefficient
+- Inference time measurements
+- Visualization of results
+- Integration with Weights & Biases for experiment tracking : https://wandb.ai/tidiane/ic_segmentation/workspace
+
+## Computing Resources
+
+For GPU access on the cluster:
+```bash
+srun -p ml_gpu-rtx2080 --time=3:00:00 --pty bash
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create a new branch for your feature
+3. Submit a pull request
+
+## License
+
+MIT
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+[Your citation info]
+```
