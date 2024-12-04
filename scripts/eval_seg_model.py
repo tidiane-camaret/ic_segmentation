@@ -6,20 +6,29 @@ project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 from src.evaluator import SegmentationEvaluator
-from src.segmentation_models import CopyPromptModel, load_seggpt_model
+from src.segmentation_models import CopyPromptModel, load_seggpt_model, FinetunedModel
+from transformers import AutoModelForSemanticSegmentation
 
+"""
+# baseline CopyPromptModel
+model = CopyPromptModel()
 
-# Use the baseline CopyPromptModel
-baseline_model = CopyPromptModel()
-
-# Load the SegGPT model
-seggpt_model = load_seggpt_model(
+# SegGPT model
+model = load_seggpt_model(
     checkpoint_path='/home/ndirt/dev/radiology/Painter/SegGPT/SegGPT_inference/seggpt_vit_large.pth',
     device='cuda'
 )
+"""
+# Finetuned model
+base_model = AutoModelForSemanticSegmentation.from_pretrained("nvidia/mit-b0")
+model = FinetunedModel(
+    model=base_model,
+    device="cuda",
+    num_epochs=50  # Adjust based on needs
+)
     
 evaluator = SegmentationEvaluator(
-    model=seggpt_model, #, #baseline_model, 
+    model=model, 
     project_name="ic_segmentation",
 )
 

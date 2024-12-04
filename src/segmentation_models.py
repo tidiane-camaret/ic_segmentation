@@ -1,9 +1,16 @@
 import numpy as np
 from PIL import Image
 from abc import ABC, abstractmethod
+from copy import deepcopy
+
 import torch 
-from seggpt_engine import run_one_image
 import torch.nn.functional as F
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import TrainingArguments, Trainer
+from transformers import AutoImageProcessor
+
+from seggpt_engine import run_one_image
 
 class SegmentationModel(ABC):
     """Abstract base class for segmentation models."""
@@ -123,3 +130,109 @@ def load_seggpt_model(checkpoint_path, model_arch='seggpt_vit_large_patch16_inpu
     model = model.to(device)
     
     return SegGPTModel(model, device)
+
+class SegmentationDataset(Dataset):
+    """Dataset for segmentation image-mask pairs."""
+    def __init__(self, images, masks, image_processor):
+        """
+        Args:
+            images: List of PIL Images
+            masks: List of PIL Images (masks)
+            image_processor: HuggingFace image processor
+        """
+        assert len(images) == len(masks), "Number of images and masks must match"
+        self.image_processor = image_processor
+        self.processed_pairs = []
+        
+        # Process all image-mask pairs at initialization
+        for img, mask in zip(images, masks):
+            inputs = self.image_processor(img, mask, return_tensors="pt")
+            self.processed_pairs.append({
+                "pixel_values": inputs.pixel_values.squeeze(0),
+                "labels": inputs.labels.squeeze(0)
+            })
+
+    def __len__(self):
+        return len(self.processed_pairs)
+
+    def __getitem__(self, idx):
+        return self.processed_pairs[idx]
+
+class FinetunedModel(SegmentationModel):
+    def __init__(self, model, device='cuda', num_epochs=50):
+        self.base_model = model
+        self.device = device
+        self.num_epochs = num_epochs
+        
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            "nvidia/mit-b0",
+            reduce_labels=True
+        )
+
+    def finetune(self, images, masks):
+        """
+        Finetune model on image-mask pairs.
+        
+        Args:
+            images: List of PIL Images or single PIL Image
+            masks: List of PIL Images or single PIL Image
+        """
+        # Convert single images to lists
+        if not isinstance(images, list):
+            images = [images]
+        if not isinstance(masks, list):
+            masks = [masks]
+            
+        # Create dataset
+        train_dataset = SegmentationDataset(images, masks, self.image_processor)
+
+        training_args = TrainingArguments(
+            output_dir="temp_finetuning",
+            learning_rate=6e-5,
+            num_train_epochs=self.num_epochs,
+            per_device_train_batch_size=1,
+            save_strategy="no",
+            remove_unused_columns=False,
+            logging_steps=10,
+            report_to="none"  # Disable wandb logging for finetuning
+        )
+
+        # Clone base model for this specific finetuning
+        model = deepcopy(self.base_model)
+        model.to(self.device)
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+        )
+
+        trainer.train()
+        return model
+
+    def predict(self, input_img, prompt_img, prompt_mask):
+        """Finetune on prompt and predict on input image."""
+        finetuned_model = self.finetune(prompt_img, prompt_mask)
+        
+        # Prepare input for inference
+        encoding = self.image_processor(input_img, return_tensors="pt")
+        pixel_values = encoding.pixel_values.to(self.device)
+
+        # Run inference
+        with torch.no_grad():
+            outputs = finetuned_model(pixel_values=pixel_values)
+            logits = outputs.logits.cpu()
+
+        # Post-process
+        upsampled_logits = nn.functional.interpolate(
+            logits,
+            size=input_img.size[::-1],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # Convert to binary mask
+        pred_seg = upsampled_logits.argmax(dim=1)[0]
+        pred_seg = (pred_seg > 0).numpy().astype(np.uint8) * 255
+        
+        return Image.fromarray(pred_seg, mode='L')
