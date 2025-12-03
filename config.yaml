@@ -1,0 +1,9 @@
+nora: 
+
+  DATA_DIR: "/nfs/data/nii/data1/Analysis/GPUnet/ANALYSIS_incontext/SegFM3D/data"
+  RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
+
+
+meta: 
+
+  
