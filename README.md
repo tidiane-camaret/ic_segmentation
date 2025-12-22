@@ -49,7 +49,12 @@ A model that fine-tunes a pre-trained segmentation model on each prompt image/ma
 ### SegGPT
 Integration with the SegGPT model for in-context segmentation.
 
+### Neuroverse3D
+Memory-efficient In-Context Learning model for 3D medical imaging. Supports training and evaluation on volumetric data. See [Neuroverse3D Training Guide](docs/NEUROVERSE3D_TRAINING.md) for detailed instructions.
+
 ## Usage
+
+### Evaluation
 
 1. Data Preparation:
 ```bash
@@ -65,6 +70,37 @@ scripts/create_dataset.ipynb
 # Run evaluation on all models
 python scripts/eval_seg_model.py
 ```
+
+### Training Neuroverse3D
+
+1. Prepare data in nnUNet format:
+```bash
+python scripts/prepare_neuroverse3d_data.py \
+    --input-dir /path/to/raw/data \
+    --output-dir data/neuroverse3d \
+    --dataset-name MyDataset
+```
+
+2. Stage 1 Training (fixed context):
+```bash
+python scripts/train_neuroverse3d.py \
+    --stage 1 \
+    --data-dir data/neuroverse3d \
+    --context-size 3 \
+    --epochs 50 \
+    --lr 0.00001
+```
+
+3. Stage 2 Training (variable context):
+```bash
+python scripts/train_neuroverse3d.py \
+    --stage 2 \
+    --checkpoint checkpoints/neuroverse3d/stage1/best.ckpt \
+    --epochs 100 \
+    --lr 0.000002
+```
+
+For detailed training instructions, see the [Neuroverse3D Training Guide](docs/NEUROVERSE3D_TRAINING.md).
 
 ## Evaluation Metrics
 
