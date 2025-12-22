@@ -11,3 +11,10 @@ wheels/
 
 wandb/
 temp_finetuning/
+
+# Mock and generated data
+data/mock_raw/
+data/mock_neuroverse3d/
+
+# Training checkpoints
+checkpoints/
