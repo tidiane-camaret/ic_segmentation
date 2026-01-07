@@ -11,7 +11,6 @@ from utils.dataloading import structure_data
 from medverse.lightning_model import LightningModel
 import numpy as np
 import nibabel as nib
-from nilearn.image import resample_img
 from pathlib import Path
 from src.config import config
 from src.utils import load_seg_data
@@ -60,7 +59,7 @@ for task_name, case_list in tasks_dict.items():
     target_in = model.normalize_3d_volume(target_in)
     #target_out = model.normalize_3d_volume(target_out)
     context_in = model.normalize_3d_volume(context_in)
-    #context_out = model.normalize_3d_volume(context_out)
+    context_out = model.normalize_3d_volume(context_out)
 
 
     # Inference
@@ -134,7 +133,7 @@ for task_name, case_list in tasks_dict.items():
 
     # save dsc and nsd to a df  
     import pandas as pd
-    results_path = Path(config["RESULTS_DIR"]) / 'eval.csv'
+    results_path = Path("results") / 'eval.csv'
 
     # Load existing results or create new DataFrame
     if results_path.exists():
