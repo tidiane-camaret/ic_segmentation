@@ -4,17 +4,24 @@ import wandb
 import time
 from pathlib import Path
 from src.config import config
+from src.totalseg_dataloader import get_dataloader
 
-sys.path.append("/nfs/norasys/notebooks/camaret/repos/Medverse")
-from medverse.data.totalseg_dataloader import get_dataloader
-
-# Define organs (from your scan results)
+# Define organs
 organ_list = [
     "spinal_cord",
     "autochthon_left",
     "autochthon_right",
     "aorta",
     "esophagus",
+    "lung_upper_lobe_left",
+    "lung_upper_lobe_right",
+    "costal_cartilages",
+    "liver", 
+    "heart",
+    "colon",
+    "stomach",
+    "femur_left",
+    "femur_right",
 ]
 
 
@@ -65,7 +72,7 @@ val_loader = get_dataloader(
     num_workers=4,
     mode='val',
     shuffle=False,
-    random_context=False,        # Use same contexts for reproducibility
+    random_context=True,        # Use same contexts for reproducibility
 )
 
 from medverse.lightning_model import LightningModel
@@ -154,7 +161,7 @@ for i, batch in enumerate(val_loader):
 
         wandb.log({
             "organ": batch["organs"][0],
-            "target_case_id": batch["target_case_id"][0],
+            "target_case_id": batch["target_case_ids"][0],
             "gt_voxel_count": target_out.sum().item(),
             "dice": dice.item(),
             "inference_time_sec": end_time - start_time,
@@ -173,5 +180,3 @@ for i, batch in enumerate(val_loader):
                 )
         })
 
-    if i >= 1:  # Limit to first 10 samples for demo
-        break
