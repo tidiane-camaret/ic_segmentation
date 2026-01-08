@@ -5,31 +5,32 @@ This dataloader supports in-context learning by sampling k context examples
 for each target image.
 """
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from pathlib import Path
-from typing import List, Optional, Tuple, Dict
-import nibabel as nib
 import random
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import nibabel as nib
+import numpy as np
+import torch
 from monai.transforms import (
     Compose,
-    LoadImaged,
-    EnsureChannelFirstd,
-    Spacingd,
-    ScaleIntensityRanged,
-    CropForegroundd,
-    SpatialPadd,
-    RandSpatialCropd,
-    Resized,
-    ToTensord,
-    EnsureChannelFirst,
-    Spacing,
-    ScaleIntensityRange,
     CropForeground,
-    SpatialPad,
+    CropForegroundd,
+    EnsureChannelFirst,
+    EnsureChannelFirstd,
+    LoadImaged,
+    RandSpatialCropd,
     Resize,
+    Resized,
+    ScaleIntensityRange,
+    ScaleIntensityRanged,
+    Spacing,
+    Spacingd,
+    SpatialPad,
+    SpatialPadd,
+    ToTensord,
 )
+from torch.utils.data import DataLoader, Dataset
 
 
 class TotalSegmentatorDataset(Dataset):
@@ -92,7 +93,7 @@ class TotalSegmentatorDataset(Dataset):
         spacing: Tuple[float, float, float] = (1.5, 1.5, 1.5),
         intensity_range: Tuple[float, float] = (-200, 300),  # HU units for CT
         cache_rate: float = 0.0,
-        mode: str = 'train',
+        split: str = 'train',
         random_context: bool = True,
         fixed_context_indices: Optional[List[int]] = None,
         num_samples: Optional[int] = None,
@@ -108,7 +109,7 @@ class TotalSegmentatorDataset(Dataset):
             spacing: Target voxel spacing in mm
             intensity_range: HU window for intensity normalization
             cache_rate: Fraction of dataset to cache in memory (0.0 = no cache)
-            mode: 'train', 'val', or 'test'
+            split: 'train', 'val', or 'test'
             random_context: If True, randomly sample context. If False, use fixed indices.
             fixed_context_indices: If provided and random_context=False, use these indices
             num_samples: If provided, limit dataset to this many samples
@@ -119,7 +120,7 @@ class TotalSegmentatorDataset(Dataset):
         self.context_size = context_size
         self.image_size = image_size
         self.spacing = spacing
-        self.mode = mode
+        self.split = split
         self.random_context = random_context
         self.fixed_context_indices = fixed_context_indices
 
@@ -133,6 +134,12 @@ class TotalSegmentatorDataset(Dataset):
             f for f in self.root_dir.iterdir()
             if f.is_dir() and f.name.startswith('s')
         ])
+        # keep cases from split
+        desc_df_path = self.root_dir / "meta.csv"
+        import pandas as pd
+        df = pd.read_csv(desc_df_path, sep=';')
+        split_case_ids = df["image_id"][df["split"]==split].tolist()
+        self.case_folders = [f for f in self.case_folders if f.name in split_case_ids]
 
         if num_samples is not None:
             self.case_folders = self.case_folders[:num_samples]
@@ -154,6 +161,16 @@ class TotalSegmentatorDataset(Dataset):
             if c.name in all_valid_case_ids
         ]
         print(f"Filtered to {len(self.valid_cases)} cases with at least one organ from organ_list")
+
+        # Build list of all valid (case_id, organ) pairs
+        # This ensures we process ALL organs for ALL cases in one epoch
+        self.case_organ_pairs = []
+        for case_folder in self.valid_cases:
+            case_id = case_folder.name
+            for organ in self.organ_list:
+                if case_id in self.organ_to_cases.get(organ, []):
+                    self.case_organ_pairs.append((case_id, organ))
+        print(f"Created {len(self.case_organ_pairs)} (case, organ) pairs for complete coverage")
 
         # Setup transforms
         self.transforms = self._get_transforms(intensity_range)
@@ -272,7 +289,7 @@ class TotalSegmentatorDataset(Dataset):
         return available_organs
 
     def __len__(self) -> int:
-        return len(self.valid_cases)
+        return len(self.case_organ_pairs)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -288,17 +305,9 @@ class TotalSegmentatorDataset(Dataset):
             - 'context_case_ids': List[str]
             - 'organ': str - The organ being segmented
         """
-        target_case_folder = self.valid_cases[idx]
-        target_case_id = target_case_folder.name
-
-        # Get available organs in this target case
-        available_organs = self._get_available_organs(target_case_folder)
-
-        if not available_organs:
-            raise RuntimeError(f"No valid organs from organ_list found in case {target_case_id}")
-
-        # Randomly sample one organ
-        sampled_organ = random.choice(available_organs)
+        # Look up the (case_id, organ) pair for this index
+        target_case_id, sampled_organ = self.case_organ_pairs[idx]
+        target_case_folder = self.root_dir / target_case_id
 
         # Load target case with sampled organ
         target_data = self._load_single_case(target_case_folder, sampled_organ)
@@ -439,7 +448,7 @@ def get_dataloader(
     image_size: Optional[Tuple[int, int, int]] = (128, 128, 128),
     spacing: Tuple[float, float, float] = (1.5, 1.5, 1.5),
     num_workers: int = 4,
-    mode: str = 'train',
+    split: str = 'train',
     shuffle: bool = True,
     **dataset_kwargs
 ) -> DataLoader:
@@ -455,7 +464,7 @@ def get_dataloader(
         image_size: Target spatial dimensions. If None, contexts are resized to match each target.
         spacing: Target voxel spacing
         num_workers: Number of data loading workers
-        mode: 'train', 'val', or 'test'
+        split: 'train', 'val', or 'test'
         shuffle: Whether to shuffle data
         **dataset_kwargs: Additional arguments for TotalSegmentatorDataset
 
@@ -469,7 +478,7 @@ def get_dataloader(
         context_size=context_size,
         image_size=image_size,
         spacing=spacing,
-        mode=mode,
+        split=split,
         **dataset_kwargs
     )
 
@@ -483,119 +492,3 @@ def get_dataloader(
     )
 
     return dataloader
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Example: Create dataloader for liver and kidney segmentation
-    # Each sample will focus on ONE organ at a time
-    organ_list = [
-        "liver",
-        "kidney_left",
-        "kidney_right",
-        "spleen",
-    ]
-
-    # Optional: Load empty segmentations to exclude cases with zero voxels
-    # from medverse.data.totalseg_utils import scan_dataset
-    # stats = scan_dataset("/path/to/TotalSegmentator/dataset")
-    # empty_segs = stats['empty_segmentations']
-
-    # Example empty_segmentations dict:
-    # empty_segs = {
-    #     'liver': ['s0010', 's0015'],  # Cases where liver is empty
-    #     'kidney_left': ['s0020'],     # Cases where kidney_left is empty
-    # }
-
-    # Test dataset
-    dataset = TotalSegmentatorDataset(
-        root_dir="/path/to/TotalSegmentator/dataset",
-        organ_list=organ_list,
-        empty_segmentations=None,  # Can provide to exclude empty cases
-        context_size=3,
-        image_size=(128, 128, 128),
-        spacing=(1.5, 1.5, 1.5),
-        mode='train',
-        num_samples=10,  # Use only 10 samples for testing
-    )
-
-    print(f"Dataset size: {len(dataset)}")
-
-    # Test single sample
-    sample = dataset[0]
-    print("\nSample shapes:")
-    print(f"  target_in: {sample['target_in'].shape}")
-    print(f"  context_in: {sample['context_in'].shape}")
-    print(f"  context_out: {sample['context_out'].shape}")
-    print(f"  target_out: {sample['target_out'].shape}")
-    print(f"  target_case_id: {sample['target_case_id']}")
-    print(f"  context_case_ids: {sample['context_case_ids']}")
-    print(f"  sampled_organ: {sample['organ']}")
-
-    # Test dataloader with batching
-    dataloader = get_dataloader(
-        root_dir="/path/to/TotalSegmentator/dataset",
-        organ_list=organ_list,
-        context_size=3,
-        batch_size=2,
-        image_size=(128, 128, 128),
-        num_workers=0,
-        mode='train',
-        num_samples=10,
-    )
-
-    print("\n\nTesting DataLoader:")
-    for batch_idx, batch in enumerate(dataloader):
-        print(f"\nBatch {batch_idx}:")
-        print(f"  target_in: {batch['target_in'].shape}")
-        print(f"  context_in: {batch['context_in'].shape}")
-        print(f"  context_out: {batch['context_out'].shape}")
-        print(f"  target_out: {batch['target_out'].shape}")
-        print(f"  Batch size: {batch['target_in'].shape[0]}")
-
-        if batch_idx == 0:  # Only show first batch
-            break
-
-    print("\n✓ DataLoader test completed successfully!")
-
-    # Test dynamic resizing (image_size=None)
-    print("\n" + "="*80)
-    print("Testing dynamic resizing (image_size=None)")
-    print("="*80)
-
-    dataset_dynamic = TotalSegmentatorDataset(
-        root_dir="/path/to/TotalSegmentator/dataset",
-        organ_list=organ_list,
-        context_size=3,
-        image_size=None,  # Dynamic resizing!
-        spacing=(1.5, 1.5, 1.5),
-        mode='train',
-        num_samples=5,
-    )
-
-    sample_dynamic = dataset_dynamic[0]
-    print(f"\nWith image_size=None, contexts match target size:")
-    print(f"  target_in: {sample_dynamic['target_in'].shape}")
-    print(f"  context_in: {sample_dynamic['context_in'].shape}")
-    print(f"  All have same spatial dims: {sample_dynamic['target_in'].shape[1:] == sample_dynamic['context_in'].shape[2:]}")
-    print(f"  sampled_organ: {sample_dynamic['organ']}")
-    print("\n✓ Dynamic resizing test completed successfully!")
-
-    # Test organ-specific sampling
-    print("\n" + "="*80)
-    print("Testing organ-specific sampling")
-    print("="*80)
-
-    # Get multiple samples and verify different organs can be sampled
-    sampled_organs = []
-    for i in range(min(10, len(dataset))):
-        sample_i = dataset[i]
-        sampled_organs.append(sample_i['organ'])
-
-        # Verify binary segmentation
-        unique_labels = torch.unique(sample_i['target_out'])
-        assert set(unique_labels.tolist()).issubset({0, 1}), "Labels should only be 0 or 1!"
-
-    print(f"\nSampled organs across {len(sampled_organs)} samples: {set(sampled_organs)}")
-    print(f"Organ distribution: {dict((o, sampled_organs.count(o)) for o in set(sampled_organs))}")
-    print("✓ Organ-specific sampling verified!")
