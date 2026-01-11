@@ -11,7 +11,7 @@ from src.totalseg_dataloader import get_dataloader
 
 # Define label_ids
 DEFAULT_LABEL_ID_LIST = [
-        "heart",
+        "liver", #"heart",
 ]
 
 """
@@ -108,7 +108,14 @@ def evaluate_totalseg(
     inspected_cases = 0
 
     for i, batch in enumerate(val_loader):
+
         print(f"Processing batch {i + 1}/{len(val_loader)}")
+        print(f"  Case IDs: {batch['target_case_ids']}, Label IDs: {batch['label_ids']}")
+        print(f"  Target img shape: {batch['target_in'].shape}, Min/Max: {batch['target_in'].min().item():.4f}/{batch['target_in'].max().item():.4f}")
+        print(f"  Target mask shape: {batch['target_out'].shape}, Min/Max: {batch['target_out'].min().item():.4f}/{batch['target_out'].max().item():.4f}")
+        print(f"  Context img shape: {batch['context_in'].shape}, Min/Max: {batch['context_in'].min().item():.4f}/{batch['context_in'].max().item():.4f}")
+        print(f"  Context mask shape: {batch['context_out'].shape}, Min/Max: {batch['context_out'].min().item():.4f}/{batch['context_out'].max().item():.4f}")
+        
         target_in = batch["target_in"].to(device)
         context_in = batch["context_in"].to(device)
         context_out = batch["context_out"].to(device)
@@ -123,7 +130,7 @@ def evaluate_totalseg(
 
         start_time = time.time()
         with torch.no_grad():
-            prediction = model.autoregressive_inference(
+            output = model.autoregressive_inference(
                 target_in=target_in,
                 context_in=context_in,
                 context_out=context_out,
@@ -145,6 +152,19 @@ def evaluate_totalseg(
             inspected_cases += 1
             print(f"  Saved inspection data for {case_id}/{label_id}")
 
+        print(f"Output Min/Max: {output.min().item():.4f}/{output.max().item():.4f}")
+        print(f"Output Mean/Std: {output.mean().item():.4f}/{output.std().item():.4f}")
+        
+        prediction = output # torch.sigmoid(output) 
+        # TODO Seems like model was trained to output probs, 
+        # even though no activation at end of block. To check.
+
+        print(f"  Prediction shape: {prediction.shape}")
+        print(f"  Pred min/max: {prediction.min().item():.4f}/{prediction.max().item():.4f}")
+        print(f"  Pred mean/std: {prediction.mean().item():.4f}/{prediction.std().item():.4f}")
+        print(f"  Target min/max: {batch['target_out'].min().item():.4f}/{batch['target_out'].max().item():.4f}")
+        print(f"  Target mean/std: {batch['target_out'].mean().item():.4f}/{batch['target_out'].std().item():.4f}")
+
         prediction_binary = (prediction > 0.5).float()
         target_out = batch["target_out"].to(device)
         print(
@@ -160,10 +180,14 @@ def evaluate_totalseg(
         dice_scores.append(float(dice.item()))
         print(f"  Dice score: {dice.item():.4f}")
 
-        if save_imgs_masks:
+        if save_imgs_masks or enable_inspection:
+            if enable_inspection:
+                save_dir_root = Path(config["RESULTS_DIR"]) / "totalseg_inspection"
+            else:
+                save_dir_root = Path(config["RESULTS_DIR"]) / "totalseg_eval"
             for i, case_id in enumerate(batch["target_case_ids"]):
                 label_id = batch["label_ids"][i]
-                save_dir = Path(config["RESULTS_DIR"]) / "totalseg_eval" / case_id
+                save_dir = save_dir_root / case_id
                 save_dir.mkdir(exist_ok=True, parents=True)
                 img_nib = nib.Nifti1Image(
                     batch["target_in"][i, 0].cpu().numpy(),

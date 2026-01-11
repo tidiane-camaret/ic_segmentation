@@ -85,6 +85,12 @@ class LightningModelForegroundSampling(LightningModel):
                 'num_patches': len(level_data['patches'])
             })
 
+            # Save full stitched prediction for this level
+            if 'full_prediction' in level_data:
+                full_pred = level_data['full_prediction'].numpy()  # [B, C, D, H, W]
+                full_pred_nifti = nib.Nifti1Image(full_pred[0, 0], affine=np.eye(4))
+                nib.save(full_pred_nifti, case_dir / f'{label_id}_level_{level_num}_full_pred_mask.nii.gz')
+
             # Save each patch
             for patch_data in level_data['patches']:
                 patch_id = patch_data['patch_id']
@@ -93,12 +99,12 @@ class LightningModelForegroundSampling(LightningModel):
                 # Save target image
                 target_in = patch_data['target_in'].numpy()  # [C, D, H, W]
                 target_nifti = nib.Nifti1Image(target_in[0], affine=np.eye(4))
-                nib.save(target_nifti, case_dir / f'{prefix}_target_in.nii.gz')
+                nib.save(target_nifti, case_dir / f'{prefix}_target_img.nii.gz')
 
                 # Save prediction
                 prediction = patch_data['prediction'].numpy()  # [C, D, H, W]
                 pred_nifti = nib.Nifti1Image(prediction[0], affine=np.eye(4))
-                nib.save(pred_nifti, case_dir / f'{prefix}_prediction.nii.gz')
+                nib.save(pred_nifti, case_dir / f'{prefix}_pred_mask.nii.gz')
 
                 # Save context data if available
                 if 'context_in' in patch_data:
@@ -112,7 +118,7 @@ class LightningModelForegroundSampling(LightningModel):
                         ctx_mask = nib.Nifti1Image(context_out[ctx_idx, 0], affine=np.eye(4))
 
                         nib.save(ctx_img, case_dir / f'{prefix}_context_{ctx_idx}_img.nii.gz')
-                        nib.save(ctx_mask, case_dir / f'{prefix}_context_{ctx_idx}_mask.nii.gz')
+                        nib.save(ctx_mask, case_dir / f'{prefix}_context_{ctx_idx}_gt_mask.nii.gz')
 
                     # Save context coordinates
                     coords_dict = {
@@ -122,113 +128,110 @@ class LightningModelForegroundSampling(LightningModel):
                     with open(case_dir / f'{prefix}_context_coordinates.json', 'w') as f:
                         json.dump(coords_dict, f, indent=2)
 
+                # Save image context from previous level if available
+                if 'img_ctx_in' in patch_data:
+                    img_ctx_in = patch_data['img_ctx_in'].numpy()  # [1, C, D, H, W]
+                    img_ctx_in_nifti = nib.Nifti1Image(img_ctx_in[0, 0], affine=np.eye(4))
+                    nib.save(img_ctx_in_nifti, case_dir / f'{prefix}_prev_lvl_img.nii.gz')
+
+                if 'img_ctx_out' in patch_data:
+                    img_ctx_out = patch_data['img_ctx_out'].numpy()  # [1, C, D, H, W]
+                    img_ctx_out_nifti = nib.Nifti1Image(img_ctx_out[0, 0], affine=np.eye(4))
+                    nib.save(img_ctx_out_nifti, case_dir / f'{prefix}_prev_lvl_pred_mask.nii.gz')
+
         # Save overall metadata
         with open(case_dir / f'{label_id}_metadata.json', 'w') as f:
             json.dump({'levels': all_metadata}, f, indent=2)
 
         print(f"Saved inspection data to {case_dir}")
 
-    def _compute_foreground_patch_centers(self,
-                                          context_out,
-                                          roi_size,
-                                          overlap,
-                                          min_foreground_ratio=0.01):
+    def _sample_patch_center_balanced(self,
+                                      context_out,
+                                      roi_size,
+                                      overlap,
+                                      foreground_ratio=0.5):
         """
-        Compute valid patch centers where context_out has foreground.
+        Sample patch center using label-balanced probability weighting (PatchWork method).
+
+        Computes probability weights for all possible patch centers such that
+        the expected ratio of patches centered on foreground equals foreground_ratio.
 
         Args:
-            context_out: [C, D, H, W] - Single context segmentation mask
+            context_out: [C, D, H, W] or [1, C, D, H, W] - Single context segmentation mask
             roi_size: (D_roi, H_roi, W_roi) - Patch size
-            overlap: Overlap ratio for patch sampling
-            min_foreground_ratio: Minimum ratio of foreground voxels in patch (default 0.01 = 1%)
+            overlap: Overlap ratio for sliding window
+            foreground_ratio: Desired ratio of patches on foreground (default 0.5 = 50%)
 
         Returns:
-            List of (d, h, w) patch center coordinates with foreground
+            Tuple (d, h, w) - Sampled patch center coordinates
         """
+        # Handle both 4D and 5D inputs
+        if context_out.ndim == 5:
+            context_out = context_out[0]  # Remove batch dimension: [1, C, D, H, W] -> [C, D, H, W]
+
         C, D, H, W = context_out.shape
         D_roi, H_roi, W_roi = roi_size
 
-        # Calculate stride from overlap
-        stride_d = max(1, int(D_roi * (1 - overlap)))
-        stride_h = max(1, int(H_roi * (1 - overlap)))
-        stride_w = max(1, int(W_roi * (1 - overlap)))
+        # For context sampling, we don't use sliding window grid - sample from ALL valid locations
+        # This allows much denser sampling than the sliding window stride
+        max_d = max(0, D - D_roi)
+        max_h = max(0, H - H_roi)
+        max_w = max(0, W - W_roi)
 
-        foreground_centers = []
-        threshold = min_foreground_ratio * (D_roi * H_roi * W_roi)
+        if max_d == 0 and max_h == 0 and max_w == 0:
+            # Volume is exactly ROI size, only one valid center
+            return (0, 0, 0)
 
-        # Iterate over all possible patch centers
-        for d in range(0, D - D_roi + 1, stride_d):
-            for h in range(0, H - H_roi + 1, stride_h):
-                for w in range(0, W - W_roi + 1, stride_w):
-                    # Extract patch
-                    patch = context_out[:, d:d+D_roi, h:h+H_roi, w:w+W_roi]
+        # Collapse mask to spatial dimensions (max across channel dimension)
+        L = torch.amax(context_out, dim=0)  # [D, H, W]
 
-                    # Check if patch has enough foreground
-                    if patch.sum() >= threshold:
-                        # Store patch top-left corner
-                        foreground_centers.append((d, h, w))
+        # Count foreground and background voxels
+        numvx = L.numel()
+        pos = (L > 0).sum().item()  # Foreground voxels
+        neg = numvx - pos  # Background voxels
 
-        # If no foreground patches found, fall back to all possible centers
-        if len(foreground_centers) == 0:
-            for d in range(0, D - D_roi + 1, stride_d):
-                for h in range(0, H - H_roi + 1, stride_h):
-                    for w in range(0, W - W_roi + 1, stride_w):
-                        foreground_centers.append((d, h, w))
+        # Check if we can achieve desired ratio
+        if pos == 0 or pos >= numvx * foreground_ratio:
+            # Fallback to uniform sampling if impossible to achieve ratio
+            # Sample uniformly from valid region
+            d = torch.randint(0, max_d + 1, (1,)).item()
+            h = torch.randint(0, max_h + 1, (1,)).item()
+            w = torch.randint(0, max_w + 1, (1,)).item()
+            return (d, h, w)
+        else:
+            # Compute background weight using PatchWork formula:
+            # background_p = (1 - ratio) * pos / (numvx * ratio - pos)
+            background_p = (1.0 - foreground_ratio) * pos / (numvx * foreground_ratio - pos)
 
-        return foreground_centers
+            # Build probability map: P = L + background_p
+            # Where L > 0 (foreground): P = 1
+            # Where L = 0 (background): P = background_p
+            P = L.float()  # Convert to float
+            P[P == 0] = background_p
+            P[P > 0] = 1.0
 
-    def _sample_context_patches(self,
-                                context_in,
-                                context_out,
-                                roi_size,
-                                patch_centers,
-                                num_samples=1):
-        """
-        Sample patches from context images at specified centers.
+            # Create valid region mask (where patches can be placed)
+            # A patch centered at (d, h, w) needs d+D_roi <= D, etc.
+            valid_region = torch.zeros_like(P)
+            valid_region[:max_d+1, :max_h+1, :max_w+1] = 1.0
 
-        Args:
-            context_in: [L, C, D, H, W] - Context images
-            context_out: [L, C, D, H, W] - Context masks
-            roi_size: (D_roi, H_roi, W_roi) - Patch size
-            patch_centers: List of lists of (d, h, w) centers for each context
-            num_samples: Number of patches to sample from each context
+            # Multiply probability map by valid region
+            P = P * valid_region
 
-        Returns:
-            Tuple of (sampled_context_in, sampled_context_out)
-            Each has shape [L, C, D_roi, H_roi, W_roi]
-        """
-        L, C, D, H, W = context_in.shape
-        D_roi, H_roi, W_roi = roi_size
+            # Flatten and normalize to get sampling probabilities
+            p = P.flatten()
+            p = p / p.sum()
 
-        sampled_in = []
-        sampled_out = []
+            # Sample one voxel index
+            idx = torch.multinomial(p, 1).item()
 
-        for l_idx in range(L):
-            # Randomly sample a patch center from available foreground centers
-            if len(patch_centers[l_idx]) > 0:
-                center = random.choice(patch_centers[l_idx])
-            else:
-                # Fallback to random center if no foreground found
-                center = (
-                    random.randint(0, max(0, D - D_roi)),
-                    random.randint(0, max(0, H - H_roi)),
-                    random.randint(0, max(0, W - W_roi))
-                )
+            # Convert flat index to 3D coordinates
+            d = idx // (H * W)
+            remainder = idx % (H * W)
+            h = remainder // W
+            w = remainder % W
 
-            d, h, w = center
-
-            # Extract patches
-            patch_in = context_in[l_idx:l_idx+1, :, d:d+D_roi, h:h+H_roi, w:w+W_roi]
-            patch_out = context_out[l_idx:l_idx+1, :, d:d+D_roi, h:h+H_roi, w:w+W_roi]
-
-            sampled_in.append(patch_in)
-            sampled_out.append(patch_out)
-
-        # Stack along L dimension
-        sampled_in = torch.cat(sampled_in, dim=0)  # [L, C, D_roi, H_roi, W_roi]
-        sampled_out = torch.cat(sampled_out, dim=0)  # [L, C, D_roi, H_roi, W_roi]
-
-        return sampled_in, sampled_out
+            return (int(d), int(h), int(w))
 
     def _sliding_window_autoregressive_step(self,
                                             current_target_in,
@@ -289,20 +292,7 @@ class LightningModelForegroundSampling(LightningModel):
         else:
             level_data = None
 
-        # Compute foreground patch centers for context sampling (NEW)
-        foreground_patch_centers = None
-        if current_context_out is not None and B_main == 1:
-            L_c = current_context_out.shape[1]
-            foreground_patch_centers = []
-            for l_idx in range(L_c):
-                ctx_out_single = current_context_out[0, l_idx]
-                centers = self._compute_foreground_patch_centers(
-                    ctx_out_single,
-                    roi_size,
-                    overlap,
-                    min_foreground_ratio=0.01
-                )
-                foreground_patch_centers.append(centers)
+        # We'll use balanced sampling inside the predictor (no pre-computation needed)
 
         inputs_to_stack = []
         # Metadata to help reconstruct original tensor shapes and types from the stacked tensor within the predictor
@@ -351,10 +341,10 @@ class LightningModelForegroundSampling(LightningModel):
 
         # Memoize metadata for use in the nested predictor function
         memoized_flat_channel_counts = flat_channel_counts
-        memoized_foreground_centers = foreground_patch_centers
         memoized_context_in = current_context_in
         memoized_context_out = current_context_out
         memoized_roi_size = roi_size
+        memoized_overlap = overlap
         memoized_level_data = level_data
 
         # Patch counter for inspection
@@ -373,51 +363,43 @@ class LightningModelForegroundSampling(LightningModel):
             target_window = data_window[:, current_idx : current_idx + memoized_flat_channel_counts[0], ...]
             current_idx += memoized_flat_channel_counts[0]
 
-            # Sample context patches from foreground (MODIFIED)
+            # Sample context patches using balanced sampling (MODIFIED)
             actual_context_in = None
             actual_context_out = None
             sampled_context_coords = None
-            if memoized_context_in is not None and memoized_foreground_centers is not None:
-                # Sample patches from foreground locations
+            if memoized_context_in is not None:
+                # Sample patches using balanced probability weighting
                 ctx_in = memoized_context_in[0]  # [L, C, D, H, W]
                 ctx_out = memoized_context_out[0]  # [L, C, D, H, W]
+                L = ctx_in.shape[0]
 
-                # Track sampled coordinates for inspection
-                if memoized_level_data is not None:
-                    sampled_context_coords = []
-                    for l_idx in range(len(memoized_foreground_centers)):
-                        if len(memoized_foreground_centers[l_idx]) > 0:
-                            center = random.choice(memoized_foreground_centers[l_idx])
-                        else:
-                            D, H, W = ctx_in.shape[2:]
-                            D_roi, H_roi, W_roi = memoized_roi_size
-                            center = (
-                                random.randint(0, max(0, D - D_roi)),
-                                random.randint(0, max(0, H - H_roi)),
-                                random.randint(0, max(0, W - W_roi))
-                            )
-                        sampled_context_coords.append(center)
+                sampled_in = []
+                sampled_out = []
+                sampled_context_coords = []
 
-                    # Use tracked coordinates to sample
-                    sampled_in = []
-                    sampled_out = []
-                    for l_idx, (d, h, w) in enumerate(sampled_context_coords):
-                        D_roi, H_roi, W_roi = memoized_roi_size
-                        patch_in = ctx_in[l_idx:l_idx+1, :, d:d+D_roi, h:h+H_roi, w:w+W_roi]
-                        patch_out = ctx_out[l_idx:l_idx+1, :, d:d+D_roi, h:h+H_roi, w:w+W_roi]
-                        sampled_in.append(patch_in)
-                        sampled_out.append(patch_out)
-                    sampled_ctx_in = torch.cat(sampled_in, dim=0)
-                    sampled_ctx_out = torch.cat(sampled_out, dim=0)
-                else:
-                    # Normal sampling without tracking
-                    sampled_ctx_in, sampled_ctx_out = self._sample_context_patches(
-                        ctx_in,
-                        ctx_out,
+                for l_idx in range(L):
+                    # Use PatchWork balanced sampling for each context
+                    center = self._sample_patch_center_balanced(
+                        ctx_out[l_idx:l_idx+1],  # [1, C, D, H, W]
                         memoized_roi_size,
-                        memoized_foreground_centers,
-                        num_samples=1
+                        memoized_overlap,
+                        foreground_ratio=0.5  # 50% patches on foreground
                     )
+                    sampled_context_coords.append(center)
+
+                    # Extract patch at sampled center
+                    d, h, w = center
+                    D_roi, H_roi, W_roi = memoized_roi_size
+                    patch_in = ctx_in[l_idx:l_idx+1, :, d:d+D_roi, h:h+H_roi, w:w+W_roi]
+                    patch_out = ctx_out[l_idx:l_idx+1, :, d:d+D_roi, h:h+H_roi, w:w+W_roi]
+                    sampled_in.append(patch_in)
+                    sampled_out.append(patch_out)
+
+                    if memoized_level_data is not None:
+                        print(f"    Patch {patch_counter[0]}, Context {l_idx}: Sampled at {center}")
+
+                sampled_ctx_in = torch.cat(sampled_in, dim=0)  # [L, C, D_roi, H_roi, W_roi]
+                sampled_ctx_out = torch.cat(sampled_out, dim=0)  # [L, C, D_roi, H_roi, W_roi]
 
                 # Reshape for model: add batch dimension
                 actual_context_in = sampled_ctx_in.unsqueeze(0)  # [1, L, C, D_roi, H_roi, W_roi]
@@ -464,6 +446,12 @@ class LightningModelForegroundSampling(LightningModel):
                     patch_data['context_out'] = actual_context_out[0].detach().cpu()  # [L, C, D_roi, H_roi, W_roi]
                     patch_data['sampled_context_coords'] = sampled_context_coords  # List of (d, h, w) tuples
 
+                # Save image context (predictions from previous level)
+                if actual_img_ctx_in is not None:
+                    patch_data['img_ctx_in'] = actual_img_ctx_in[0].detach().cpu()  # [1, C, D_roi, H_roi, W_roi]
+                if actual_img_ctx_out is not None:
+                    patch_data['img_ctx_out'] = actual_img_ctx_out[0].detach().cpu()  # [1, C, D_roi, H_roi, W_roi]
+
                 memoized_level_data['patches'].append(patch_data)
                 patch_counter[0] += 1
 
@@ -497,6 +485,8 @@ class LightningModelForegroundSampling(LightningModel):
 
         # Append level data to inspection data if enabled
         if level_data is not None:
+            # Store the full stitched prediction for this level
+            level_data['full_prediction'] = output_pred.detach().cpu()  # [B, C, D, H, W]
             self.inspection_data['levels'].append(level_data)
 
         return output_pred
