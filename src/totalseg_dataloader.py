@@ -35,14 +35,13 @@ from torch.utils.data import DataLoader, Dataset
 
 class TotalSegmentatorDataset(Dataset):
     """
-    Dataset for TotalSegmentator with organ-specific in-context learning.
+    Dataset for TotalSegmentator in-context learning eval.
 
-    Each sample focuses on ONE organ at a time:
-    1. For each case, randomly samples one organ from organ_list that exists in that case
-    2. Finds k context cases that have the SAME organ (with non-zero voxels)
-    3. Creates binary segmentation for only that specific organ
-    4. Context examples always match the target organ for better in-context learning
-
+    Each sample focuses on label at a time:
+    1. For each case, randomly samples one label from label_id_list that exists in that case
+    2. Finds k context cases that have the SAME label (with non-zero voxels)
+    3. Creates binary segmentation for only that specific label
+    4. Context examples always match the target label for better in-context learning
     Example:
         If case s0001 has [liver, kidney_left, spleen]:
         - Sample might choose "liver"
@@ -50,7 +49,7 @@ class TotalSegmentatorDataset(Dataset):
         - All images show liver (label=1) vs background (label=0)
 
     Case Filtering:
-        Cases are automatically excluded if they have NO organs from organ_list available.
+        Cases are automatically excluded if they have NO label_ids from label_id_list available.
         This happens after applying empty_segmentations exclusions.
 
     Args for empty_segmentations:
@@ -65,9 +64,9 @@ class TotalSegmentatorDataset(Dataset):
                 'kidney_left': ['s0020', 's0025'] # Cases with zero kidney_left voxels
             }
 
-        These cases are automatically excluded when building organ_to_cases mapping.
-        Additionally, cases with NO valid organs from organ_list are filtered out entirely.
-        If None, assumes all cases have non-zero voxels for all organs (not recommended).
+        These cases are automatically excluded when building label_id_to_cases mapping.
+        Additionally, cases with NO valid label_ids from label_id_list are filtered out entirely.
+        If None, assumes all cases have non-zero voxels for all label_ids (not recommended).
 
     If image_size is specified, all images are resized to that size.
     If image_size is None, context images are dynamically resized to match each target's size.
@@ -75,18 +74,18 @@ class TotalSegmentatorDataset(Dataset):
     Returns:
         Dictionary with:
         - 'target_in': [1, H, W, D] - Target CT scan
-        - 'context_in': [k, 1, H, W, D] - k context CT scans (same organ as target)
-        - 'context_out': [k, 1, H, W, D] - k context segmentations (binary: 0=bg, 1=organ)
-        - 'target_out': [1, H, W, D] - Target segmentation (binary: 0=bg, 1=organ)
+        - 'context_in': [k, 1, H, W, D] - k context CT scans (same label_id as target)
+        - 'context_out': [k, 1, H, W, D] - k context segmentations (binary: 0=bg, 1=label_id)
+        - 'target_out': [1, H, W, D] - Target segmentation (binary: 0=bg, 1=label_id)
         - 'target_case_id': str - Target case identifier
         - 'context_case_ids': List[str] - Context case identifiers
-        - 'organ': str - The specific organ being segmented in this sample
+        - 'label_id': str - The specific label_id being segmented in this sample
     """
 
     def __init__(
         self,
         root_dir: str,
-        organ_list: List[str],
+        label_id_list: List[str],
         empty_segmentations: Optional[Dict[str, List[str]]] = None,
         context_size: int = 3,
         image_size: Optional[Tuple[int, int, int]] = (128, 128, 128),
@@ -96,14 +95,14 @@ class TotalSegmentatorDataset(Dataset):
         split: str = 'train',
         random_context: bool = True,
         fixed_context_indices: Optional[List[int]] = None,
-        num_samples: Optional[int] = None,
+        max_ds_len: Optional[int] = None,
     ):
         """
         Args:
             root_dir: Root directory containing s0000, s0001, ... folders
-            organ_list: List of organ names to segment (e.g., ['liver', 'kidney_left'])
-            empty_segmentations: Optional dict mapping organ_name -> list of case_ids to exclude
-                                 (cases where that organ has zero voxels)
+            label_id_list: List of label_ids to segment (e.g., ['liver', 'kidney_left'])
+            empty_segmentations: Optional dict mapping label_id -> list of case_ids to exclude
+                                 (cases where that label_id has zero voxels)
             context_size: Number of context examples (k)
             image_size: Target spatial size (H, W, D). If None, context images are resized to match target.
             spacing: Target voxel spacing in mm
@@ -112,10 +111,10 @@ class TotalSegmentatorDataset(Dataset):
             split: 'train', 'val', or 'test'
             random_context: If True, randomly sample context. If False, use fixed indices.
             fixed_context_indices: If provided and random_context=False, use these indices
-            num_samples: If provided, limit dataset to this many samples
+            max_ds_len: If provided, limit dataset to this many samples (for debugging)
         """
         self.root_dir = Path(root_dir)
-        self.organ_list = organ_list
+        self.label_id_list = label_id_list
         self.empty_segmentations = empty_segmentations or {}
         self.context_size = context_size
         self.image_size = image_size
@@ -123,6 +122,7 @@ class TotalSegmentatorDataset(Dataset):
         self.split = split
         self.random_context = random_context
         self.fixed_context_indices = fixed_context_indices
+        self.max_ds_len = max_ds_len
 
         # Warn if empty_segmentations not provided
         if not self.empty_segmentations:
@@ -141,36 +141,33 @@ class TotalSegmentatorDataset(Dataset):
         split_case_ids = df["image_id"][df["split"]==split].tolist()
         self.case_folders = [f for f in self.case_folders if f.name in split_case_ids]
 
-        if num_samples is not None:
-            self.case_folders = self.case_folders[:num_samples]
-
         self.valid_cases = self.case_folders
         print(f"Found {len(self.valid_cases)} cases in {root_dir}")
 
-        # Build organ to cases mapping from empty_segmentations
-        self.organ_to_cases = self._build_organ_to_cases_mapping()
-        print(f"Built organ-to-cases mapping for {len(self.organ_to_cases)} organs")
+        # Build label_id to cases mapping from empty_segmentations
+        self.label_id_to_cases = self._build_label_id_to_cases_mapping()
+        print(f"Built label_id-to-cases mapping for {len(self.label_id_to_cases)} label_ids")
 
-        # Filter valid_cases to only include cases with at least one organ from organ_list
+        # Filter valid_cases to only include cases with at least one label_id from label_id_list
         all_valid_case_ids = set()
-        for organ, case_ids in self.organ_to_cases.items():
+        for label_id, case_ids in self.label_id_to_cases.items():
             all_valid_case_ids.update(case_ids)
 
         self.valid_cases = [
             c for c in self.valid_cases
             if c.name in all_valid_case_ids
         ]
-        print(f"Filtered to {len(self.valid_cases)} cases with at least one organ from organ_list")
+        print(f"Filtered to {len(self.valid_cases)} cases with at least one label_id from label_id_list")
 
-        # Build list of all valid (case_id, organ) pairs
-        # This ensures we process ALL organs for ALL cases in one epoch
-        self.case_organ_pairs = []
+        # Build list of all valid (case_id, label_id) pairs
+        # This ensures we process ALL label_ids for ALL cases in one epoch
+        self.case_label_id_pairs = []
         for case_folder in self.valid_cases:
             case_id = case_folder.name
-            for organ in self.organ_list:
-                if case_id in self.organ_to_cases.get(organ, []):
-                    self.case_organ_pairs.append((case_id, organ))
-        print(f"Created {len(self.case_organ_pairs)} (case, organ) pairs for complete coverage")
+            for label_id in self.label_id_list:
+                if case_id in self.label_id_to_cases.get(label_id, []):
+                    self.case_label_id_pairs.append((case_id, label_id))
+        print(f"Created {len(self.case_label_id_pairs)} (case, label_id) pairs for complete coverage")
 
         # Setup transforms
         self.transforms = self._get_transforms(intensity_range)
@@ -184,31 +181,31 @@ class TotalSegmentatorDataset(Dataset):
             for idx in range(num_to_cache):
                 self.cache[idx] = self._load_case(idx)
 
-    def _build_organ_to_cases_mapping(self) -> Dict[str, List[str]]:
+    def _build_label_id_to_cases_mapping(self) -> Dict[str, List[str]]:
         """
-        Build mapping from organ name to list of case IDs that have that organ.
+        Build mapping from label_id name to list of case IDs that have that label_id.
 
         Uses empty_segmentations to efficiently exclude cases without loading files:
-        organ_to_cases[organ] = all_cases - empty_segmentations[organ]
+        label_id_to_cases[label_id] = all_cases - empty_segmentations[label_id]
         """
-        organ_to_cases = {}
+        label_id_to_cases = {}
 
         # Get all case IDs
         all_case_ids = [c.name for c in self.valid_cases]
 
-        for organ in self.organ_list:
-            # Get cases to exclude for this organ
-            exclude_cases = set(self.empty_segmentations.get(organ, []))
+        for label_id in self.label_id_list:
+            # Get cases to exclude for this label_id
+            exclude_cases = set(self.empty_segmentations.get(label_id, []))
 
             # All cases minus excluded ones
-            valid_cases_for_organ = [
+            valid_cases_for_label_id = [
                 case_id for case_id in all_case_ids
                 if case_id not in exclude_cases
             ]
 
-            organ_to_cases[organ] = valid_cases_for_organ
+            label_id_to_cases[label_id] = valid_cases_for_label_id
 
-        return organ_to_cases
+        return label_id_to_cases
 
     def _get_transforms(self, intensity_range: Tuple[float, float]):
         """Create MONAI transform pipeline."""
@@ -250,14 +247,14 @@ class TotalSegmentatorDataset(Dataset):
 
         return Compose(transforms)
 
-    def _load_single_case(self, case_folder: Path, organ: str) -> Dict[str, torch.Tensor]:
-        """Load CT and segmentation for a single case and specific organ."""
+    def _load_single_case(self, case_folder: Path, label_id: str) -> Dict[str, torch.Tensor]:
+        """Load CT and segmentation for a single case and specific label_id."""
         ct_path = case_folder / "ct.nii.gz"
         seg_folder = case_folder / "segmentations"
-        seg_path = seg_folder / f"{organ}.nii.gz"
+        seg_path = seg_folder / f"{label_id}.nii.gz"
 
         if not seg_path.exists():
-            raise ValueError(f"Organ {organ} not found in case {case_folder.name}")
+            raise ValueError(f"label_id {label_id} not found in case {case_folder.name}")
 
         # Apply transforms with file paths (not numpy arrays)
         data_dict = {
@@ -272,61 +269,63 @@ class TotalSegmentatorDataset(Dataset):
             "case_id": case_folder.name,
         }
 
-    def _get_available_organs(self, case_folder: Path) -> List[str]:
+    def _get_available_label_ids(self, case_folder: Path) -> List[str]:
         """
-        Get list of organs from organ_list that exist in this case.
+        Get list of label_ids from label_id_list that exist in this case.
 
-        Uses organ_to_cases mapping for efficient lookup without loading files.
+        Uses label_id_to_cases mapping for efficient lookup without loading files.
         """
         case_id = case_folder.name
-        available_organs = []
+        available_label_ids = []
 
-        for organ in self.organ_list:
-            # Check if case_id is in the valid cases for this organ
-            if case_id in self.organ_to_cases.get(organ, []):
-                available_organs.append(organ)
+        for label_id in self.label_id_list:
+            # Check if case_id is in the valid cases for this label_id
+            if case_id in self.label_id_to_cases.get(label_id, []):
+                available_label_ids.append(label_id)
 
-        return available_organs
+        return available_label_ids
 
     def __len__(self) -> int:
-        return len(self.case_organ_pairs)
+        if self.max_ds_len is not None:
+            return min(self.max_ds_len, len(self.case_label_id_pairs))
+        return len(self.case_label_id_pairs)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get a sample with context examples for a specific organ.
+        Get a sample with context examples for a specific label_id.
 
         Returns:
             Dictionary with:
             - 'target_in': [1, H, W, D]
             - 'context_in': [k, 1, H, W, D]
-            - 'context_out': [k, 1, H, W, D] - Binary mask for sampled organ
-            - 'target_out': [1, H, W, D] - Binary mask for sampled organ
+            - 'context_out': [k, 1, H, W, D] - Binary mask for sampled label_id
+            - 'target_out': [1, H, W, D] - Binary mask for sampled label_id
             - 'target_case_id': str
             - 'context_case_ids': List[str]
-            - 'organ': str - The organ being segmented
+            - 'label_id': str - The label_id being segmented
         """
-        # Look up the (case_id, organ) pair for this index
-        target_case_id, sampled_organ = self.case_organ_pairs[idx]
+        # Look up the (case_id, label_id) pair for this index
+        target_case_id, sampled_label_id = self.case_label_id_pairs[idx]
         target_case_folder = self.root_dir / target_case_id
 
-        # Load target case with sampled organ
-        target_data = self._load_single_case(target_case_folder, sampled_organ)
+        # Load target case with sampled label_id
+        target_data = self._load_single_case(target_case_folder, sampled_label_id)
 
-        # Find context cases that have this same organ
-        cases_with_organ = self.organ_to_cases.get(sampled_organ, [])
+        # Find context cases that have this same label_id
+        cases_with_label_id = self.label_id_to_cases.get(sampled_label_id, [])
 
         # Filter out target case
         available_context_case_ids = [
-            case_id for case_id in cases_with_organ
+            case_id for case_id in cases_with_label_id
             if case_id != target_case_id
         ]
 
         if len(available_context_case_ids) < self.context_size:
-            # Not enough contexts with this organ, sample fewer
+            # Not enough contexts with this label_id, sample fewer
             num_contexts = len(available_context_case_ids)
             if num_contexts == 0:
                 raise RuntimeError(
-                    f"No context cases available for organ '{sampled_organ}' "
+                    f"No context cases available for label_id '{sampled_label_id}' "
                     f"(excluding target case {target_case_id})"
                 )
             context_case_ids = available_context_case_ids
@@ -338,7 +337,7 @@ class TotalSegmentatorDataset(Dataset):
                 # Use first k cases for deterministic selection
                 context_case_ids = available_context_case_ids[:self.context_size]
 
-        # Load context cases with the same organ
+        # Load context cases with the same label_id
         context_images = []
         context_labels = []
 
@@ -351,18 +350,18 @@ class TotalSegmentatorDataset(Dataset):
                 continue
 
             try:
-                ctx_data = self._load_single_case(context_case_folder, sampled_organ)
+                ctx_data = self._load_single_case(context_case_folder, sampled_label_id)
                 context_images.append(ctx_data["image"])
                 context_labels.append(ctx_data["label"])
             except Exception as e:
                 # Skip cases that fail to load
-                print(f"Warning: Failed to load {context_case_id} for organ {sampled_organ}: {e}")
+                print(f"Warning: Failed to load {context_case_id} for label_id {sampled_label_id}: {e}")
                 continue
 
         # Ensure we have at least one context
         if len(context_images) == 0:
             raise RuntimeError(
-                f"Failed to load any context cases for organ '{sampled_organ}'"
+                f"Failed to load any context cases for label_id '{sampled_label_id}'"
             )
 
         # If image_size is None, resize contexts to match target's spatial dimensions
@@ -408,7 +407,7 @@ class TotalSegmentatorDataset(Dataset):
             "target_out": target_data["label"],  # [C, H, W, D]
             "target_case_id": target_data["case_id"],
             "context_case_ids": context_case_ids,
-            "organ": sampled_organ,
+            "label_id": sampled_label_id,
         }
 
 
@@ -435,13 +434,13 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "target_out": target_out,
         "target_case_ids": [item["target_case_id"] for item in batch],
         "context_case_ids": [item["context_case_ids"] for item in batch],
-        "organs": [item["organ"] for item in batch],
+        "label_ids": [item["label_id"] for item in batch],
     }
 
 
 def get_dataloader(
     root_dir: str,
-    organ_list: List[str],
+    label_id_list: List[str],
     empty_segmentations: Optional[Dict[str, List[str]]] = None,
     context_size: int = 3,
     batch_size: int = 1,
@@ -457,8 +456,8 @@ def get_dataloader(
 
     Args:
         root_dir: Root directory of TotalSegmentator dataset
-        organ_list: List of organs to segment
-        empty_segmentations: Optional dict mapping organ_name -> list of case_ids to exclude
+        label_id_list: List of label_ids to segment
+        empty_segmentations: Optional dict mapping label_id -> list of case_ids to exclude
         context_size: Number of context examples
         batch_size: Batch size
         image_size: Target spatial dimensions. If None, contexts are resized to match each target.
@@ -473,7 +472,7 @@ def get_dataloader(
     """
     dataset = TotalSegmentatorDataset(
         root_dir=root_dir,
-        organ_list=organ_list,
+        label_id_list=label_id_list,
         empty_segmentations=empty_segmentations,
         context_size=context_size,
         image_size=image_size,
