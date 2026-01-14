@@ -218,20 +218,32 @@ class LightningModelForegroundSampling(LightningModel):
             # Multiply probability map by valid region
             P = P * valid_region
 
-            # Flatten and normalize to get sampling probabilities
-            p = P.flatten()
-            p = p / p.sum()
+            # Extract valid patch centers as a list of coordinates
+            # This avoids the 2^24 limit in multinomial by working with a smaller set
+            valid_coords = torch.nonzero(P > 0, as_tuple=False)  # [N, 3] tensor of (d, h, w)
 
-            # Sample one voxel index
-            idx = torch.multinomial(p, 1).item()
+            if len(valid_coords) == 0:
+                # Fallback to center if no valid patches
+                return (D // 2, H // 2, W // 2)
 
-            # Convert flat index to 3D coordinates
-            d = idx // (H * W)
-            remainder = idx % (H * W)
-            h = remainder // W
-            w = remainder % W
+            # Get probabilities for valid coordinates only
+            valid_probs = P[valid_coords[:, 0], valid_coords[:, 1], valid_coords[:, 2]]
+            valid_probs = valid_probs / valid_probs.sum()
 
-            return (int(d), int(h), int(w))
+            # Sample from valid coordinates
+            # Check if number of valid coords exceeds multinomial limit
+            if len(valid_coords) > 2**24:
+                # Subsample valid coords to stay within limit
+                # Use uniform subsampling
+                subsample_indices = torch.linspace(0, len(valid_coords)-1, 2**24, dtype=torch.long)
+                valid_coords = valid_coords[subsample_indices]
+                valid_probs = valid_probs[subsample_indices]
+                valid_probs = valid_probs / valid_probs.sum()
+
+            idx = torch.multinomial(valid_probs, 1).item()
+            sampled_coord = valid_coords[idx]
+
+            return (int(sampled_coord[0].item()), int(sampled_coord[1].item()), int(sampled_coord[2].item()))
 
     def _sliding_window_autoregressive_step(self,
                                             current_target_in,

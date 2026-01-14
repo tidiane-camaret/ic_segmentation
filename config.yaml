@@ -1,10 +1,62 @@
-nora: 
+# IC Segmentation Configuration
+#
+# This file contains machine-specific configurations.
+# The system automatically detects which machine you're on and loads the appropriate config.
+# All eval_totalseg parameters can be overridden via command-line arguments.
+
+nora:
 
   #DATA_DIR: "/nfs/data/nii/data1/Analysis/GPUnet/ANALYSIS_incontext/SegFM3D/data"
   DATA_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data"
   RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
 
+  # Evaluation hyperparameters
+  eval_totalseg:
+    dataset_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
+    model_path: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
 
-meta: 
+    # Label selection
+    # label_ids_split: Can be:
+    #   - "train", "val", or "all" (predefined splits)
+    #   - List of specific label IDs
+    # label_ids_split: "val"
+    label_ids_split:
+      - heart
+      - spinal_cord
+      - autochthon_left
+      - autochthon_right
+      - aorta
+      - esophagus
+      - lung_upper_lobe_left
+      - lung_upper_lobe_right
+      - costal_cartilages
+      - liver
+      - colon
+      - stomach
+      - femur_left
+      - femur_right
+    # Model parameters
+    context_size: 3
+    spacing: [1.5, 1.5, 1.5]
+    sw_roi_size: [128, 128, 128]
+    sw_overlap: 0.25
+    # sampling_method: Context sampling strategy
+    #   - "original": Medverse's default (samples from same spatial location as target)
+    #   - "foreground": Custom method (samples from locations with foreground voxels)
+    sampling_method: "foreground"
 
-  
+    # Dataloader parameters
+    batch_size: 1 # if > 1, images must have same size
+    image_size: null  # null = original size
+    num_workers: 4
+    split: "val"  # Dataset split to use ("train", "val", "test")
+    shuffle: false
+    random_context: false
+    max_ds_len: null  # null = use full dataset, or integer to limit number of samples
+
+    # Logging and inspection
+    use_wandb: true
+    save_imgs_masks: false
+    enable_inspection: false
+    max_inspect_cases: 1
+
