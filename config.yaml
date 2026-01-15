@@ -78,6 +78,39 @@ nora:
     wandb_group: "totalseg"
     wandb_name: "segformer3d_train"
 
+    # NMSW (No More Sliding Window) patch sampling
+    # Replaces sliding window with differentiable top-k patch selection
+    nmsw:
+      enabled: false  # Set to true to enable NMSW sampling
+
+      # Global branch (coarse prediction)
+      down_size_rate: [2, 2, 2]  # Downsampling factor for global branch
+      global_model_scale: 0.5    # Scale factor for global model channels (smaller = faster)
+
+      # Patch sampling
+      # patch_size should be SMALLER than image_size to benefit from selective sampling
+      # With 128^3 image and 64^3 patches at 50% overlap: ~8 patches total
+      # Selecting top-4 reduces compute by ~50%
+      patch_size: [16, 16, 16]    # Patch size for local branch (smaller than image_size!)
+      overlap: 0.5                 # Patch overlap (0.5 = 50%)
+      num_train_patches: 50          # Top-k patches during training
+      num_train_random_patches: 50   # Random patches for exploration
+      num_inference_patches: 50      # Top-k patches during inference
+
+      # Gumbel-softmax temperature (controls selection hardness)
+      starting_tau: 0.6666          # Initial temperature (softer selection)
+      final_tau: 0.6666             # Final temperature (can decay to harder)
+      tau_decay_epochs: 100         # Epochs over which to decay tau
+
+      # Loss weighting
+      global_loss_weight: 1.0       # Weight for global (coarse) prediction loss
+      local_loss_weight: 1.0        # Weight for local (patch) prediction loss
+      agg_loss_weight: 1.0          # Weight for aggregated prediction loss
+      entropy_multiplier: 0.00001   # Encourage diverse patch sampling
+
+      # Aggregation
+      add_aggregation_module: false  # Use learnable aggregation (combines local + global)
+
   eval_totalseg:
     dataset_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
     model_path: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
