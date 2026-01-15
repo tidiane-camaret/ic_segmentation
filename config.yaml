@@ -10,7 +10,74 @@ nora:
   DATA_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data"
   RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
 
-  # Evaluation hyperparameters
+  train_totalseg:
+    # Dataset
+    dataset_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
+    train_label_ids:
+      - heart
+    val_label_ids:
+      - heart
+    image_size: [128, 128, 128]
+    spacing: [1.5, 1.5, 1.5]
+
+    # Dataloader
+    train_batch_size: 2
+    val_batch_size: 1
+    num_workers: 4
+    max_ds_len: null  # null = use full dataset
+
+    # Model (SegFormer3D)
+    model_parameters:
+      in_channels: 1
+      sr_ratios: [4, 2, 1, 1]
+      embed_dims: [32, 64, 160, 256]
+      patch_kernel_size: [7, 3, 3, 3]
+      patch_stride: [4, 2, 2, 2]
+      patch_padding: [3, 1, 1, 1]
+      mlp_ratios: [4, 4, 4, 4]
+      num_heads: [1, 2, 5, 8]
+      depths: [2, 2, 2, 2]
+      num_classes: 1  # Binary segmentation per label
+      decoder_dropout: 0.0
+      decoder_head_embedding_dim: 256
+
+    # Loss
+    loss_fn:
+      loss_type: "dice"
+      loss_args: null
+
+    # Optimizer
+    optimizer:
+      optimizer_type: "adamw"
+      optimizer_args:
+        lr: 0.0001
+        weight_decay: 0.01
+
+    # Schedulers
+    warmup_scheduler:
+      enabled: true
+      warmup_epochs: 10
+    train_scheduler:
+      scheduler_type: "cosine_annealing_wr"
+      scheduler_args:
+        t_0_epochs: 100
+        t_mult: 1
+        min_lr: 0.000001
+
+    # Training
+    training_parameters:
+      seed: 42
+      num_epochs: 200
+      print_every: 50
+      grad_accumulate_steps: 1
+      checkpoint_save_dir: null # null = default directory
+
+    # Logging
+    project: "segformer3d_totalseg"
+    wandb_entity: null
+    wandb_group: "totalseg"
+    wandb_name: "segformer3d_train"
+
   eval_totalseg:
     dataset_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
     model_path: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
