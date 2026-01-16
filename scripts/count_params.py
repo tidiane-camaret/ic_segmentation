@@ -7,8 +7,8 @@ Usage:
     python scripts/count_params.py --num-layers 12
 """
 
-import sys
 import argparse
+import sys
 from pathlib import Path
 
 import torch
