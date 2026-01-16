@@ -14,14 +14,12 @@ import sys
 import random
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-import yaml
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
-from termcolor import colored
 from tqdm import tqdm
 
 # Add paths
@@ -244,7 +242,7 @@ def main():
 
     # Merge with defaults
     full_config = {
-        "project": train_cfg.get("project", "segformer3d_nmsw"),
+        "project": train_cfg.get("project", "patch_icl_train"),
         "wandb_parameters": {
             "entity": train_cfg.get("wandb_entity"),
             "group": train_cfg.get("wandb_group", "nmsw"),

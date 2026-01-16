@@ -21,8 +21,8 @@ nora:
     spacing: [1.5, 1.5, 1.5]
 
     # Dataloader
-    train_batch_size: 2
-    val_batch_size: 1
+    train_batch_size: 16
+    val_batch_size: 4
     num_workers: 4
     max_ds_len: null  # null = use full dataset
 
@@ -73,10 +73,10 @@ nora:
       checkpoint_save_dir: null # null = default directory
 
     # Logging
-    project: "segformer3d_totalseg"
-    wandb_entity: null
-    wandb_group: "totalseg"
-    wandb_name: "segformer3d_train"
+    project: "patch_icl_train"
+    # wandb_entity: null
+    # wandb_group: "totalseg"
+    # wandb_name: "segformer3d_train"
 
     # NMSW (No More Sliding Window) patch sampling
     # Replaces sliding window with differentiable top-k patch selection
@@ -110,6 +110,41 @@ nora:
 
       # Aggregation
       add_aggregation_module: false  # Use learnable aggregation (combines local + global)
+
+    # Token-based NMSW with cross-patch attention
+    # Patches attend to each other via transformer
+    token_nmsw:
+      enabled: true  # Use token-based approach instead of standard NMSW
+
+      # Patch parameters (8³ patches for fine granularity)
+      patch_size: 8                   # 8x8x8 patches
+      num_patches: 200                # Select ~200 patches (increased for GPU util)
+      num_random_patches: 0           # Additional random patches (exploration)
+
+      # Global branch
+      down_size_rate: [2, 2, 2]       # Downsampling for global branch
+      global_base_channels: 16        # Base channels for global UNet
+
+      # Transformer (full, 12 layers)
+      embed_dim: 512                  # Token embedding dimension (increased)
+      num_heads: 8                    # Attention heads
+      num_layers: 12                  # Transformer depth (increased)
+      mlp_ratio: 4.0                  # MLP hidden dim = embed_dim * mlp_ratio
+      dropout: 0.1
+
+      # Positional encoding: "sinusoidal", "learnable", "relative"
+      pos_encoding: "learnable"
+
+      # Gumbel-softmax
+      starting_tau: 0.6666
+      final_tau: 0.6666
+      tau_decay_epochs: 100
+
+      # Loss weights
+      global_loss_weight: 1.0
+      local_loss_weight: 1.0
+      agg_loss_weight: 1.0
+      entropy_multiplier: 0.00001
 
   eval_totalseg:
     dataset_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"

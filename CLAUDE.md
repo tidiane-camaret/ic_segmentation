@@ -1,7 +1,9 @@
-# IC Segmentation - In-Context Medical Image Segmentation
+## INSTRUCTIONS
 
-This research project explores methods for deep-learning based 3D medical image segmentation. It aims to design architectures and evaluate them dataset for accuracy (Dice, NSD ...) and efficiency (memory consumption, flops, inference time)
-The general idea is to perform segmentation in-context, i.e. the model recieves a target image to segment, as well as a set of context image/ground truth masks.
+This research project evaluates methods for deep-learning based 3D medical image segmentation. It aims to design architectures and evaluate them dataset for accuracy (Dice, NSD ...) and efficiency (memory consumption, flops, inference time)
+
+The final goal is to perform segmentation in-context, i.e. the model recieves a target image and a set of related context image/masks, and outputs a mask prediction for the target image.
+
 Write understandable code with short docstrings. Do not write extensive documentation or quickstarts, just write important changes in README.md and short research logs in logs.md. Write tests only when necessary.
 The relevant code repos as in /software/notebooks/camaret/repos , e.g Medverse, nnInteractive_fork, PatchWork, Neuroverse3D
 
