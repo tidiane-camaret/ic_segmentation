@@ -10,14 +10,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import nibabel as nib
 import numpy as np
+from data.label_ids_totalseg import get_label_ids
 from src.config import config
 from src.totalseg_dataloader import get_dataloader
-from data.label_ids_totalseg import get_label_ids
 
 
 def evaluate_totalseg(
     dataset_path: Optional[str] = None,
     model_path: Optional[str] = None,
+    model_type: Optional[str] = None,  # "medverse", "nmsw", or "nmsw_token"
     label_id_list: Optional[List[str]] = None,
     label_ids_split: Optional[Union[str, List[str]]] = None,
     context_size: Optional[int] = None,
@@ -25,6 +26,8 @@ def evaluate_totalseg(
     sw_roi_size: Optional[tuple] = None,
     sw_overlap: Optional[float] = None,
     sampling_method: Optional[str] = None,
+    # NMSW parameters
+    nmsw_checkpoint: Optional[str] = None,
     # Dataloader parameters
     batch_size: Optional[int] = None,
     image_size: Optional[tuple] = None,
@@ -44,11 +47,16 @@ def evaluate_totalseg(
     """
     # Load defaults from config if not provided
     eval_config = config.get("eval_totalseg", {})
+    paths_config = config.get("paths", {})
 
     if dataset_path is None:
-        dataset_path = eval_config.get("dataset_path", "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg")
+        dataset_path = eval_config.get("dataset_path") or paths_config.get("totalseg_dataset", "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg")
     if model_path is None:
-        model_path = eval_config.get("model_path", "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt")
+        model_path = eval_config.get("model_path") or paths_config.get("medverse_checkpoint", "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt")
+    if model_type is None:
+        model_type = eval_config.get("model_type", "medverse")
+    if model_type not in ["medverse", "nmsw", "nmsw_token"]:
+        raise ValueError(f"model_type must be 'medverse', 'nmsw', or 'nmsw_token', got: {model_type}")
     if label_ids_split is None:
         label_ids_split = eval_config.get("label_ids_split", "val")
     if context_size is None:
@@ -93,6 +101,11 @@ def evaluate_totalseg(
     if sampling_method not in ["original", "foreground"]:
         raise ValueError(f"sampling_method must be 'original' or 'foreground', got: {sampling_method}")
 
+    # NMSW-specific config
+    nmsw_config = config.get("train_totalseg", {}).get("nmsw", {})
+    if nmsw_checkpoint is None:
+        nmsw_checkpoint = eval_config.get("nmsw_checkpoint") or nmsw_config.get("checkpoint_path")
+
     # Load label_id_list based on split (unless explicitly provided)
     if label_id_list is None:
         if isinstance(label_ids_split, list):
@@ -113,6 +126,9 @@ def evaluate_totalseg(
     print("Evaluation Configuration:")
     print(f"  dataset_path: {dataset_path}")
     print(f"  model_path: {model_path}")
+    print(f"  model_type: {model_type}")
+    if model_type in ["nmsw", "nmsw_token"]:
+        print(f"  nmsw_checkpoint: {nmsw_checkpoint}")
     if isinstance(label_ids_split, list):
         print(f"  label_ids_split: custom list")
         print(f"  labels: {label_ids_split}")
@@ -157,6 +173,7 @@ def evaluate_totalseg(
 
             wandb_config = {
                 "dataset": "TotalSeg",
+                "model_type": model_type,
                 "label_ids_split": "custom" if isinstance(label_ids_split, list) else label_ids_split,
                 "num_labels": len(label_id_list),
                 # Model parameters
@@ -179,7 +196,7 @@ def evaluate_totalseg(
                 wandb_config["label_ids_custom"] = label_ids_split
 
             wandb_run = wandb.init(
-                project="ic_segmentation",
+                project=eval_config.get("wandb_project", "ic_segmentation"),
                 config=wandb_config,
             )
             wandb.define_metric("dice")
@@ -206,10 +223,56 @@ def evaluate_totalseg(
     # Import model/torch lazily to avoid import at module load
     import torch
 
-    # Load model - choose based on sampling method
+    # Load model - choose based on model_type and sampling method
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    if sampling_method == "foreground":
+    if model_type == "nmsw_token":
+        # Load NMSW Token-based model
+        from src.nmsw_token_based import NMSWTokenSegFormer3D
+        print("Loading NMSW Token-based model...")
+        
+        # Load config for model initialization
+        train_config = config.get("train_totalseg", {})
+        model_config = {
+            "model_parameters": train_config.get("model_parameters", {}),
+        }
+        
+        # Create model and load checkpoint
+        model = NMSWTokenSegFormer3D(config=model_config, nmsw_config=nmsw_config)
+        if nmsw_checkpoint is not None:
+            checkpoint = torch.load(nmsw_checkpoint, map_location=device)
+            if "state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
+            print(f"  Loaded checkpoint from: {nmsw_checkpoint}")
+        else:
+            print("  Warning: No NMSW checkpoint provided, using random weights")
+        model = model.to(device).eval()
+        
+    elif model_type == "nmsw":
+        # Load original NMSW model (SegFormer3D-based)
+        from src.nmsw_segformer import NMSWSegFormer3D
+        print("Loading NMSW SegFormer3D model...")
+        
+        train_config = config.get("train_totalseg", {})
+        model_config = {
+            "model_parameters": train_config.get("model_parameters", {}),
+        }
+        
+        model = NMSWSegFormer3D(config=model_config, nmsw_config=nmsw_config)
+        if nmsw_checkpoint is not None:
+            checkpoint = torch.load(nmsw_checkpoint, map_location=device)
+            if "state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
+            print(f"  Loaded checkpoint from: {nmsw_checkpoint}")
+        else:
+            print("  Warning: No NMSW checkpoint provided, using random weights")
+        model = model.to(device).eval()
+        
+    elif sampling_method == "foreground":
         from src.medverse_foreground_sampling import LightningModelForegroundSampling
         print("Loading model with foreground sampling...")
         model = (
@@ -256,16 +319,27 @@ def evaluate_totalseg(
 
         start_time = time.time()
         with torch.no_grad():
-            output = model.autoregressive_inference(
-                target_in=target_in,
-                context_in=context_in,
-                context_out=context_out,
-                level=None,
-                forward_l_arg=3,
-                sw_roi_size=sw_roi_size,
-                sw_overlap=sw_overlap,
-                sw_batch_size_val=1,
-            )
+            if model_type in ["nmsw", "nmsw_token"]:
+                # NMSW models have different inference interface
+                # They process the full volume directly
+                outputs = model(
+                    x=target_in,
+                    labels=None,
+                    mode="test",
+                )
+                output = outputs["final_logit"]
+            else:
+                # Medverse models use autoregressive inference
+                output = model.autoregressive_inference(
+                    target_in=target_in,
+                    context_in=context_in,
+                    context_out=context_out,
+                    level=None,
+                    forward_l_arg=3,
+                    sw_roi_size=sw_roi_size,
+                    sw_overlap=sw_overlap,
+                    sw_batch_size_val=1,
+                )
         end_time = time.time()
         print(f"Inference time: {end_time - start_time:.2f} seconds")
 
@@ -427,6 +501,19 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Path to Medverse checkpoint (.ckpt) (default: from config.yaml)",
     )
     parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=["medverse", "nmsw", "nmsw_token"],
+        help="Model type: 'medverse', 'nmsw' (SegFormer3D), or 'nmsw_token' (Transformer) (default: from config.yaml)",
+    )
+    parser.add_argument(
+        "--nmsw-checkpoint",
+        type=str,
+        default=None,
+        help="Path to NMSW model checkpoint (for nmsw/nmsw_token model types)",
+    )
+    parser.add_argument(
         "--label-ids-split",
         type=str,
         nargs="+",
@@ -515,6 +602,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     mean_dice = evaluate_totalseg(
         dataset_path=args.dataset_path,
         model_path=args.model_path,
+        model_type=args.model_type,
         label_id_list=None,  # Will be loaded from split
         label_ids_split=label_ids_split,
         context_size=args.context_size,
@@ -522,6 +610,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         sw_roi_size=sw_roi_size,
         sw_overlap=args.sw_overlap,
         sampling_method=args.sampling_method,
+        nmsw_checkpoint=args.nmsw_checkpoint,
         # Dataloader parameters (use config defaults)
         batch_size=None,
         image_size=None,

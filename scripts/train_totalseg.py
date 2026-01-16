@@ -1,38 +1,38 @@
 """
-Train SegFormer3D on TotalSegmentator dataset.
+Train SegFormer3D or NMSW models on TotalSegmentator dataset.
 
 Usage:
     python scripts/train_totalseg.py
+    python scripts/train_totalseg.py --model-type nmsw_token
     python scripts/train_totalseg.py --no-wandb
 """
 
-import os
-import sys
-import random
 import argparse
+import os
+import random
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import yaml
-import torch
 import numpy as np
-from torch.utils.data import DataLoader
+import torch
+import yaml
 from accelerate import Accelerator
 from termcolor import colored
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add paths
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, "/software/notebooks/camaret/repos/SegFormer3D")
 
-from src.totalseg_dataloader import TotalSegmentatorDataset
-from src.config import load_config
-
 # SegFormer3D imports
 from architectures.segformer3d import build_segformer3d_model
 from losses.losses import build_loss_fn
 from optimizers.optimizers import build_optimizer
 from optimizers.schedulers import build_scheduler
+from src.config import load_config
+from src.totalseg_dataloader import TotalSegmentatorDataset
 
 
 class TotalSegDatasetWrapper(TotalSegmentatorDataset):
@@ -141,10 +141,13 @@ def build_dataloaders(config: Dict, accelerator) -> tuple:
     return train_loader, val_loader
 
 
-def train_epoch(model, train_loader, criterion, optimizer, accelerator, epoch: int, print_every: int):
+def train_epoch(model, train_loader, criterion, optimizer, accelerator, epoch: int, print_every: int, model_type: str = "segformer3d"):
     """Run one training epoch."""
     model.train()
     epoch_loss = 0.0
+    epoch_global_loss = 0.0
+    epoch_local_loss = 0.0
+    epoch_agg_loss = 0.0
 
     for idx, batch in enumerate(train_loader):
         with accelerator.accumulate(model):
@@ -153,8 +156,19 @@ def train_epoch(model, train_loader, criterion, optimizer, accelerator, epoch: i
 
             optimizer.zero_grad(set_to_none=True)
 
-            predictions = model(images)
-            loss = criterion(predictions, labels)
+            if model_type in ["nmsw", "nmsw_token"]:
+                # NMSW models have different forward/loss interface
+                outputs = model(x=images, labels=labels, mode="train")
+                losses = model.compute_loss(outputs, labels, criterion)
+                loss = losses["total_loss"]
+                
+                epoch_global_loss += losses["global_loss"].detach().item()
+                epoch_local_loss += losses["local_loss"].detach().item()
+                epoch_agg_loss += losses["agg_loss"].detach().item()
+            else:
+                # Standard SegFormer3D
+                predictions = model(images)
+                loss = criterion(predictions, labels)
 
             accelerator.backward(loss)
             optimizer.step()
@@ -162,15 +176,24 @@ def train_epoch(model, train_loader, criterion, optimizer, accelerator, epoch: i
             epoch_loss += loss.detach().item()
 
             if print_every and idx % print_every == 0:
-                accelerator.print(
-                    f"Epoch {epoch:04d} | Batch {idx:04d} | "
-                    f"Loss: {epoch_loss / (idx + 1):.5f}"
-                )
+                if model_type in ["nmsw", "nmsw_token"]:
+                    accelerator.print(
+                        f"Epoch {epoch:04d} | Batch {idx:04d} | "
+                        f"Loss: {epoch_loss / (idx + 1):.5f} | "
+                        f"Global: {epoch_global_loss / (idx + 1):.5f} | "
+                        f"Local: {epoch_local_loss / (idx + 1):.5f} | "
+                        f"Agg: {epoch_agg_loss / (idx + 1):.5f}"
+                    )
+                else:
+                    accelerator.print(
+                        f"Epoch {epoch:04d} | Batch {idx:04d} | "
+                        f"Loss: {epoch_loss / (idx + 1):.5f}"
+                    )
 
     return epoch_loss / len(train_loader)
 
 
-def validate(model, val_loader, criterion, accelerator):
+def validate(model, val_loader, criterion, accelerator, model_type: str = "segformer3d"):
     """Run validation."""
     model.eval()
     total_loss = 0.0
@@ -181,8 +204,16 @@ def validate(model, val_loader, criterion, accelerator):
             images = batch["image"]
             labels = batch["label"]
 
-            predictions = model(images)
-            loss = criterion(predictions, labels)
+            if model_type in ["nmsw", "nmsw_token"]:
+                # NMSW models return dict with final_logit
+                outputs = model(x=images, labels=None, mode="test")
+                predictions = outputs["final_logit"]
+                loss = criterion(predictions, labels)
+            else:
+                # Standard SegFormer3D
+                predictions = model(images)
+                loss = criterion(predictions, labels)
+            
             total_loss += loss.item()
 
             # Compute dice score
@@ -198,24 +229,42 @@ def validate(model, val_loader, criterion, accelerator):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SegFormer3D on TotalSegmentator")
+    parser = argparse.ArgumentParser(description="Train SegFormer3D or NMSW models on TotalSegmentator")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=["segformer3d", "nmsw", "nmsw_token"],
+        help="Model type: 'segformer3d', 'nmsw', or 'nmsw_token' (default: from config or segformer3d)"
+    )
     args = parser.parse_args()
 
     # Load config
     config = load_config()
     train_cfg = config.get("train_totalseg", {})
+    nmsw_cfg = train_cfg.get("nmsw", {})
+    paths_cfg = config.get("paths", {})
+
+    # Determine model type
+    if args.model_type is not None:
+        model_type = args.model_type
+    elif nmsw_cfg.get("enabled", False):
+        model_type = "nmsw_token" if nmsw_cfg.get("use_token_branch", False) else "nmsw"
+    else:
+        model_type = "segformer3d"
 
     # Merge with defaults
     full_config = {
-        "project": train_cfg.get("project", "segformer3d_totalseg"),
+        "project": train_cfg.get("wandb_project", "segformer3d_totalseg"),
+        "model_type": model_type,
         "wandb_parameters": {
             "entity": train_cfg.get("wandb_entity"),
             "group": train_cfg.get("wandb_group", "totalseg"),
-            "name": train_cfg.get("wandb_name", "segformer3d_train"),
+            "name": train_cfg.get("wandb_name", f"{model_type}_train"),
             "mode": "disabled" if args.no_wandb else "online",
         },
-        "model_name": "segformer3d",
+        "model_name": model_type,
         "model_parameters": train_cfg.get("model_parameters", {
             "in_channels": 1,
             "sr_ratios": [4, 2, 1, 1],
@@ -264,7 +313,18 @@ def main():
         },
         "sliding_window_inference": {"sw_batch_size": 4, "roi": [128, 128, 128]},
         "ema": {"enabled": False, "ema_decay": 0.999, "val_ema_every": 1},
+        "nmsw_config": nmsw_cfg,
     }
+
+    # Update dataset path from paths config if not set
+    if full_config["dataset_parameters"]["dataset_path"] is None:
+        full_config["dataset_parameters"]["dataset_path"] = paths_cfg.get("totalseg_dataset")
+
+    # Update checkpoint dir to include model type
+    if train_cfg.get("training_parameters", {}).get("checkpoint_save_dir") is None:
+        full_config["training_parameters"]["checkpoint_save_dir"] = str(
+            Path(paths_cfg.get("RESULTS_DIR", config.get("RESULTS_DIR", "results"))) / f"{model_type}_totalseg"
+        )
 
     # Set seed
     seed_everything(full_config["training_parameters"]["seed"])
@@ -287,14 +347,44 @@ def main():
         )
 
     accelerator.print("=" * 60)
-    accelerator.print("Training SegFormer3D on TotalSegmentator")
+    accelerator.print(f"Training {model_type} on TotalSegmentator")
     accelerator.print("=" * 60)
 
     # Build dataloaders
     train_loader, val_loader = build_dataloaders(full_config, accelerator)
 
-    # Build model
-    model = build_segformer3d_model(full_config)
+    # Build model based on model_type
+    if model_type == "nmsw_token":
+        from src.nmsw_token_based import NMSWTokenSegFormer3D, TokenTauScheduler
+        model = NMSWTokenSegFormer3D(
+            config=full_config,
+            nmsw_config=full_config["nmsw_config"],
+        )
+        tau_scheduler = TokenTauScheduler(
+            model=model,
+            starting_tau=full_config["nmsw_config"].get("starting_tau", 2/3),
+            final_tau=full_config["nmsw_config"].get("final_tau", 2/3),
+            decay_epochs=full_config["nmsw_config"].get("tau_decay_epochs", 100),
+            total_epochs=full_config["training_parameters"]["num_epochs"],
+        )
+        accelerator.print(f"Using NMSW Token-based model with tau={tau_scheduler.get_tau():.4f}")
+    elif model_type == "nmsw":
+        from src.nmsw_segformer import NMSWSegFormer3D, TauScheduler
+        model = NMSWSegFormer3D(
+            config=full_config,
+            nmsw_config=full_config["nmsw_config"],
+        )
+        tau_scheduler = TauScheduler(
+            model=model,
+            starting_tau=full_config["nmsw_config"].get("starting_tau", 2/3),
+            final_tau=full_config["nmsw_config"].get("final_tau", 2/3),
+            decay_epochs=full_config["nmsw_config"].get("tau_decay_epochs", 100),
+            total_epochs=full_config["training_parameters"]["num_epochs"],
+        )
+        accelerator.print(f"Using NMSW SegFormer3D model with tau={tau_scheduler.get_tau():.4f}")
+    else:
+        model = build_segformer3d_model(full_config)
+        tau_scheduler = None
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     accelerator.print(f"Model parameters: {num_params:,}")
 
@@ -328,6 +418,13 @@ def main():
     print_every = full_config["training_parameters"]["print_every"]
 
     for epoch in tqdm(range(num_epochs), desc="Training"):
+        # Update tau for NMSW models
+        if tau_scheduler is not None:
+            tau_scheduler.step(epoch)
+            current_tau = tau_scheduler.get_tau()
+        else:
+            current_tau = None
+
         # Select scheduler
         if full_config["warmup_scheduler"]["enabled"] and epoch < warmup_epochs:
             scheduler = warmup_scheduler
@@ -337,32 +434,38 @@ def main():
         # Train
         train_loss = train_epoch(
             model, train_loader, criterion, optimizer,
-            accelerator, epoch, print_every
+            accelerator, epoch, print_every, model_type=model_type
         )
 
         # Validate
-        val_loss, val_dice = validate(model, val_loader, criterion, accelerator)
+        val_loss, val_dice = validate(model, val_loader, criterion, accelerator, model_type=model_type)
 
         # Step scheduler
         scheduler.step()
 
         # Log
-        accelerator.print(
+        log_msg = (
             f"Epoch {epoch:04d} | "
             f"Train Loss: {train_loss:.5f} | "
             f"Val Loss: {val_loss:.5f} | "
             f"Val Dice: {val_dice:.5f} | "
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
+        if current_tau is not None:
+            log_msg += f" | Tau: {current_tau:.4f}"
+        accelerator.print(log_msg)
 
         if not args.no_wandb:
-            accelerator.log({
+            log_dict = {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_dice": val_dice,
                 "lr": scheduler.get_last_lr()[0],
-            })
+            }
+            if current_tau is not None:
+                log_dict["tau"] = current_tau
+            accelerator.log(log_dict)
 
         # Save best model
         if val_dice > best_dice:

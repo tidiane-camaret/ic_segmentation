@@ -4,15 +4,19 @@
 # The system automatically detects which machine you're on and loads the appropriate config.
 # All eval_totalseg parameters can be overridden via command-line arguments.
 
+
 nora:
 
-  #DATA_DIR: "/nfs/data/nii/data1/Analysis/GPUnet/ANALYSIS_incontext/SegFM3D/data"
-  DATA_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data"
-  RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
+  paths:
+    DATA_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data"
+    RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
+    totalseg_dataset: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
+    medverse_checkpoint: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
+    neuroverse_checkpoint: "/software/notebooks/camaret/repos/Neuroverse3D/checkpoint/neuroverse3D.ckpt"
 
   train_totalseg:
     # Dataset
-    dataset_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
+    dataset_path: null  # Uses paths.totalseg_dataset if not specified
     train_label_ids:
       - heart
     val_label_ids:
@@ -73,15 +77,15 @@ nora:
       checkpoint_save_dir: null # null = default directory
 
     # Logging
-    project: "segformer3d_totalseg"
-    wandb_entity: null
-    wandb_group: "totalseg"
-    wandb_name: "segformer3d_train"
+    wandb_project: "segformer3d_totalseg"
+    #wandb_entity: null
+    #wandb_group: "totalseg"
+    #wandb_name: "segformer3d_train"
 
     # NMSW (No More Sliding Window) patch sampling
     # Replaces sliding window with differentiable top-k patch selection
     nmsw:
-      enabled: false  # Set to true to enable NMSW sampling
+      enabled: true  # Set to true to enable NMSW sampling
 
       # Global branch (coarse prediction)
       down_size_rate: [2, 2, 2]  # Downsampling factor for global branch
@@ -91,7 +95,7 @@ nora:
       # patch_size should be SMALLER than image_size to benefit from selective sampling
       # With 128^3 image and 64^3 patches at 50% overlap: ~8 patches total
       # Selecting top-4 reduces compute by ~50%
-      patch_size: [16, 16, 16]    # Patch size for local branch (smaller than image_size!)
+      patch_size: [8, 8, 8]    # Patch size for local branch (smaller than image_size!)
       overlap: 0.5                 # Patch overlap (0.5 = 50%)
       num_train_patches: 50          # Top-k patches during training
       num_train_random_patches: 50   # Random patches for exploration
@@ -111,9 +115,25 @@ nora:
       # Aggregation
       add_aggregation_module: false  # Use learnable aggregation (combines local + global)
 
+      # Token-based local branch (alternative to SegFormer3D)
+      # Set use_token_branch: true to use transformer-based patch processing
+      use_token_branch: true        # Use token-based transformer instead of SegFormer3D
+      transformer_embed_dim: 256     # Embedding dimension for patch tokens
+      transformer_num_heads: 8       # Number of attention heads
+      transformer_num_layers: 6      # Number of transformer encoder layers
+      transformer_mlp_ratio: 4.0     # MLP hidden dim = embed_dim * mlp_ratio
+      transformer_dropout: 0.1       # Dropout rate in transformer
+
   eval_totalseg:
-    dataset_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
-    model_path: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
+    dataset_path: null  # Uses paths.totalseg_dataset if not specified
+    model_path: null     # Uses paths.medverse_checkpoint if not specified
+    
+    # Model type selection
+    # - "medverse": Original Medverse model (default)
+    # - "nmsw": NMSW with SegFormer3D local branch
+    # - "nmsw_token": NMSW with Token-based transformer local branch
+    model_type: "medverse"
+    nmsw_checkpoint: null  # Path to NMSW checkpoint (for nmsw/nmsw_token types)
 
     # Label selection
     # label_ids_split: Can be:
@@ -155,6 +175,7 @@ nora:
     max_ds_len: null  # null = use full dataset, or integer to limit number of samples
 
     # Logging and inspection
+    wandb_project: "ic_segmentation"  # W&B project name
     use_wandb: true
     save_imgs_masks: false
     enable_inspection: false

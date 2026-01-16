@@ -3,35 +3,39 @@
 # 3) eval output (dice, nsd) and add mask pred to nora project
 
 import os
-import torch
 import sys
+
+import torch
+
 sys.path.append("/nfs/norasys/notebooks/camaret/repos/Medverse")
 sys.path.append("/software/notebooks/camaret/repos/Neuroverse3D")
-from utils.dataloading import structure_data
-from medverse.lightning_model import LightningModel
-import numpy as np
-import nibabel as nib
-from nilearn.image import resample_img
 from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+from medverse.lightning_model import LightningModel
+from nilearn.image import resample_img
+from scripts.tasks_dict import tasks_dict
 from src.config import config
 from src.utils import load_seg_data
-from scripts.tasks_dict import tasks_dict
+from utils.dataloading import structure_data
 
-
+paths_config = config.get("paths", {})
 project_name = "camaret___in_context_segmentation"
 
 sys.path.append("/software/notebooks/camaret/repos/Neuroverse3D")
 from neuroverse3D.lightning_model import LightningModel
-from utils.dataloading import structure_data
 from src.utils import load_seg_data
-
+from utils.dataloading import structure_data
 from utils.task_synthesis import *
+
 device = "cuda:0"
-checkpoint_path = '/software/notebooks/camaret/repos/Neuroverse3D/checkpoint/neuroverse3D.ckpt'
+checkpoint_path = paths_config.get("neuroverse_checkpoint", "/software/notebooks/camaret/repos/Neuroverse3D/checkpoint/neuroverse3D.ckpt")
 checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
 hparams = checkpoint['hyper_parameters']
 # load model
 import warnings
+
 warnings.filterwarnings('ignore')
 model = LightningModel.load_from_checkpoint(checkpoint_path, map_location=torch.device(device))
 print('Load checkpoint from:', checkpoint_path)
@@ -45,7 +49,8 @@ target_shape = (128, 128, 128)
 for task_name, case_list in tasks_dict.items():
     # remove underscore from task_name
     task_name = task_name.replace("_", "")
-    export_dir = Path(config["RESULTS_DIR"]) / task_name
+    results_dir = paths_config.get("RESULTS_DIR", config.get("RESULTS_DIR", ""))
+    export_dir = Path(results_dir) / task_name
     export_dir.mkdir(exist_ok=True)
     img_dir = export_dir / 'imgs'
     lab_dir = export_dir / 'labs'
@@ -104,9 +109,9 @@ for task_name, case_list in tasks_dict.items():
     # compute dsc and nsd
     sys.path.append("/nfs/norasys/notebooks/camaret/cvpr25/CVPR-MedSegFMCompetition")
     from SurfaceDice import (
-        compute_surface_distances,
-        compute_surface_dice_at_tolerance,
         compute_dice_coefficient,
+        compute_surface_dice_at_tolerance,
+        compute_surface_distances,
     )
     dsc = compute_dice_coefficient(mask_np, target_out_np)
 

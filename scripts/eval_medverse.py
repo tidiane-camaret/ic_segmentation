@@ -3,21 +3,25 @@
 # 3) eval output (dice, nsd) and add mask pred to nora project
 
 import os
-import torch
 import sys
+
+import torch
+
 sys.path.append("/nfs/norasys/notebooks/camaret/repos/Medverse")
 sys.path.append("/software/notebooks/camaret/repos/Neuroverse3D")
-from utils.dataloading import structure_data
-from medverse.lightning_model import LightningModel
-import numpy as np
-import nibabel as nib
 from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+from medverse.lightning_model import LightningModel
+from scripts.tasks_dict import tasks_dict
 from src.config import config
 from src.utils import load_seg_data
-from scripts.tasks_dict import tasks_dict
+from utils.dataloading import structure_data
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model_path = "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
+paths_config = config.get("paths", {})
+model_path = paths_config.get("medverse_checkpoint", "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt")
 model = LightningModel.load_from_checkpoint(model_path, map_location=device).to(device).eval()
 project_name = "camaret___in_context_segmentation"
 
@@ -29,7 +33,8 @@ nb_cases = 5  # number of context cases + 1 (target case). None for all cases
 for task_name, case_list in tasks_dict.items():
     # remove underscore from task_name
     task_name = task_name.replace("_", "")
-    export_dir = Path(config["RESULTS_DIR"]) / task_name
+    results_dir = paths_config.get("RESULTS_DIR", config.get("RESULTS_DIR", ""))
+    export_dir = Path(results_dir) / task_name
     export_dir.mkdir(exist_ok=True)
     img_dir = export_dir / 'imgs'
     lab_dir = export_dir / 'labs'
@@ -90,9 +95,9 @@ for task_name, case_list in tasks_dict.items():
     # compute dsc and nsd
     sys.path.append("/nfs/norasys/notebooks/camaret/cvpr25/CVPR-MedSegFMCompetition")
     from SurfaceDice import (
-        compute_surface_distances,
-        compute_surface_dice_at_tolerance,
         compute_dice_coefficient,
+        compute_surface_dice_at_tolerance,
+        compute_surface_distances,
     )
     dsc = compute_dice_coefficient(mask_np, target_out_np)
 
