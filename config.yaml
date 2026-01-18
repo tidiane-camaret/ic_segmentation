@@ -16,7 +16,7 @@ paths:
       dino_convnext: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3"
 
 train:
-  dataset: "medsegbench"
+  dataset: "medsegbench_dca1"
   method: "global_local"  # Options: "segformer3d", "global_local""
   train_label_ids:
     - heart
@@ -66,7 +66,7 @@ train:
   logging:
     use_wandb: false
     wandb_project: "patch_icl_train"
-    save_imgs_masks: false
+    save_imgs_masks: true
 
 
 eval:
@@ -143,11 +143,11 @@ model_params:
     global:
 
       backbone: "ground_truth"
-      down_size_rate: 2
+      down_size_rate: 16
       base_channels: 16
 
       # Patch sampling
-      patch_size: 8    # Patch size for local branch (smaller than image_size!)
+      patch_size: 16    # Patch size for local branch (smaller than image_size!)
       overlap: 0.5                 # Patch overlap (0.5 = 50%)
       num_train_patches: 50          # Top-k patches during training
       num_train_random_patches: 50   # Random patches for exploration

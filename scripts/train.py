@@ -1,13 +1,13 @@
 """ training script for image segmentation models """
 import sys
 from pathlib import Path
+from turtle import down
 import torch
 from tqdm import tqdm
 sys.path.insert(0, "/software/notebooks/camaret/repos")
 
 from SegFormer3D.architectures.segformer3d import build_segformer3d_model
 from SegFormer3D.losses.losses import build_loss_fn
-
 
 from src.config import load_config
 from src.train_utils import seed_everything, build_dataloaders, train_epoch, validate
@@ -31,13 +31,13 @@ ckpt_dir.mkdir(parents=True, exist_ok=True)
 
 ### get dataset class
 if train_config["dataset"] == "totalseg_no_context":
-    from src.totalseg_dataloader_no_context import TotalSegDatasetNoContext, collate_fn
+    from src.dataloaders.totalseg_dataloader_no_context import TotalSegDatasetNoContext, collate_fn
     DatasetClass = TotalSegDatasetNoContext
 elif train_config["dataset"] == "totalseg":
-    from src.totalseg_dataloader import TotalSegmentatorDataset as DatasetClass
+    from src.dataloaders.totalseg_dataloader import TotalSegmentatorDataset as DatasetClass
     collate_fn = None
-elif train_config["dataset"] == "medsegbench":
-    from src.medsegbench_dataloader import get_dataloader 
+elif train_config["dataset"].split("_")[0] == "medsegbench":
+    from src.dataloaders.medsegbench_dataloader import get_dataloader 
 else:
     raise ValueError(f"Unknown dataset: {train_config['dataset']}")
 
@@ -58,15 +58,17 @@ train_loader, val_loader = build_dataloaders(
 )
 """
 train_loader = get_dataloader(
-    dataset_name="abdomenus",
+    dataset_name=train_config["dataset"],
     split="train",
     root=config["paths"]["medsegbench"],
-    image_size=train_config["preprocessing"]["image_size"][0])
+    image_size=train_config["preprocessing"]["image_size"][0],
+    download=True)
 val_loader = get_dataloader(
-    dataset_name="abdomenus",
+    dataset_name=train_config["dataset"],
     split="val",
     root=config["paths"]["medsegbench"],
-    image_size=train_config["preprocessing"]["image_size"][0])
+    image_size=train_config["preprocessing"]["image_size"][0],
+    download=True)
 
 # get model 
 if train_config["method"] == "segformer3d":
@@ -113,13 +115,23 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         device, epoch, print_every
     )
 
-    val_loss, val_dice = validate(model, val_loader, criterion, device)
+    # Validation with optional saving (overwrites each time)
+    save_imgs = train_config["logging"].get("save_imgs_masks", False)
+    save_dir = None
+    if save_imgs and epoch % 10 == 0:  # Save every 10 epochs
+        save_dir = Path(paths["RESULTS_DIR"]) / "train_outputs"
+
+    val_loss, val_dice = validate(
+        model, val_loader, criterion, device,
+        save_dir=save_dir, max_save_batches=2
+    )
 
     scheduler.step()
 
     print(
         f"Epoch {epoch:04d} | "
-        f"Train: {train_losses['loss']:.5f} | "
+        f"Train Loss: {train_losses['loss']:.5f} | "
+        f"Train Dice: {train_losses['dice']:.5f} | "
         f"Val Loss: {val_loss:.5f} | "
         f"Val Dice: {val_dice:.5f} | "
         f"LR: {scheduler.get_last_lr()[0]:.2e}"
@@ -129,6 +141,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         wandb.log({
             "epoch": epoch,
             "train_loss": train_losses["loss"],
+            "train_dice": train_losses["dice"],
             "train_global_loss": train_losses["global_loss"],
             "train_local_loss": train_losses["local_loss"],
             "train_agg_loss": train_losses["agg_loss"],

@@ -8,8 +8,8 @@ import medsegbench
 
 # Available MedSegBench dataset classes
 DATASET_CLASSES = {
-    "abdomenus": medsegbench.AbdomenUSMSBench,
-
+    "medsegbench_abdomenus": medsegbench.AbdomenUSMSBench,
+    "medsegbench_dca1": medsegbench.Dca1MSBench
 }
 
 """
@@ -85,12 +85,15 @@ class MedSegBenchDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        """Returns (image, mask) tensors."""
+        """Returns dict with image, mask, and case_id."""
         image, mask = self.dataset[idx]
 
         # mask is already a tensor from medsegbench, resize it
         if not isinstance(mask, torch.Tensor):
             mask = torch.tensor(mask)
+
+        # set values > 1 to 1
+        mask[mask>1]=1
 
         # Resize mask to match image size
         if mask.dim() == 2:
@@ -104,6 +107,7 @@ class MedSegBenchDataset(Dataset):
         return {
             "image": image,
             "label": mask,
+            "case_id": f"s{idx:04d}",
         }
 
     @property

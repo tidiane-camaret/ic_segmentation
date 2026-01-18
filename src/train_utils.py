@@ -1,7 +1,9 @@
 import os
 import random
-from typing import Dict
+from pathlib import Path
+from typing import Dict, Optional
 import numpy as np
+import nibabel as nib
 import torch
 from torch.utils.data import DataLoader
 
@@ -75,6 +77,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
     total_global = 0.0
     total_local = 0.0
     total_agg = 0.0
+    total_dice = 0.0
 
     for idx, batch in enumerate(train_loader):
         images = batch["image"].to(device)
@@ -90,6 +93,16 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
         losses = model.compute_loss(outputs, labels, criterion)
         loss = losses["total_loss"]
 
+        # Compute Dice score
+        with torch.no_grad():
+            pred_binary = (torch.sigmoid(outputs["final_logit"]) > 0.5).float()
+            labels_binary = (labels > 0).float()
+            spatial_dims = tuple(range(2, pred_binary.dim()))
+            intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
+            union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
+            dice = (2 * intersection + 1e-6) / (union + 1e-6)
+            total_dice += dice.mean().item()
+
         loss.backward()
         optimizer.step()
 
@@ -102,6 +115,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
                 f"Loss: {total_loss / (idx + 1):.5f} | "
+                f"Dice: {total_dice / (idx + 1):.5f} | "
                 f"Global: {total_global / (idx + 1):.5f} | "
                 f"Local: {total_local / (idx + 1):.5f} | "
                 f"Agg: {total_agg / (idx + 1):.5f}"
@@ -110,19 +124,75 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
     n = len(train_loader)
     return {
         "loss": total_loss / n,
+        "dice": total_dice / n,
         "global_loss": total_global / n,
         "local_loss": total_local / n,
         "agg_loss": total_agg / n,
     }
 
+def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=4):
+    """Save images, masks, and predictions to NIfTI files organized by case ID."""
+    save_dir = Path(save_dir)
+    B = min(images.shape[0], max_samples)
+
+    for i in range(B):
+        case_id = case_ids[i] if case_ids else f"s{i:04d}"
+        case_dir = save_dir / case_id
+        case_dir.mkdir(parents=True, exist_ok=True)
+
+        # Input image
+        img_nib = nib.Nifti1Image(images[i, 0].cpu().numpy(), affine=np.eye(4))
+        nib.save(img_nib, case_dir / "img.nii.gz")
+
+        # Ground truth mask
+        gt_nib = nib.Nifti1Image(labels[i, 0].cpu().numpy().astype(np.float32), affine=np.eye(4))
+        nib.save(gt_nib, case_dir / "gt_mask.nii.gz")
+
+        # Coarse/global prediction (resize to original image size)
+        coarse = outputs["coarse_pred"][i:i+1]  # Keep batch dim for interpolate
+        target_size = images.shape[2:]  # (H, W) or (D, H, W)
+        coarse_resized = torch.nn.functional.interpolate(
+            coarse, size=target_size, mode="nearest"
+        )
+        coarse_nib = nib.Nifti1Image(coarse_resized[0, 0].cpu().numpy().astype(np.float32), affine=np.eye(4))
+        nib.save(coarse_nib, case_dir / "coarse_pred_mask.nii.gz")
+
+        # Final aggregated prediction
+        final = torch.sigmoid(outputs["final_logit"][i, 0]).cpu().numpy()
+        final_nib = nib.Nifti1Image(final.astype(np.float32), affine=np.eye(4))
+        nib.save(final_nib, case_dir / "final_pred_mask.nii.gz")
+
+        # Save first few patches and their predictions
+        K = min(4, outputs["patches"].shape[1])
+        for k in range(K):
+            patch_img = outputs["patches"][i, k, 0].cpu().numpy()
+            patch_img_nib = nib.Nifti1Image(patch_img.astype(np.float32), affine=np.eye(4))
+            nib.save(patch_img_nib, case_dir / f"patch{k}_img.nii.gz")
+
+            patch_label = outputs["patch_labels"][i, k, 0].cpu().numpy()
+            patch_label_nib = nib.Nifti1Image(patch_label.astype(np.float32), affine=np.eye(4))
+            nib.save(patch_label_nib, case_dir / f"patch{k}_gt_mask.nii.gz")
+
+            patch_pred = torch.sigmoid(outputs["patch_logits"][i, k, 0]).cpu().numpy()
+            patch_pred_nib = nib.Nifti1Image(patch_pred.astype(np.float32), affine=np.eye(4))
+            nib.save(patch_pred_nib, case_dir / f"patch{k}_pred_mask.nii.gz")
+
+
 @torch.no_grad()
-def validate(model, val_loader, criterion, device):
-    """Run validation."""
+def validate(
+    model,
+    val_loader,
+    criterion,
+    device,
+    save_dir: Optional[Path] = None,
+    max_save_batches: int = 2,
+):
+    """Run validation with optional saving of predictions."""
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
 
-    for batch in val_loader:
+    for batch_idx, batch in enumerate(val_loader):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
 
@@ -130,19 +200,30 @@ def validate(model, val_loader, criterion, device):
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
-        outputs = model(images, labels=None, mode="test")
+        # Pass labels for oracle global branch (for now - later replace with learned global)
+        outputs = model(images, labels=labels, mode="test")
         predictions = outputs["final_logit"]
 
         loss = criterion(predictions, labels.float())
         total_loss += loss.item()
 
         # Dice score (works for both 2D and 3D)
+        # Binarize both predictions and labels (labels may be multi-class)
         pred_binary = (torch.sigmoid(predictions) > 0.5).float()
-        spatial_dims = tuple(range(2, pred_binary.dim()))  # (2, 3) for 2D, (2, 3, 4) for 3D
-        intersection = (pred_binary * labels).sum(dim=spatial_dims)
-        union = pred_binary.sum(dim=spatial_dims) + labels.sum(dim=spatial_dims)
+        labels_binary = (labels > 0).float()
+        spatial_dims = tuple(range(2, pred_binary.dim()))
+        intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
+        union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
         dice = (2 * intersection + 1e-6) / (union + 1e-6)
         total_dice += dice.mean().item()
+
+        # Save outputs if requested
+        if save_dir is not None and batch_idx < max_save_batches:
+            case_ids = batch.get("case_id", None)
+            save_predictions(save_dir, case_ids, images, labels, outputs)
+
+    if save_dir is not None:
+        print(f"  Saved validation outputs to {save_dir}")
 
     return total_loss / len(val_loader), total_dice / len(val_loader)
 

@@ -13,63 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.models.local import LocalTransformer, LocalDino, LocalDinoLight, PatchEmbedding2D
 
-class PatchEmbedding2D(nn.Module):
-    """Embed 2D image patches into tokens."""
-
-    def __init__(self, patch_size: int = 8, in_channels: int = 1, embed_dim: int = 256):
-        super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(
-            in_channels, embed_dim,
-            kernel_size=patch_size, stride=patch_size
-        )
-
-    def forward(self, x):
-        # x: [B, C, H, W] -> [B, embed_dim, H//ps, W//ps]
-        x = self.proj(x)
-        # Flatten to [B, num_patches, embed_dim]
-        x = x.flatten(2).transpose(1, 2)
-        return x
-
-
-class LocalTransformer(nn.Module):
-    """Shallow transformer for processing local patches."""
-
-    def __init__(
-        self,
-        embed_dim: int = 256,
-        num_heads: int = 4,
-        num_layers: int = 2,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.embed_dim = embed_dim
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Output projection to segmentation logits per token
-        self.seg_head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, 1),
-        )
-
-    def forward(self, x):
-        # x: [B, num_tokens, embed_dim]
-        x = self.transformer(x)
-        logits = self.seg_head(x)  # [B, num_tokens, 1]
-        return logits.squeeze(-1)
 
 
 class GlobalLocalModel(nn.Module):
@@ -110,10 +55,8 @@ class GlobalLocalModel(nn.Module):
             in_channels=in_channels,
             embed_dim=embed_dim,
         )
-        self.local_transformer = LocalTransformer(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            num_layers=num_layers,
+        self.local_transformer = LocalDino(
+            pretrained_path="/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
         )
 
         # Position embeddings
@@ -203,34 +146,35 @@ class GlobalLocalModel(nn.Module):
 
         return patches, patch_labels, coords
 
-    def local_branch(self, patches: torch.Tensor) -> torch.Tensor:
-        """Process all patches as tokens in a single transformer forward pass."""
-        B, K, C, ps, _ = patches.shape
-        ips = self.internal_patch_size
-        grid_size = ps // ips
-        tokens_per_patch = self.num_tokens
+    def local_branch(self, patches: torch.Tensor, coords: torch.Tensor = None) -> torch.Tensor:
+        """Process patches through local model (LocalDino or LocalTransformer)."""
+        # LocalDino/LocalDinoLight expect [B, K, C, ps, ps] and coords
+        # They return [B, K, num_classes, ps, ps]
+        if hasattr(self.local_transformer, 'backbone') or hasattr(self.local_transformer, 'patch_embed'):
+            # LocalDino or LocalDinoLight
+            return self.local_transformer(patches, coords)
+        else:
+            # Fallback for LocalTransformer (token-based)
+            B, K, C, ps, _ = patches.shape
+            ips = self.internal_patch_size
+            grid_size = ps // ips
+            tokens_per_patch = self.num_tokens
 
-        # Embed all patches: [B, K, C, ps, ps] -> [B*K, C, ps, ps] -> [B*K, tokens_per_patch, embed_dim]
-        patches_flat = patches.reshape(B * K, C, ps, ps)
-        all_tokens = self.patch_embed(patches_flat)  # [B*K, tokens_per_patch, embed_dim]
+            patches_flat = patches.reshape(B * K, C, ps, ps)
+            all_tokens = self.patch_embed(patches_flat)
+            all_tokens = all_tokens.reshape(B, K * tokens_per_patch, -1)
 
-        # Reshape to [B, K*tokens_per_patch, embed_dim] for cross-patch attention
-        all_tokens = all_tokens.reshape(B, K * tokens_per_patch, -1)
+            pos_embed_tiled = self.pos_embed.repeat(1, K, 1)
+            all_tokens = all_tokens + pos_embed_tiled
 
-        # Add position embeddings (tiled for each patch)
-        pos_embed_tiled = self.pos_embed.repeat(1, K, 1)  # [1, K*tokens_per_patch, embed_dim]
-        all_tokens = all_tokens + pos_embed_tiled
+            all_logits = self.local_transformer(all_tokens)
 
-        # Single transformer forward pass with cross-patch attention
-        all_logits = self.local_transformer(all_tokens)  # [B, K*tokens_per_patch]
+            all_logits = all_logits.view(B, K, tokens_per_patch)
+            all_logits = all_logits.view(B * K, 1, grid_size, grid_size)
+            all_logits = self.decoder(all_logits)
+            all_logits = all_logits.view(B, K, 1, ps, ps)
 
-        # Reshape back to per-patch logits and upsample
-        all_logits = all_logits.view(B, K, tokens_per_patch)  # [B, K, tokens_per_patch]
-        all_logits = all_logits.view(B * K, 1, grid_size, grid_size)
-        all_logits = self.decoder(all_logits)  # [B*K, 1, ps, ps]
-        all_logits = all_logits.view(B, K, 1, ps, ps)
-
-        return all_logits  # [B, K, 1, ps, ps]
+            return all_logits
 
     def forward(
         self,
@@ -270,7 +214,7 @@ class GlobalLocalModel(nn.Module):
             )
 
         patches, patch_labels, coords = self.select_patches(image, labels, coarse_pred)
-        patch_logits = self.local_branch(patches)
+        patch_logits = self.local_branch(patches, coords)
 
         # Create full output volume (for final_logit)
         B, C, H, W = image.shape
