@@ -1,9 +1,155 @@
-
+""" training script for image segmentation models """
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import torch
+from tqdm import tqdm
+sys.path.insert(0, "/software/notebooks/camaret/repos")
+
+from SegFormer3D.architectures.segformer3d import build_segformer3d_model
+from SegFormer3D.losses.losses import build_loss_fn
+
 
 from src.config import load_config
+from src.train_utils import seed_everything, build_dataloaders, train_epoch, validate
 
+
+# get config from config.yaml 
 config = load_config()
-print(config["train"]["module_params"])
+paths = config["paths"]
+train_config = config["train"]
+
+# set seed
+seed_everything(train_config["training_parameters"]["seed"])
+
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Create checkpoint dir
+ckpt_dir = Path(paths["ckpts"]["save_dir"])
+ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+### get dataset class
+if train_config["dataset"] == "totalseg_no_context":
+    from src.totalseg_dataloader_no_context import TotalSegDatasetNoContext, collate_fn
+    DatasetClass = TotalSegDatasetNoContext
+elif train_config["dataset"] == "totalseg":
+    from src.totalseg_dataloader import TotalSegmentatorDataset as DatasetClass
+    collate_fn = None
+elif train_config["dataset"] == "medsegbench":
+    from src.medsegbench_dataloader import get_dataloader 
+else:
+    raise ValueError(f"Unknown dataset: {train_config['dataset']}")
+
+
+# logging
+if train_config["logging"]["use_wandb"]:
+    import wandb
+    wandb.init(
+        project=train_config["logging"].get("wandb_project"),
+        config=train_config,
+        name=train_config["method"]+"+"+train_config["dataset"],
+    )
+
+# Build dataloaders
+"""
+train_loader, val_loader = build_dataloaders(
+    train_config, DatasetClass, collate_fn
+)
+"""
+train_loader = get_dataloader(
+    dataset_name="abdomenus",
+    split="train",
+    root=config["paths"]["medsegbench"],
+    image_size=train_config["preprocessing"]["image_size"][0])
+val_loader = get_dataloader(
+    dataset_name="abdomenus",
+    split="val",
+    root=config["paths"]["medsegbench"],
+    image_size=train_config["preprocessing"]["image_size"][0])
+
+# get model 
+if train_config["method"] == "segformer3d":
+    sys.path.insert(0, "/software/notebooks/camaret/repos/SegFormer3D")
+    model = build_segformer3d_model(config["model_params"]["segformer3d"]).to(device)
+elif train_config["method"] == "global_local":
+    from src.models.global_local import GlobalLocalModel
+    model = GlobalLocalModel(config["model_params"]["global_local"]).to(device)
+else:
+    raise ValueError(f"Unknown method: {train_config['method']}")
+
+num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Model parameters: {num_params:,}")
+
+# Loss
+criterion = build_loss_fn(
+    train_config["loss_fn"]["loss_type"],
+    train_config["loss_fn"].get("loss_args"),
+)
+
+# Optimizer
+opt_cfg = train_config["optimizer"]
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=opt_cfg["optimizer_args"]["lr"],
+    weight_decay=opt_cfg["optimizer_args"]["weight_decay"],
+)
+
+# Scheduler
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=train_config["training_parameters"]["num_epochs"],
+    eta_min=1e-6,
+)
+
+# Training loop
+best_dice = 0.0
+num_epochs = train_config["training_parameters"]["num_epochs"]
+print_every = train_config["training_parameters"]["print_every"]
+
+for epoch in tqdm(range(num_epochs), desc="Training"):
+    train_losses = train_epoch(
+        model, train_loader, criterion, optimizer,
+        device, epoch, print_every
+    )
+
+    val_loss, val_dice = validate(model, val_loader, criterion, device)
+
+    scheduler.step()
+
+    print(
+        f"Epoch {epoch:04d} | "
+        f"Train: {train_losses['loss']:.5f} | "
+        f"Val Loss: {val_loss:.5f} | "
+        f"Val Dice: {val_dice:.5f} | "
+        f"LR: {scheduler.get_last_lr()[0]:.2e}"
+    )
+
+    if train_config["logging"]["use_wandb"]:
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_losses["loss"],
+            "train_global_loss": train_losses["global_loss"],
+            "train_local_loss": train_losses["local_loss"],
+            "train_agg_loss": train_losses["agg_loss"],
+            "val_loss": val_loss,
+            "val_dice": val_dice,
+            "lr": scheduler.get_last_lr()[0],
+        })
+
+    # Save best
+    if val_dice > best_dice:
+        best_dice = val_dice
+        print(f"  -> New best dice: {best_dice:.5f}")
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_dice": best_dice,
+            "config": config,
+        }, ckpt_dir / "best_model.pt")
+
+print(f"\nTraining complete! Best Dice: {best_dice:.5f}")
+
+if train_config["logging"]["use_wandb"]:
+    wandb.finish()
