@@ -2,16 +2,16 @@
 import sys
 from pathlib import Path
 from turtle import down
+
 import torch
 from tqdm import tqdm
+
 sys.path.insert(0, "/software/notebooks/camaret/repos")
 
 from SegFormer3D.architectures.segformer3d import build_segformer3d_model
 from SegFormer3D.losses.losses import build_loss_fn
-
 from src.config import load_config
-from src.train_utils import seed_everything, build_dataloaders, train_epoch, validate
-
+from src.train_utils import build_dataloaders, seed_everything, train_epoch, validate
 
 # get config from config.yaml 
 config = load_config()
@@ -31,13 +31,18 @@ ckpt_dir.mkdir(parents=True, exist_ok=True)
 
 ### get dataset class
 if train_config["dataset"] == "totalseg_no_context":
-    from src.dataloaders.totalseg_dataloader_no_context import TotalSegDatasetNoContext, collate_fn
+    from src.dataloaders.totalseg_dataloader_no_context import (
+        TotalSegDatasetNoContext,
+        collate_fn,
+    )
     DatasetClass = TotalSegDatasetNoContext
 elif train_config["dataset"] == "totalseg":
-    from src.dataloaders.totalseg_dataloader import TotalSegmentatorDataset as DatasetClass
+    from src.dataloaders.totalseg_dataloader import (
+        TotalSegmentatorDataset as DatasetClass,
+    )
     collate_fn = None
 elif train_config["dataset"].split("_")[0] == "medsegbench":
-    from src.dataloaders.medsegbench_dataloader import get_dataloader 
+    from src.dataloaders.medsegbench_dataloader import get_dataloader
 else:
     raise ValueError(f"Unknown dataset: {train_config['dataset']}")
 
@@ -82,7 +87,10 @@ if train_config["method"] == "segformer3d":
     model = build_segformer3d_model(config["model_params"]["segformer3d"]).to(device)
 elif train_config["method"] == "global_local":
     from src.models.global_local import GlobalLocalModel
-    model = GlobalLocalModel(config["model_params"]["global_local"]).to(device)
+    model = GlobalLocalModel(
+        config["model_params"]["global_local"],
+        context_size=train_config.get("context_size", 0),
+    ).to(device)
 else:
     raise ValueError(f"Unknown method: {train_config['method']}")
 
@@ -127,7 +135,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
     if save_imgs and epoch % 10 == 0:  # Save every 10 epochs
         save_dir = Path(paths["RESULTS_DIR"]) / f"{train_config['dataset']}"
 
-    val_loss, val_dice = validate(
+    val_loss, val_local_dice, val_final_dice = validate(
         model, val_loader, criterion, device,
         save_dir=save_dir, max_save_batches=2
     )
@@ -137,9 +145,11 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
     print(
         f"Epoch {epoch:04d} | "
         f"Train Loss: {train_losses['loss']:.5f} | "
-        f"Train Dice: {train_losses['dice']:.5f} | "
+        f"Train LocalDice: {train_losses['local_dice']:.5f} | "
+        f"Train FinalDice: {train_losses['final_dice']:.5f} | "
         f"Val Loss: {val_loss:.5f} | "
-        f"Val Dice: {val_dice:.5f} | "
+        f"Val LocalDice: {val_local_dice:.5f} | "
+        f"Val FinalDice: {val_final_dice:.5f} | "
         f"LR: {scheduler.get_last_lr()[0]:.2e}"
     )
 
@@ -147,18 +157,20 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         wandb.log({
             "epoch": epoch,
             "train_loss": train_losses["loss"],
-            "train_dice": train_losses["dice"],
+            "train_local_dice": train_losses["local_dice"],
+            "train_final_dice": train_losses["final_dice"],
             "train_global_loss": train_losses["global_loss"],
             "train_local_loss": train_losses["local_loss"],
             "train_agg_loss": train_losses["agg_loss"],
             "val_loss": val_loss,
-            "val_dice": val_dice,
+            "val_local_dice": val_local_dice,
+            "val_final_dice": val_final_dice,
             "lr": scheduler.get_last_lr()[0],
         })
 
-    # Save best
-    if val_dice > best_dice:
-        best_dice = val_dice
+    # Save best (based on final dice)
+    if val_final_dice > best_dice:
+        best_dice = val_final_dice
         print(f"  -> New best dice: {best_dice:.5f}")
         torch.save({
             "epoch": epoch,

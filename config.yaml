@@ -20,8 +20,8 @@ train:
   download: false
   context_size: 1
   method: "global_local"  # Options: "segformer3d", "global_local""
-  train_label_ids: [1,2,3,4] # 0 should be excluded (background)
-  val_label_ids: [5,6,7,8]
+  train_label_ids: [1,2,3,4,5] # 0 should be excluded (background)
+  val_label_ids: [6,7,8]
 
 
   preprocessing:
@@ -146,6 +146,7 @@ model_params:
       backbone: "ground_truth"
       down_size_rate: 16
       base_channels: 16
+      image_size: 512  # Must match train.preprocessing.image_size[0]
 
       # Patch sampling
       patch_size: 16    # Patch size for local branch (smaller than image_size!)

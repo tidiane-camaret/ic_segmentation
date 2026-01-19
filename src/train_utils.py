@@ -2,8 +2,9 @@ import os
 import random
 from pathlib import Path
 from typing import Dict, Optional
-import numpy as np
+
 import nibabel as nib
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -77,11 +78,20 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
     total_global = 0.0
     total_local = 0.0
     total_agg = 0.0
-    total_dice = 0.0
+    total_local_dice = 0.0
+    total_final_dice = 0.0
 
     for idx, batch in enumerate(train_loader):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
+
+        # Get context data if available
+        context_in = batch.get("context_in", None)
+        context_out = batch.get("context_out", None)
+        if context_in is not None:
+            context_in = context_in.to(device)
+        if context_out is not None:
+            context_out = context_out.to(device)
 
         # Ensure labels have channel dim
         if labels.dim() == 3:
@@ -89,19 +99,32 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
 
         optimizer.zero_grad()
 
-        outputs = model(images, labels=labels, mode="train")
+        outputs = model(images, labels=labels, context_in=context_in, context_out=context_out, mode="train")
         losses = model.compute_loss(outputs, labels, criterion)
         loss = losses["total_loss"]
 
-        # Compute Dice score
+        # Compute Dice scores
         with torch.no_grad():
+            # Local dice: on sampled patches
+            patch_logits = outputs["patch_logits"]  # [B, K, 1, ps, ps]
+            patch_labels = outputs["patch_labels"]  # [B, K, 1, ps, ps]
+            patch_pred_binary = (torch.sigmoid(patch_logits) > 0.5).float()
+            patch_labels_binary = (patch_labels > 0).float()
+            # Compute dice per patch then average
+            B, K = patch_logits.shape[:2]
+            patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(2, 3, 4))
+            patch_union = patch_pred_binary.sum(dim=(2, 3, 4)) + patch_labels_binary.sum(dim=(2, 3, 4))
+            local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
+            total_local_dice += local_dice.mean().item()
+
+            # Final dice: on full prediction
             pred_binary = (torch.sigmoid(outputs["final_logit"]) > 0.5).float()
             labels_binary = (labels > 0).float()
             spatial_dims = tuple(range(2, pred_binary.dim()))
             intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
             union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
-            dice = (2 * intersection + 1e-6) / (union + 1e-6)
-            total_dice += dice.mean().item()
+            final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
+            total_final_dice += final_dice.mean().item()
 
         loss.backward()
         optimizer.step()
@@ -115,7 +138,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
                 f"Loss: {total_loss / (idx + 1):.5f} | "
-                f"Dice: {total_dice / (idx + 1):.5f} | "
+                f"LocalDice: {total_local_dice / (idx + 1):.5f} | "
+                f"FinalDice: {total_final_dice / (idx + 1):.5f} | "
                 f"Global: {total_global / (idx + 1):.5f} | "
                 f"Local: {total_local / (idx + 1):.5f} | "
                 f"Agg: {total_agg / (idx + 1):.5f}"
@@ -124,7 +148,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
     n = len(train_loader)
     return {
         "loss": total_loss / n,
-        "dice": total_dice / n,
+        "local_dice": total_local_dice / n,
+        "final_dice": total_final_dice / n,
         "global_loss": total_global / n,
         "local_loss": total_local / n,
         "agg_loss": total_agg / n,
@@ -217,47 +242,61 @@ def validate(
     """Run validation with optional saving of predictions."""
     model.eval()
     total_loss = 0.0
-    total_dice = 0.0
+    total_local_dice = 0.0
+    total_final_dice = 0.0
 
     for batch_idx, batch in enumerate(val_loader):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
+
+        # Get context data if available
+        context_in = batch.get("context_in", None)
+        context_out = batch.get("context_out", None)
+        if context_in is not None:
+            context_in = context_in.to(device)
+        if context_out is not None:
+            context_out = context_out.to(device)
 
         # Ensure labels have channel dim
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
         # Pass labels for oracle global branch (for now - later replace with learned global)
-        outputs = model(images, labels=labels, mode="test")
+        outputs = model(images, labels=labels, context_in=context_in, context_out=context_out, mode="test")
         predictions = outputs["final_logit"]
 
         loss = criterion(predictions, labels.float())
         total_loss += loss.item()
 
-        # Dice score (works for both 2D and 3D)
-        # Binarize both predictions and labels (labels may be multi-class)
+        # Local dice: on sampled patches
+        patch_logits = outputs["patch_logits"]  # [B, K, 1, ps, ps]
+        patch_labels = outputs["patch_labels"]  # [B, K, 1, ps, ps]
+        patch_pred_binary = (torch.sigmoid(patch_logits) > 0.5).float()
+        patch_labels_binary = (patch_labels > 0).float()
+        # Compute dice per patch then average
+        patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(2, 3, 4))
+        patch_union = patch_pred_binary.sum(dim=(2, 3, 4)) + patch_labels_binary.sum(dim=(2, 3, 4))
+        local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
+        total_local_dice += local_dice.mean().item()
+
+        # Final dice: on full prediction
         pred_binary = (torch.sigmoid(predictions) > 0.5).float()
         labels_binary = (labels > 0).float()
         spatial_dims = tuple(range(2, pred_binary.dim()))
         intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
         union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
-        dice = (2 * intersection + 1e-6) / (union + 1e-6)
-        total_dice += dice.mean().item()
+        final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
+        total_final_dice += final_dice.mean().item()
 
         # Save outputs if requested
         if save_dir is not None and batch_idx < max_save_batches:
             case_ids = batch.get("case_id", None)
-            context_in = batch.get("context_in", None)
-            context_out = batch.get("context_out", None)
-            if context_in is not None:
-                context_in = context_in.to(device)
-            if context_out is not None:
-                context_out = context_out.to(device)
             save_predictions(save_dir, case_ids, images, labels, outputs,
                            context_in=context_in, context_out=context_out)
 
     if save_dir is not None:
         print(f"  Saved validation outputs to {save_dir}")
 
-    return total_loss / len(val_loader), total_dice / len(val_loader)
+    n = len(val_loader)
+    return total_loss / n, total_local_dice / n, total_final_dice / n
 

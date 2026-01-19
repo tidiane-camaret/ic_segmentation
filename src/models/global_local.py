@@ -15,9 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from src.models.local import (
     LocalDino,
-    LocalDinoLight,
-    LocalTransformer,
-    PatchEmbedding2D,
+
 )
 
 
@@ -56,16 +54,18 @@ class GlobalLocalModel(nn.Module):
         # Patch embedding (internal tokenization within each selected patch)
         internal_patch_size = min(4, self.patch_size)
         self.internal_patch_size = internal_patch_size
-        self.patch_embed = PatchEmbedding2D(
-            patch_size=internal_patch_size,
-            in_channels=in_channels,
-            embed_dim=embed_dim,
-        )
+
         # Image size for position embeddings (assume 224 for 2D, can be overridden)
         image_size = global_cfg.get("image_size", 224)
 
+        # Get DINO pretrained path from local config or use default
+        dino_path = local_cfg.get(
+            "dino_pretrained_path",
+            "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
+        )
+
         self.local_transformer = LocalDino(
-            pretrained_path="/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51",
+            pretrained_path=dino_path,
             patch_size=self.patch_size,
             image_size=image_size,
         )
@@ -140,7 +140,7 @@ class GlobalLocalModel(nn.Module):
         # ---------------------------------------------------------
         # Temperature scaling to sharpen the distribution
         # Lower temperature = more concentrated around high scores
-        temperature = 0.1
+        temperature = 0.3
 
         # Scale scores to have meaningful range for softmax
         # Normalize to [0, 1] range first, then apply temperature
@@ -460,8 +460,8 @@ class GlobalLocalModel(nn.Module):
         patch_labels = outputs["patch_labels"]  # [B, K, 1, ps, ps]
         B, K = patch_logits.shape[:2]
         local_loss = criterion(
-            patch_logits.view(B * K, -1),
-            patch_labels.view(B * K, -1)
+            patch_logits.reshape(B * K, -1),
+            patch_labels.reshape(B * K, -1)
         )
 
         # Aggregation loss (placeholder - just final vs GT)
