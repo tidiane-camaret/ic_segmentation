@@ -108,37 +108,13 @@ eval:
   
 # model parameters
 model_params:
-  segformer3d:
-    in_channels: 1
-    sr_ratios: [4, 2, 1, 1]
-    embed_dims: [32, 64, 160, 256]
-    patch_kernel_size: [7, 3, 3, 3]
-    patch_stride: [4, 2, 2, 2]
-    patch_padding: [3, 1, 1, 1]
-    mlp_ratios: [4, 4, 4, 4]
-    num_heads: [1, 2, 5, 8]
-    depths: [2, 2, 2, 2]
-    num_classes: 1  # Binary segmentation per label
-    decoder_dropout: 0.0
-    decoder_head_embedding_dim: 256
-
-  patch_transformer:
-    embed_dim: 512                  # Token embedding dimension (increased)
-    num_heads: 8                    # Attention heads
-    num_layers: 12                  # Transformer depth (increased)
-    mlp_ratio: 4.0                  # MLP hidden dim = embed_dim * mlp_ratio
-    dropout: 0.1
-    pos_encoding: "learnable"  # Positional encoding: "sinusoidal", "learnable", "relative"
-
-  medverse:
-    context_size: 3
-    spacing: [1.5, 1.5, 1.5]
-    sw_roi_size: [128, 128, 128]
-    sw_overlap: 0.25
-    # sampling_method: Context sampling strategy
-    #   - "original": Medverse's default (samples from same spatial location as target)
-    #   - "foreground": Custom method (samples from locations with foreground voxels)
-    sampling_method: "foreground"  # Context sampling strategy
+  patch_icl:
+    res_levels: [32, 128, 512]
+    patch_sizes: [16, 16, 16]
+    num_train_patches: [50, 50, 50]
+    num_valid_patches: [50, 50, 50]
+    sampling_temperature: 0.3
+    backbone: "patch_transformer"
 
   global_local:
     global:
@@ -180,3 +156,36 @@ model_params:
       loss:
         objective: "gt_mask"
         weight: 1.0        # Weight for aggregated prediction loss
+
+  segformer3d:
+    in_channels: 1
+    sr_ratios: [4, 2, 1, 1]
+    embed_dims: [32, 64, 160, 256]
+    patch_kernel_size: [7, 3, 3, 3]
+    patch_stride: [4, 2, 2, 2]
+    patch_padding: [3, 1, 1, 1]
+    mlp_ratios: [4, 4, 4, 4]
+    num_heads: [1, 2, 5, 8]
+    depths: [2, 2, 2, 2]
+    num_classes: 1  # Binary segmentation per label
+    decoder_dropout: 0.0
+    decoder_head_embedding_dim: 256
+
+  patch_transformer:
+    embed_dim: 512                  # Token embedding dimension (increased)
+    num_heads: 8                    # Attention heads
+    num_layers: 12                  # Transformer depth (increased)
+    mlp_ratio: 4.0                  # MLP hidden dim = embed_dim * mlp_ratio
+    dropout: 0.1
+    pos_encoding: "learnable"  # Positional encoding: "sinusoidal", "learnable", "relative"
+
+  medverse:
+    context_size: 3
+    spacing: [1.5, 1.5, 1.5]
+    sw_roi_size: [128, 128, 128]
+    sw_overlap: 0.25
+    # sampling_method: Context sampling strategy
+    #   - "original": Medverse's default (samples from same spatial location as target)
+    #   - "foreground": Custom method (samples from locations with foreground voxels)
+    sampling_method: "foreground"  # Context sampling strategy
+
