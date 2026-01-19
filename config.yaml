@@ -16,12 +16,13 @@ paths:
       dino_convnext: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3"
 
 train:
-  dataset: "medsegbench_covid19radio"
+  dataset: "medsegbench_abdomenus"
+  download: false
+  context_size: 1
   method: "global_local"  # Options: "segformer3d", "global_local""
-  train_label_ids:
-    - heart
-  val_label_ids:
-    - heart
+  train_label_ids: [0,1,2,3,4]
+  val_label_ids: [5,6,7,8]
+
 
   preprocessing:
     image_size: [256, 256, 256]

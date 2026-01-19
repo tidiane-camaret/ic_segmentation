@@ -62,13 +62,13 @@ train_loader = get_dataloader(
     split="train",
     root=config["paths"]["medsegbench"],
     image_size=train_config["preprocessing"]["image_size"][0],
-    download=True)
+    download=train_config["download"],)
 val_loader = get_dataloader(
     dataset_name=train_config["dataset"],
     split="val",
     root=config["paths"]["medsegbench"],
     image_size=train_config["preprocessing"]["image_size"][0],
-    download=True)
+    download=train_config["download"])
 
 # get model 
 if train_config["method"] == "segformer3d":
