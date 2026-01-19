@@ -9,7 +9,8 @@ import medsegbench
 # Available MedSegBench dataset classes
 DATASET_CLASSES = {
     "medsegbench_abdomenus": medsegbench.AbdomenUSMSBench,
-    "medsegbench_dca1": medsegbench.Dca1MSBench
+    "medsegbench_dca1": medsegbench.Dca1MSBench,
+    "medsegbench_covid19radio": medsegbench.Covid19RadioMSBench
 }
 
 """

@@ -9,12 +9,16 @@ Architecture:
 """
 
 from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from src.models.local import LocalTransformer, LocalDino, LocalDinoLight, PatchEmbedding2D
-
+from src.models.local import (
+    LocalDino,
+    LocalDinoLight,
+    LocalTransformer,
+    PatchEmbedding2D,
+)
 
 
 class GlobalLocalModel(nn.Module):
@@ -85,52 +89,93 @@ class GlobalLocalModel(nn.Module):
         labels: torch.Tensor,
         coarse_pred: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select K patches based on coarse prediction foreground scores."""
+        """
+        Efficiently select K patches based on coarse prediction scores.
+        Uses vectorized pooling and interpolation to avoid python loops.
+        """
         B, C, H, W = image.shape
         ps = self.patch_size
         K = self.num_patches
+        
+        # Stride for dense sampling
+        stride = max(1, ps // 8)
 
-        num_h, num_w = H // ps, W // ps
+        # 1. GENERATE SCORE MAP (Vectorized)
+        # ---------------------------------------------------------
+        # Instead of looping, we use AvgPool to calculate regional scores.
+        # We map the patch size to the coarse feature map scale.
+        coarse_kernel = max(1, ps // self.coarse_scale)
+        
+        # Slice channel 0 (foreground) and keep dim: [B, 1, H_c, W_c]
+        fg_pred = coarse_pred[:, 0:1, :, :] 
 
+        # Compute "patch scores" on the coarse grid using pooling
+        # stride=1 on coarse map ensures we get a score for every coarse location
+        coarse_scores = F.avg_pool2d(fg_pred, kernel_size=coarse_kernel, stride=1)
+
+        # Calculate the target dimensions of our dense sampling grid
+        grid_h = (H - ps) // stride + 1
+        grid_w = (W - ps) // stride + 1
+
+        # Interpolate scores to match the dense grid size
+        # This approximates the score for every possible stride location
+        scores_map = F.interpolate(
+            coarse_scores, 
+            size=(grid_h, grid_w), 
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        # Flatten spatial dimensions: [B, 1, GridH, GridW] -> [B, N_candidates]
+        flat_scores = scores_map.flatten(2).squeeze(1)
+
+        # 2. SELECT INDICES
+        # ---------------------------------------------------------
+        if self.training:
+            # Add noise to randomize selection among high-score patches
+            # (Satisfies "high score but not necessarily the top ones")
+            noise = torch.rand_like(flat_scores) * 0.1
+            flat_scores = flat_scores + noise
+
+        # Select Top K indices per batch element
+        # This is much faster than sorting a list in Python
+        num_candidates = flat_scores.shape[1]
+        k_safe = min(K, num_candidates)
+        
+        top_indices = torch.multinomial(F.softmax(flat_scores, dim=1), k_safe)
+
+        # 3. EXTRACT PATCHES
+        # ---------------------------------------------------------
+        # Convert flattened indices back to (h, w) coordinates in image space
+        row_indices = top_indices // grid_w
+        col_indices = top_indices % grid_w
+        
+        h_starts = row_indices * stride
+        w_starts = col_indices * stride
+
+        # We collect patches in lists. Because K is small (e.g. 16-64), 
+        # a loop here is negligible compared to the scoring loop we removed.
         all_patches = []
         all_labels = []
         all_coords = []
 
         for b in range(B):
-            scores = []
-            coords = []
-
-            for hi in range(num_h):
-                for wi in range(num_w):
-                    # Map to coarse prediction coords
-                    ch = hi * ps // self.coarse_scale
-                    cw = wi * ps // self.coarse_scale
-                    ch_end = min((hi + 1) * ps // self.coarse_scale, coarse_pred.shape[2])
-                    cw_end = min((wi + 1) * ps // self.coarse_scale, coarse_pred.shape[3])
-
-                    region = coarse_pred[b, 0, ch:ch_end, cw:cw_end]
-                    score = region.mean().item() if region.numel() > 0 else 0
-
-                    scores.append(score)
-                    coords.append((hi * ps, wi * ps))
-
-            scores = torch.tensor(scores, device=image.device)
-            if self.training:
-                scores = scores + torch.rand_like(scores) * 0.1
-
-            _, indices = torch.topk(scores, min(K, len(scores)))
-
             batch_patches = []
             batch_labels = []
             batch_coords = []
-            for idx in indices:
-                h, w = coords[idx]
-                patch = image[b, :, h:h+ps, w:w+ps]
-                label_patch = labels[b, :, h:h+ps, w:w+ps]
+            
+            for k in range(k_safe):
+                h, w = h_starts[b, k].item(), w_starts[b, k].item()
+                
+                # Extract patch
+                patch = image[b, :, h : h + ps, w : w + ps]
+                label_patch = labels[b, :, h : h + ps, w : w + ps]
+                
                 batch_patches.append(patch)
                 batch_labels.append(label_patch)
                 batch_coords.append([h, w])
-
+            
+            # Padding if fewer than K candidates (rare, but good for safety)
             while len(batch_patches) < K:
                 batch_patches.append(torch.zeros(C, ps, ps, device=image.device))
                 batch_labels.append(torch.zeros(1, ps, ps, device=image.device))
@@ -140,11 +185,11 @@ class GlobalLocalModel(nn.Module):
             all_labels.append(torch.stack(batch_labels))
             all_coords.append(torch.tensor(batch_coords, device=image.device))
 
-        patches = torch.stack(all_patches)      # [B, K, C, ps, ps]
-        patch_labels = torch.stack(all_labels)  # [B, K, 1, ps, ps]
-        coords = torch.stack(all_coords)        # [B, K, 2]
-
-        return patches, patch_labels, coords
+        return (
+            torch.stack(all_patches),   # [B, K, C, ps, ps]
+            torch.stack(all_labels),    # [B, K, 1, ps, ps]
+            torch.stack(all_coords)     # [B, K, 2]
+        )
 
     def local_branch(self, patches: torch.Tensor, coords: torch.Tensor = None) -> torch.Tensor:
         """Process patches through local model (LocalDino or LocalTransformer)."""

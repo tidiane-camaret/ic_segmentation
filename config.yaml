@@ -16,7 +16,7 @@ paths:
       dino_convnext: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3"
 
 train:
-  dataset: "medsegbench_dca1"
+  dataset: "medsegbench_covid19radio"
   method: "global_local"  # Options: "segformer3d", "global_local""
   train_label_ids:
     - heart
@@ -24,12 +24,12 @@ train:
     - heart
 
   preprocessing:
-    image_size: [128, 128, 128]
+    image_size: [256, 256, 256]
     spacing: [1.5, 1.5, 1.5]
 
   # Dataloader
-  train_batch_size: 16
-  val_batch_size: 4
+  train_batch_size: 64
+  val_batch_size: 32
   num_workers: 4
   max_ds_len: null  # null = use full dataset
 
@@ -64,7 +64,7 @@ train:
     grad_accumulate_steps: 1
 
   logging:
-    use_wandb: false
+    use_wandb: true
     wandb_project: "patch_icl_train"
     save_imgs_masks: true
 
@@ -150,8 +150,8 @@ model_params:
       patch_size: 16    # Patch size for local branch (smaller than image_size!)
       overlap: 0.5                 # Patch overlap (0.5 = 50%)
       num_train_patches: 50          # Top-k patches during training
-      num_train_random_patches: 50   # Random patches for exploration
-      num_inference_patches: 50      # Top-k patches during inference
+      #num_train_random_patches: 50   # Random patches for exploration
+      #num_inference_patches: 50      # Top-k patches during inference
   
       # Gumbel-softmax temperature (controls selection hardness)
       starting_tau: 0.6666          # Initial temperature (softer selection)
