@@ -61,8 +61,13 @@ class GlobalLocalModel(nn.Module):
             in_channels=in_channels,
             embed_dim=embed_dim,
         )
+        # Image size for position embeddings (assume 224 for 2D, can be overridden)
+        image_size = global_cfg.get("image_size", 224)
+
         self.local_transformer = LocalDino(
-            pretrained_path="/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
+            pretrained_path="/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51",
+            patch_size=self.patch_size,
+            image_size=image_size,
         )
 
         # Position embeddings
@@ -271,6 +276,8 @@ class GlobalLocalModel(nn.Module):
         target_patches: torch.Tensor,
         context_patches: torch.Tensor,
         context_labels: torch.Tensor,  # noqa: ARG002 - reserved for future use
+        target_coords: torch.Tensor = None,
+        context_coords: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Process target patches with context patches.
@@ -279,6 +286,8 @@ class GlobalLocalModel(nn.Module):
             target_patches: [B, K, C, ps, ps] target image patches
             context_patches: [B, K*k, C, ps, ps] context image patches (K per context)
             context_labels: [B, K*k, 1, ps, ps] context mask patches
+            target_coords: [B, K, 2] coordinates of target patches
+            context_coords: [B, K*k, 2] coordinates of context patches
 
         Returns:
             patch_logits: [B, K, 1, ps, ps] predictions for target patches
@@ -288,9 +297,14 @@ class GlobalLocalModel(nn.Module):
         # Concatenate target and context patches: [B, K + K*k, C, ps, ps]
         all_patches = torch.cat([target_patches, context_patches], dim=1)
 
+        # Concatenate coordinates if provided
+        all_coords = None
+        if target_coords is not None and context_coords is not None:
+            all_coords = torch.cat([target_coords, context_coords], dim=1)
+
         # Process through local transformer
         # LocalDino expects [B, num_patches, C, ps, ps]
-        all_logits = self.local_transformer(all_patches, coords=None)
+        all_logits = self.local_transformer(all_patches, coords=all_coords)
         # all_logits: [B, K + K*k, num_classes, ps, ps]
 
         # Extract only target predictions (first K)
@@ -393,7 +407,8 @@ class GlobalLocalModel(nn.Module):
         if context_patches is not None:
             # Combine target and context for local processing
             patch_logits = self.local_branch_with_context(
-                patches, context_patches, context_patch_labels
+                patches, context_patches, context_patch_labels,
+                target_coords=coords, context_coords=context_coords
             )
         else:
             patch_logits = self.local_branch(patches, coords)

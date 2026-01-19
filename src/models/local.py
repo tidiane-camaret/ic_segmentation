@@ -1,6 +1,10 @@
+import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from transformers import AutoModel
+
 
 class PatchEmbedding2D(nn.Module):
     """Embed 2D image patches into tokens."""
@@ -61,11 +65,31 @@ class LocalTransformer(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    """Decoder head that upsamples patch features to segmentation mask."""
+    """Decoder head with transformer for cross-patch attention, then CNN upsampling."""
 
-    def __init__(self, embed_dim: int = 1024, num_classes: int = 1, patch_size: int = 16):
+    def __init__(
+        self,
+        embed_dim: int = 1024,
+        num_classes: int = 1,
+        patch_size: int = 16,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.patch_size = patch_size
+        self.embed_dim = embed_dim
+
+        # Transformer for cross-patch attention
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
         # Decoder with upsampling (4 x 2x upsamples = 16x total for patch_size=16)
         self.decoder = nn.Sequential(
@@ -92,26 +116,44 @@ class SegmentationHead(nn.Module):
             nn.Conv2d(64, num_classes, kernel_size=1),
         )
 
-    def forward(self, patch_features, h, w):
+    def forward(self, patch_features, h, w, num_patches: int = 1):
         """
         Args:
-            patch_features: [B, num_patches, embed_dim]
-            h, w: spatial grid dimensions of patches
+            patch_features: [B, total_tokens, embed_dim] where total_tokens = K * tokens_per_patch
+            h, w: spatial grid dimensions of tokens within a single patch
+            num_patches: K, number of patches per example
+
         Returns:
-            [B, num_classes, H, W] where H=h*patch_size, W=w*patch_size
+            [B, K, num_classes, H, W] where H=h*patch_size, W=w*patch_size
         """
-        B, N, C = patch_features.shape
-        feature_map = patch_features.transpose(1, 2).reshape(B, C, h, w)
-        return self.decoder(feature_map)
+        B, _, C = patch_features.shape
+        tokens_per_patch = h * w
+
+        # Apply transformer for cross-patch attention (all tokens attend to each other)
+        patch_features = self.transformer(patch_features)
+
+        # Reshape to [B*K, tokens_per_patch, embed_dim] for per-patch decoding
+        patch_features = patch_features.reshape(B * num_patches, tokens_per_patch, C)
+
+        # Reshape to spatial grid and decode
+        feature_map = patch_features.transpose(1, 2).reshape(B * num_patches, C, h, w)
+        output = self.decoder(feature_map)
+
+        # Reshape to [B, K, num_classes, H, W]
+        _, nc, H, W = output.shape
+        output = output.reshape(B, num_patches, nc, H, W)
+
+        return output
 
 
 class LocalDino(nn.Module):
     """
-    Local branch using DINOv2/v3 backbone for processing K patches.
+    Local branch using DINOv3 backbone for processing K patches with cross-patch attention.
 
-    Each patch is embedded using DINO's patch embedding, then positional
-    embeddings are added based on the patch's location in the original image.
-    All tokens from all K patches are processed together through the transformer.
+    All K patches are processed together through the DINO transformer, allowing
+    patches to attend to each other. Position embeddings are computed using RoPE
+    (Rotary Position Embedding) based on each token's actual global coordinates
+    in the original image.
     """
 
     def __init__(
@@ -138,6 +180,9 @@ class LocalDino(nn.Module):
         # Load DINO backbone
         self.backbone = AutoModel.from_pretrained(pretrained_path)
         self.embed_dim = self.backbone.config.hidden_size  # 1024 for ViT-L
+        self.num_heads = self.backbone.config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.rope_theta = self.backbone.config.rope_theta
 
         if freeze_backbone:
             for param in self.backbone.parameters():
@@ -146,12 +191,9 @@ class LocalDino(nn.Module):
         # Number of DINO tokens per input patch
         self.tokens_per_patch = (patch_size // self.dino_patch_size) ** 2
 
-        # Learnable position embeddings for patch locations in original image
-        # Grid size for patch centers in original image
-        self.num_patch_positions = (image_size // patch_size) ** 2
-        self.patch_pos_embed = nn.Parameter(
-            torch.randn(1, self.num_patch_positions, self.embed_dim) * 0.02
-        )
+        # Compute RoPE inverse frequencies (same as DINOv3)
+        inv_freq = 1 / self.rope_theta ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Segmentation head
         self.seg_head = SegmentationHead(
@@ -160,21 +202,93 @@ class LocalDino(nn.Module):
             patch_size=self.dino_patch_size,
         )
 
-    def get_patch_position_idx(self, coords, image_size):
-        """Convert patch coordinates to position index in the grid."""
-        grid_size = image_size // self.patch_size
-        h_idx = coords[:, :, 0] // self.patch_size  # [B, K]
-        w_idx = coords[:, :, 1] // self.patch_size  # [B, K]
-        pos_idx = h_idx * grid_size + w_idx  # [B, K]
-        return pos_idx
+    def compute_rope_embeddings(self, coords, device, dtype):
+        """
+        Compute RoPE cos/sin embeddings for tokens based on their global coordinates.
+
+        Args:
+            coords: [B, K, 2] - (h, w) top-left coordinates of each patch in original image
+            device: torch device
+            dtype: torch dtype
+
+        Returns:
+            cos, sin: [B, K * tokens_per_patch, head_dim] - RoPE embeddings for all tokens
+        """
+        B, K, _ = coords.shape
+        tokens_h = tokens_w = int(math.sqrt(self.tokens_per_patch))
+
+        # Create token offset grid within a patch: [tokens_h, tokens_w, 2]
+        # Each token's offset from patch top-left to token center
+        ti = torch.arange(tokens_h, device=device, dtype=torch.float32)
+        tj = torch.arange(tokens_w, device=device, dtype=torch.float32)
+        grid_i, grid_j = torch.meshgrid(ti, tj, indexing='ij')
+
+        # Token center offsets: (ti + 0.5) * dino_patch_size
+        token_offsets_h = (grid_i + 0.5) * self.dino_patch_size  # [tokens_h, tokens_w]
+        token_offsets_w = (grid_j + 0.5) * self.dino_patch_size
+        token_offsets = torch.stack([token_offsets_h, token_offsets_w], dim=-1)  # [tokens_h, tokens_w, 2]
+        token_offsets = token_offsets.reshape(1, 1, self.tokens_per_patch, 2)  # [1, 1, tpp, 2]
+
+        # Expand coords: [B, K, 1, 2] + [1, 1, tpp, 2] -> [B, K, tpp, 2]
+        coords_expanded = coords.unsqueeze(2)  # [B, K, 1, 2]
+        token_coords = coords_expanded + token_offsets  # [B, K, tpp, 2]
+
+        # Reshape to [B, K * tpp, 2]
+        token_coords = token_coords.reshape(B, K * self.tokens_per_patch, 2)
+
+        # Normalize to [-1, +1] range (same as DINOv3)
+        token_coords = token_coords / self.image_size  # [0, 1]
+        token_coords = 2.0 * token_coords - 1.0  # [-1, +1]
+
+        # Compute RoPE angles: 2π * coords * inv_freq
+        # token_coords: [B, num_tokens, 2]
+        # inv_freq: [head_dim / 4]
+        angles = 2 * math.pi * token_coords[:, :, :, None] * self.inv_freq[None, None, None, :]
+        # angles: [B, num_tokens, 2, head_dim/4]
+
+        angles = angles.flatten(2, 3)  # [B, num_tokens, head_dim/2]
+        angles = angles.tile(2)  # [B, num_tokens, head_dim]
+
+        cos = torch.cos(angles).to(dtype)
+        sin = torch.sin(angles).to(dtype)
+
+        return cos, sin
+
+    def forward_with_custom_rope(self, hidden_states, cos, sin):
+        """
+        Forward pass through DINO transformer layers with custom RoPE embeddings.
+
+        Args:
+            hidden_states: [B, num_tokens, embed_dim] - embedded patch tokens
+            cos, sin: [B, num_tokens, head_dim] - custom RoPE embeddings
+
+        Returns:
+            output: [B, num_tokens, embed_dim] - transformer output
+        """
+        # Reshape cos/sin for attention: [B, 1, num_tokens, head_dim]
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        position_embeddings = (cos, sin)
+
+        # Process through transformer layers
+        for layer in self.backbone.layer:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+            )[0]
+
+        # Final layer norm
+        hidden_states = self.backbone.norm(hidden_states)
+
+        return hidden_states
 
     def forward(self, patches, coords=None):
         """
-        Process K patches through DINO backbone.
+        Process K patches: DINO patch embedding -> SegmentationHead transformer -> decode.
 
         Args:
             patches: [B, K, C, ps, ps] - K patches per batch
-            coords: [B, K, 2] - (h, w) coordinates of each patch in original image
+            coords: [B, K, 2] - (h, w) coordinates (unused for now, reserved for future)
 
         Returns:
             patch_logits: [B, K, 1, ps, ps] - segmentation logits for each patch
@@ -184,45 +298,25 @@ class LocalDino(nn.Module):
         # Ensure patches are 3-channel for DINO (repeat grayscale)
         if C == 1:
             patches = patches.repeat(1, 1, 3, 1, 1)
-            C = 3
 
-        # Reshape to process all patches: [B*K, C, ps, ps]
-        patches_flat = patches.reshape(B * K, C, ps, ps)
+        # Reshape to [B*K, 3, ps, ps] for patch embedding
+        patches_flat = patches.reshape(B * K, 3, ps, ps)
 
-        # Resize patches to DINO expected size if needed
-        # DINO expects multiples of patch_size (16), our patches should be ps x ps
-        # For ps=32, we get 2x2=4 tokens per patch
+        # Apply DINO patch embedding (Conv2d projection only)
+        with torch.no_grad():
+            hidden_states = self.backbone.embeddings.patch_embeddings(patches_flat)
+            # hidden_states: [B*K, embed_dim, h, w] where h=w=ps/16
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)  # [B*K, tokens_per_patch, embed_dim]
 
-        # Extract features through DINO backbone
-        with torch.set_grad_enabled(not self.backbone.training or any(p.requires_grad for p in self.backbone.parameters())):
-            outputs = self.backbone(patches_flat, output_hidden_states=True)
-            # Get patch tokens (exclude CLS and register tokens)
-            # DINOv2 has: 1 CLS + 4 registers + patch tokens
-            features = outputs.last_hidden_state[:, 5:, :]  # [B*K, tokens_per_patch, embed_dim]
+        # Reshape to [B, K * tokens_per_patch, embed_dim] for cross-patch attention
+        hidden_states = hidden_states.reshape(B, K * self.tokens_per_patch, self.embed_dim)
 
-        # Add position embeddings based on patch location in original image
-        if coords is not None:
-            pos_idx = self.get_patch_position_idx(coords, self.image_size)  # [B, K]
-            pos_idx_flat = pos_idx.reshape(B * K)  # [B*K]
-
-            # Clamp indices to valid range
-            pos_idx_flat = pos_idx_flat.clamp(0, self.num_patch_positions - 1)
-
-            # Get position embeddings for each patch
-            patch_pos = self.patch_pos_embed[:, pos_idx_flat, :]  # [1, B*K, embed_dim]
-            patch_pos = patch_pos.squeeze(0)  # [B*K, embed_dim]
-
-            # Add to all tokens of each patch
-            features = features + patch_pos.unsqueeze(1)  # [B*K, tokens, embed_dim]
-
-        # Compute spatial dimensions for seg head
+        # Compute spatial dimensions for seg head (per patch)
         h = w = ps // self.dino_patch_size
 
-        # Apply segmentation head per patch
-        seg_output = self.seg_head(features, h, w)  # [B*K, num_classes, ps, ps]
-
-        # Reshape back to [B, K, num_classes, ps, ps]
-        seg_output = seg_output.reshape(B, K, -1, ps, ps)
+        # Apply segmentation head - has its own transformer for cross-patch attention
+        # seg_head expects [B, K*tokens_per_patch, embed_dim], returns [B, K, num_classes, ps, ps]
+        seg_output = self.seg_head(hidden_states, h, w, num_patches=K)
 
         return seg_output
 
@@ -237,7 +331,7 @@ class LocalDinoLight(nn.Module):
 
     def __init__(
         self,
-        pretrained_path: str = None,
+        pretrained_path: Optional[str] = None,
         patch_size: int = 32,
         image_size: int = 224,
         embed_dim: int = 768,
@@ -259,7 +353,7 @@ class LocalDinoLight(nn.Module):
         )
 
         # Load pretrained patch embedding if available
-        if pretrained_path:
+        if pretrained_path is not None:
             try:
                 backbone = AutoModel.from_pretrained(pretrained_path)
                 # Copy patch embedding weights
