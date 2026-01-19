@@ -125,7 +125,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
     save_imgs = train_config["logging"].get("save_imgs_masks", False)
     save_dir = None
     if save_imgs and epoch % 10 == 0:  # Save every 10 epochs
-        save_dir = Path(paths["RESULTS_DIR"]) / "train_outputs"
+        save_dir = Path(paths["RESULTS_DIR"]) / f"{train_config['dataset']}"
 
     val_loss, val_dice = validate(
         model, val_loader, criterion, device,

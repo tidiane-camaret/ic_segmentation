@@ -3,9 +3,9 @@ import os
 from pathlib import Path
 
 from src.config import load_config
-
-dir_to_export = Path(load_config()["paths"]["RESULTS_DIR"]) 
-patient_name = "train_outputs" # "totalseg_eval" 
+config = load_config()
+dir_to_export = Path(config["paths"]["RESULTS_DIR"]) 
+patient_name = config["train"]["dataset"]
 
 project_name = "camaret___in_context_segmentation"
 

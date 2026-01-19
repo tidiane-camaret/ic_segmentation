@@ -130,7 +130,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
         "agg_loss": total_agg / n,
     }
 
-def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=4):
+def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=4,
+                     context_in=None, context_out=None):
     """Save images, masks, and predictions to NIfTI files organized by case ID."""
     save_dir = Path(save_dir)
     B = min(images.shape[0], max_samples)
@@ -177,6 +178,32 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
             patch_pred_nib = nib.Nifti1Image(patch_pred.astype(np.float32), affine=np.eye(4))
             nib.save(patch_pred_nib, case_dir / f"patch{k}_pred_mask.nii.gz")
 
+        # Save context images and masks if provided
+        if context_in is not None and context_out is not None:
+            n_ctx = context_in.shape[1]  # [B, k, C, H, W]
+            for c in range(n_ctx):
+                ctx_img = context_in[i, c, 0].cpu().numpy()
+                ctx_img_nib = nib.Nifti1Image(ctx_img.astype(np.float32), affine=np.eye(4))
+                nib.save(ctx_img_nib, case_dir / f"context{c}_img.nii.gz")
+
+                ctx_gt = context_out[i, c, 0].cpu().numpy()
+                ctx_gt_nib = nib.Nifti1Image(ctx_gt.astype(np.float32), affine=np.eye(4))
+                nib.save(ctx_gt_nib, case_dir / f"context{c}_gt_mask.nii.gz")
+
+        # Save context patches if available in outputs
+        if outputs.get("context_patches") is not None:
+            ctx_patches = outputs["context_patches"]  # [B, K*k, C, ps, ps]
+            ctx_labels = outputs["context_patch_labels"]  # [B, K*k, 1, ps, ps]
+            n_ctx_patches = min(4, ctx_patches.shape[1])
+            for c in range(n_ctx_patches):
+                ctx_p_img = ctx_patches[i, c, 0].cpu().numpy()
+                ctx_p_img_nib = nib.Nifti1Image(ctx_p_img.astype(np.float32), affine=np.eye(4))
+                nib.save(ctx_p_img_nib, case_dir / f"context_patch{c}_img.nii.gz")
+
+                ctx_p_gt = ctx_labels[i, c, 0].cpu().numpy()
+                ctx_p_gt_nib = nib.Nifti1Image(ctx_p_gt.astype(np.float32), affine=np.eye(4))
+                nib.save(ctx_p_gt_nib, case_dir / f"context_patch{c}_gt_mask.nii.gz")
+
 
 @torch.no_grad()
 def validate(
@@ -220,7 +247,14 @@ def validate(
         # Save outputs if requested
         if save_dir is not None and batch_idx < max_save_batches:
             case_ids = batch.get("case_id", None)
-            save_predictions(save_dir, case_ids, images, labels, outputs)
+            context_in = batch.get("context_in", None)
+            context_out = batch.get("context_out", None)
+            if context_in is not None:
+                context_in = context_in.to(device)
+            if context_out is not None:
+                context_out = context_out.to(device)
+            save_predictions(save_dir, case_ids, images, labels, outputs,
+                           context_in=context_in, context_out=context_out)
 
     if save_dir is not None:
         print(f"  Saved validation outputs to {save_dir}")

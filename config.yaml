@@ -25,7 +25,7 @@ train:
 
 
   preprocessing:
-    image_size: [256, 256, 256]
+    image_size: [512, 512, 512]
     spacing: [1.5, 1.5, 1.5]
 
   # Dataloader
