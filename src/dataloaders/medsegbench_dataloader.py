@@ -152,9 +152,25 @@ class MedSegBenchDataset(Dataset):
 
     def __getitem__(self, idx):
         """Returns dict with image, mask, case_id, and optionally context examples."""
-        # Sample a label_id for this sample (target and context will use the same)
+        # Sample a label_id that exists in this target sample (exclude 0 = background)
         if self.label_ids is not None and len(self.label_ids) > 0:
-            label_id = random.choice(self.label_ids)
+            # Find which of the configured label_ids exist in this sample (exclude 0)
+            available_labels = [
+                lid for lid in self.label_ids
+                if lid != 0 and lid in self.label_to_cases and idx in self.label_to_cases[lid]
+            ]
+            if len(available_labels) > 0:
+                label_id = random.choice(available_labels)
+            else:
+                # Fallback: use any non-zero label present in this sample
+                sample_labels = [
+                    lid for lid, cases in self.label_to_cases.items()
+                    if idx in cases and lid != 0  # exclude background
+                ]
+                if sample_labels:
+                    label_id = random.choice(sample_labels)
+                else:
+                    label_id = None  # Will binarize full mask
         else:
             label_id = None  # Will binarize full mask
 
