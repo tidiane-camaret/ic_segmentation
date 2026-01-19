@@ -93,6 +93,29 @@ class MedSegBenchDataset(Dataset):
             transform=self.image_transform,
         )
 
+        # Build label_to_cases mapping for efficient context sampling
+        self.label_to_cases = self._build_label_to_cases_mapping()
+
+    def _build_label_to_cases_mapping(self) -> dict:
+        """Scan all masks and build mapping: label_id -> list of case indices."""
+        label_to_cases = {}
+        print(f"Building label-to-cases mapping for {len(self.dataset)} samples...")
+
+        for idx in range(len(self.dataset)):
+            _, mask = self.dataset[idx]
+            if not isinstance(mask, torch.Tensor):
+                mask = torch.tensor(mask)
+
+            # Get unique labels in this mask
+            unique_labels = mask.unique().tolist()
+            for label in unique_labels:
+                if label not in label_to_cases:
+                    label_to_cases[label] = []
+                label_to_cases[label].append(idx)
+
+        print(f"Found {len(label_to_cases)} unique labels: {sorted(label_to_cases.keys())}")
+        return label_to_cases
+
     def __len__(self):
         return len(self.dataset)
 
@@ -146,36 +169,37 @@ class MedSegBenchDataset(Dataset):
 
         # Sample context examples if context_size > 0
         if self.context_size > 0:
-            # Get valid context indices (exclude current sample)
-            all_indices = list(range(len(self)))
-            all_indices.remove(idx)
+            # Get cases that have this label (exclude current sample)
+            if label_id is not None and label_id in self.label_to_cases:
+                available_indices = [i for i in self.label_to_cases[label_id] if i != idx]
+            else:
+                # Fallback: all indices except current
+                available_indices = [i for i in range(len(self)) if i != idx]
 
             # Sample context indices
-            n_context = min(self.context_size, len(all_indices))
-            context_indices = random.sample(all_indices, n_context)
+            n_context = min(self.context_size, len(available_indices))
+            if n_context < self.context_size:
+                warnings.warn(
+                    f"Only {n_context}/{self.context_size} cases have label {label_id}"
+                )
+
+            context_indices = random.sample(available_indices, n_context) if n_context > 0 else []
 
             context_images = []
             context_labels = []
 
             for ctx_idx in context_indices:
-                # Use the SAME label_id for context as target
                 ctx_image, ctx_mask = self._process_sample(ctx_idx, label_id=label_id)
-
-                # Warn if context mask is empty for this label
-                if ctx_mask.sum() == 0:
-                    warnings.warn(
-                        f"Context sample {ctx_idx} has no label {label_id} (target {idx})"
-                    )
-
                 context_images.append(ctx_image)
                 context_labels.append(ctx_mask)
 
-            # Stack context examples: [k, C, H, W]
-            result["context_in"] = torch.stack(context_images, dim=0)
-            result["context_out"] = torch.stack(
-                [m.unsqueeze(0).float() for m in context_labels], dim=0
-            )
-            result["context_case_ids"] = [f"s{i:04d}" for i in context_indices]
+            if len(context_images) > 0:
+                # Stack context examples: [k, C, H, W]
+                result["context_in"] = torch.stack(context_images, dim=0)
+                result["context_out"] = torch.stack(
+                    [m.unsqueeze(0).float() for m in context_labels], dim=0
+                )
+                result["context_case_ids"] = [f"s{i:04d}" for i in context_indices]
 
         return result
 
@@ -184,12 +208,8 @@ class MedSegBenchDataset(Dataset):
         """Returns number of segmentation classes."""
         if hasattr(self.dataset, 'num_classes'):
             return self.dataset.num_classes
-        # Infer from first few samples if not available
-        classes = set()
-        for i in range(min(10, len(self))):
-            _, mask = self[i]
-            classes.update(mask.unique().tolist())
-        return len(classes)
+        # Use precomputed label_to_cases mapping
+        return len(self.label_to_cases)
 
 
 def collate_fn(batch):

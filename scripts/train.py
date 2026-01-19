@@ -62,13 +62,19 @@ train_loader = get_dataloader(
     split="train",
     root=config["paths"]["medsegbench"],
     image_size=train_config["preprocessing"]["image_size"][0],
-    download=train_config["download"],)
+    download=train_config["download"],
+    label_ids=train_config["train_label_ids"],
+    context_size=train_config["context_size"],
+)
 val_loader = get_dataloader(
     dataset_name=train_config["dataset"],
     split="val",
     root=config["paths"]["medsegbench"],
     image_size=train_config["preprocessing"]["image_size"][0],
-    download=train_config["download"])
+    download=train_config["download"],
+    label_ids=train_config["val_label_ids"],
+    context_size=train_config["context_size"],
+    )
 
 # get model 
 if train_config["method"] == "segformer3d":
