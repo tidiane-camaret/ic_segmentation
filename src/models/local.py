@@ -65,22 +65,22 @@ class LocalTransformer(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    """Decoder head with transformer for cross-patch attention, then CNN upsampling."""
+    """Decoder head with trainable transformer for cross-patch attention, then CNN upsampling."""
 
     def __init__(
         self,
         embed_dim: int = 1024,
         num_classes: int = 1,
         patch_size: int = 16,
+        num_transformer_layers: int = 2,
         num_heads: int = 8,
-        num_layers: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
 
-        # Transformer for cross-patch attention
+        # Shallow trainable transformer for task-specific cross-patch attention
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -89,7 +89,7 @@ class SegmentationHead(nn.Module):
             activation="gelu",
             batch_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
 
         # Decoder with upsampling (4 x 2x upsamples = 16x total for patch_size=16)
         self.decoder = nn.Sequential(
@@ -129,7 +129,7 @@ class SegmentationHead(nn.Module):
         B, _, C = patch_features.shape
         tokens_per_patch = h * w
 
-        # Apply transformer for cross-patch attention (all tokens attend to each other)
+        # Apply trainable transformer for task-specific cross-patch attention
         patch_features = self.transformer(patch_features)
 
         # Reshape to [B*K, tokens_per_patch, embed_dim] for per-patch decoding
@@ -217,6 +217,9 @@ class LocalDino(nn.Module):
         B, K, _ = coords.shape
         tokens_h = tokens_w = int(math.sqrt(self.tokens_per_patch))
 
+        # Ensure inv_freq is on the correct device
+        inv_freq = self.inv_freq.to(device)
+
         # Create token offset grid within a patch: [tokens_h, tokens_w, 2]
         # Each token's offset from patch top-left to token center
         ti = torch.arange(tokens_h, device=device, dtype=torch.float32)
@@ -230,7 +233,7 @@ class LocalDino(nn.Module):
         token_offsets = token_offsets.reshape(1, 1, self.tokens_per_patch, 2)  # [1, 1, tpp, 2]
 
         # Expand coords: [B, K, 1, 2] + [1, 1, tpp, 2] -> [B, K, tpp, 2]
-        coords_expanded = coords.unsqueeze(2)  # [B, K, 1, 2]
+        coords_expanded = coords.unsqueeze(2).float()  # [B, K, 1, 2]
         token_coords = coords_expanded + token_offsets  # [B, K, tpp, 2]
 
         # Reshape to [B, K * tpp, 2]
@@ -243,7 +246,7 @@ class LocalDino(nn.Module):
         # Compute RoPE angles: 2π * coords * inv_freq
         # token_coords: [B, num_tokens, 2]
         # inv_freq: [head_dim / 4]
-        angles = 2 * math.pi * token_coords[:, :, :, None] * self.inv_freq[None, None, None, :]
+        angles = 2 * math.pi * token_coords[:, :, :, None] * inv_freq[None, None, None, :]
         # angles: [B, num_tokens, 2, head_dim/4]
 
         angles = angles.flatten(2, 3)  # [B, num_tokens, head_dim/2]
@@ -254,9 +257,21 @@ class LocalDino(nn.Module):
 
         return cos, sin
 
+    def apply_rotary_pos_emb(self, q, k, cos, sin):
+        """Apply rotary position embeddings to query and key tensors."""
+        def rotate_half(x):
+            x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+            return torch.cat([-x2, x1], dim=-1)
+
+        q_rot = (q * cos) + (rotate_half(q) * sin)
+        k_rot = (k * cos) + (rotate_half(k) * sin)
+        return q_rot, k_rot
+
     def forward_with_custom_rope(self, hidden_states, cos, sin):
         """
         Forward pass through DINO transformer layers with custom RoPE embeddings.
+
+        Manually processes through each layer component to properly apply custom RoPE.
 
         Args:
             hidden_states: [B, num_tokens, embed_dim] - embedded patch tokens
@@ -265,17 +280,57 @@ class LocalDino(nn.Module):
         Returns:
             output: [B, num_tokens, embed_dim] - transformer output
         """
-        # Reshape cos/sin for attention: [B, 1, num_tokens, head_dim]
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        position_embeddings = (cos, sin)
+        B, N, _ = hidden_states.shape
 
-        # Process through transformer layers
+        # Reshape cos/sin for attention: [B, 1, num_tokens, head_dim]
+        # This matches what apply_rotary_pos_emb expects after Q/K are reshaped
+        cos = cos.unsqueeze(1)  # [B, 1, N, head_dim]
+        sin = sin.unsqueeze(1)  # [B, 1, N, head_dim]
+
+        # Process through transformer layers manually
         for layer in self.backbone.layer:
-            hidden_states = layer(
-                hidden_states,
-                position_embeddings=position_embeddings,
-            )[0]
+            # Pre-norm
+            residual = hidden_states
+            hidden_states = layer.norm1(hidden_states)
+
+            # Self-attention with custom RoPE
+            attn = layer.attention
+
+            # Compute Q, K, V
+            query = attn.q_proj(hidden_states)
+            key = attn.k_proj(hidden_states)
+            value = attn.v_proj(hidden_states)
+
+            # Reshape for multi-head attention: [B, N, H, D] -> [B, H, N, D]
+            query = query.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            key = key.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+            value = value.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+            # Apply custom RoPE to Q and K
+            query, key = self.apply_rotary_pos_emb(query, key, cos, sin)
+
+            # Scaled dot-product attention
+            scale = self.head_dim ** -0.5
+            attn_weights = torch.matmul(query, key.transpose(-2, -1)) * scale
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+
+            # Apply attention to values
+            attn_output = torch.matmul(attn_weights, value)
+
+            # Reshape back: [B, H, N, D] -> [B, N, H*D]
+            attn_output = attn_output.transpose(1, 2).contiguous().view(B, N, self.embed_dim)
+
+            # Output projection
+            attn_output = attn.o_proj(attn_output)
+
+            # Layer scale and residual
+            hidden_states = residual + layer.drop_path(layer.layer_scale1(attn_output))
+
+            # MLP block
+            residual = hidden_states
+            hidden_states = layer.norm2(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + layer.drop_path(layer.layer_scale2(hidden_states))
 
         # Final layer norm
         hidden_states = self.backbone.norm(hidden_states)
@@ -284,16 +339,18 @@ class LocalDino(nn.Module):
 
     def forward(self, patches, coords=None):
         """
-        Process K patches: DINO patch embedding -> SegmentationHead transformer -> decode.
+        Process K patches: DINO patch embedding -> DINO transformer (with custom RoPE) -> SegmentationHead.
 
         Args:
             patches: [B, K, C, ps, ps] - K patches per batch
-            coords: [B, K, 2] - (h, w) coordinates (unused for now, reserved for future)
+            coords: [B, K, 2] - (h, w) top-left coordinates of each patch in original image
 
         Returns:
             patch_logits: [B, K, 1, ps, ps] - segmentation logits for each patch
         """
         B, K, C, ps, _ = patches.shape
+        device = patches.device
+        dtype = patches.dtype
 
         # Ensure patches are 3-channel for DINO (repeat grayscale)
         if C == 1:
@@ -311,11 +368,27 @@ class LocalDino(nn.Module):
         # Reshape to [B, K * tokens_per_patch, embed_dim] for cross-patch attention
         hidden_states = hidden_states.reshape(B, K * self.tokens_per_patch, self.embed_dim)
 
+        # Compute custom RoPE based on patch coordinates and process through DINO transformer
+        if coords is not None:
+            cos, sin = self.compute_rope_embeddings(coords, device, dtype)
+            hidden_states = self.forward_with_custom_rope(hidden_states, cos, sin)
+        else:
+            # Fallback: use default grid coordinates if coords not provided
+            # Create default coords assuming patches are arranged in a grid
+            grid_size = int(math.sqrt(K)) if K > 1 else 1
+            default_coords = torch.zeros(B, K, 2, device=device, dtype=torch.float32)
+            for k in range(K):
+                h_idx = k // grid_size
+                w_idx = k % grid_size
+                default_coords[:, k, 0] = h_idx * ps
+                default_coords[:, k, 1] = w_idx * ps
+            cos, sin = self.compute_rope_embeddings(default_coords, device, dtype)
+            hidden_states = self.forward_with_custom_rope(hidden_states, cos, sin)
+
         # Compute spatial dimensions for seg head (per patch)
         h = w = ps // self.dino_patch_size
 
-        # Apply segmentation head - has its own transformer for cross-patch attention
-        # seg_head expects [B, K*tokens_per_patch, embed_dim], returns [B, K, num_classes, ps, ps]
+        # Apply segmentation head for decoding (transformer already applied via DINO layers)
         seg_output = self.seg_head(hidden_states, h, w, num_patches=K)
 
         return seg_output
