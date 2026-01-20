@@ -380,3 +380,4 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 *Analysis generated: 2026-01-20*
 *Updated: 2026-01-20 - Added PatchSampler refactoring, per-level oracle config*
 *Updated: 2026-01-20 - Implemented GumbelSoftmaxSampler for differentiable patch selection*
+*Updated: 2026-01-20 - Added PatchAugmenter with rotation/flip/scale augmentation*

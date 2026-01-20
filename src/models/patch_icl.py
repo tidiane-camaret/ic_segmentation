@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from src.models.local import LocalDino, LocalDinoLight
 from src.models.sampling import (
+    PatchAugmenter,
     PatchSampler,
     UniformSampler,
     DeterministicTopKSampler,
@@ -85,7 +86,7 @@ class PatchICL_Level(nn.Module):
         image: torch.Tensor,
         labels: torch.Tensor,
         weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         Select K patches based on weight map.
 
@@ -100,6 +101,7 @@ class PatchICL_Level(nn.Module):
             patches: [B, K, C, ps, ps]
             patch_labels: [B, K, 1, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
+            aug_params: dict with augmentation parameters
         """
         return self.sampler(image, labels, weights)
 
@@ -194,8 +196,8 @@ class PatchICL_Level(nn.Module):
                 ctx_mask = context_out[b, ctx_idx].unsqueeze(0)  # [1, 1, H, W]
                 ctx_weight = context_weights[b, ctx_idx].unsqueeze(0)  # [1, 1, H, W]
 
-                # Select K patches from this context
-                patches, labels, coords = self.select_patches(ctx_img, ctx_mask, ctx_weight)
+                # Select K patches from this context (ignore aug_params for context)
+                patches, labels, coords, _ = self.select_patches(ctx_img, ctx_mask, ctx_weight)
                 # patches: [1, K, C, ps, ps], coords: [1, K, 2]
 
                 batch_patches.append(patches.squeeze(0))  # [K, C, ps, ps]
@@ -260,7 +262,7 @@ class PatchICL_Level(nn.Module):
             labels_ds = torch.zeros(B, 1, self.resolution, self.resolution, device=device)
 
         # Select target patches
-        patches, patch_labels, coords = self.select_patches(image_ds, labels_ds, weights)
+        patches, patch_labels, coords, aug_params = self.select_patches(image_ds, labels_ds, weights)
 
         # Scale coordinates for backbone
         coords_for_backbone = coords.float() * original_coords_scale
@@ -307,9 +309,15 @@ class PatchICL_Level(nn.Module):
             # No context: process target patches only
             patch_logits = self.backbone(patches, coords=coords_for_backbone)
 
+        # Apply inverse augmentation to predictions before aggregation
+        # This ensures predictions are in the original orientation for correct placement
+        patch_logits_for_agg = patch_logits
+        if self.sampler.augmenter is not None and aug_params:
+            patch_logits_for_agg = self.sampler.augmenter.inverse(patch_logits, aug_params)
+
         # Aggregate to full prediction at this level's resolution
         pred = self.aggregate(
-            patch_logits, coords,
+            patch_logits_for_agg, coords,
             output_size=(self.resolution, self.resolution),
             # prev_pred=self.downsample(prev_pred) if prev_pred is not None else None,
         )
@@ -318,7 +326,7 @@ class PatchICL_Level(nn.Module):
             'pred': pred,  # [B, 1, res, res]
             'patches': patches,  # [B, K, C, ps, ps]
             'patch_labels': patch_labels,  # [B, K, 1, ps, ps]
-            'patch_logits': patch_logits,  # [B, K, 1, ps, ps]
+            'patch_logits': patch_logits,  # [B, K, 1, ps, ps] - augmented (for patch-level loss)
             'coords': coords,  # [B, K, 2]
             'context_patches': context_patches,  # [B, K*k, C, ps, ps] or None
             'context_patch_labels': context_patch_labels,  # [B, K*k, 1, ps, ps] or None
@@ -371,6 +379,19 @@ class PatchICL(nn.Module):
         self.gumbel_tau = sampler_cfg.get('gumbel_tau', 1.0)
         self.gumbel_tau_min = sampler_cfg.get('gumbel_tau_min', 0.1)
         self.gumbel_hard = sampler_cfg.get('gumbel_hard', True)
+
+        # Augmenter config
+        aug_cfg = sampler_cfg.get('augmentation', {})
+        if aug_cfg.get('enabled', False):
+            self.augmenter = PatchAugmenter(
+                rotation=aug_cfg.get('rotation', 'none'),
+                rotation_range=aug_cfg.get('rotation_range', 0.5),
+                flip_horizontal=aug_cfg.get('flip_horizontal', False),
+                flip_vertical=aug_cfg.get('flip_vertical', False),
+                scale_range=aug_cfg.get('scale_range', None),
+            )
+        else:
+            self.augmenter = None
 
         backbone_cfg = config.get('backbone', {})
 
@@ -449,6 +470,7 @@ class PatchICL(nn.Module):
                 temperature=temperature,
                 exploration_noise=self.exploration_noise,
                 stride_divisor=self.stride_divisor,
+                augmenter=self.augmenter,
             )
         elif self.sampler_type == 'topk':
             return DeterministicTopKSampler(
@@ -457,6 +479,7 @@ class PatchICL(nn.Module):
                 temperature=temperature,
                 exploration_noise=0.0,  # No noise for deterministic
                 stride_divisor=self.stride_divisor,
+                augmenter=self.augmenter,
             )
         elif self.sampler_type == 'gumbel':
             return GumbelSoftmaxSampler(
@@ -467,6 +490,7 @@ class PatchICL(nn.Module):
                 tau_min=self.gumbel_tau_min,
                 hard=self.gumbel_hard,
                 stride_divisor=self.stride_divisor,
+                augmenter=self.augmenter,
             )
         else:  # Default: 'weighted'
             return PatchSampler(
@@ -475,6 +499,7 @@ class PatchICL(nn.Module):
                 temperature=temperature,
                 exploration_noise=self.exploration_noise,
                 stride_divisor=self.stride_divisor,
+                augmenter=self.augmenter,
             )
 
     def forward(

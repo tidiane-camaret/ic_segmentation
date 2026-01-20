@@ -131,13 +131,21 @@ model_params:
 
     # Patch sampling configuration
     sampler:
-      type: "weighted"  # Options: "weighted" (default), "uniform", "topk", "gumbel"
+      type: "gumbel"  # Options: "weighted" (default), "uniform", "topk", "gumbel"
       exploration_noise: 0.5  # Noise magnitude during training (0 = deterministic)
       stride_divisor: 4  # Stride = patch_size // stride_divisor
       # Gumbel-Softmax options (only used when type: "gumbel")
       gumbel_tau: 1.0       # Gumbel temperature (higher = softer, anneal during training)
       gumbel_tau_min: 0.1   # Minimum tau for annealing
       gumbel_hard: true     # Use straight-through estimator (hard forward, soft backward)
+      # Patch augmentation (applied after sampling, during training only)
+      augmentation:
+        enabled: true
+        rotation: "continuous"         # "none", "90" (fast), "continuous" (slow, uses grid_sample)
+        rotation_range: 0.5    # Max rotation in radians (for continuous mode)
+        flip_horizontal: true
+        flip_vertical: true
+        # scale_range: [0.9, 1.1]  # Optional random scaling
 
     # Backbone configuration
     backbone:

@@ -10,6 +10,296 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class PatchAugmenter(nn.Module):
+    """
+    Augments patches with rotation, flipping, and scaling.
+
+    Applies the same transformation to both image patches and label patches
+    to maintain correspondence.
+    """
+
+    def __init__(
+        self,
+        rotation: str = "none",  # "none", "90", "continuous"
+        rotation_range: float = 0.5,  # For continuous: max rotation in radians
+        flip_horizontal: bool = False,
+        flip_vertical: bool = False,
+        scale_range: tuple[float, float] | None = None,  # (min_scale, max_scale)
+    ):
+        """
+        Args:
+            rotation: Rotation mode
+                - "none": No rotation
+                - "90": Random 90° rotations (0°, 90°, 180°, 270°)
+                - "continuous": Random rotation within rotation_range
+            rotation_range: Max rotation in radians for continuous mode
+            flip_horizontal: Enable random horizontal flipping
+            flip_vertical: Enable random vertical flipping
+            scale_range: (min, max) scale factors, e.g., (0.9, 1.1)
+        """
+        super().__init__()
+        self.rotation = rotation
+        self.rotation_range = rotation_range
+        self.flip_horizontal = flip_horizontal
+        self.flip_vertical = flip_vertical
+        self.scale_range = scale_range
+
+    def _rotate_90(
+        self,
+        patches: torch.Tensor,
+        k: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Rotate patches by k * 90 degrees.
+
+        Args:
+            patches: [B, K, C, H, W]
+            k: [B, K] - rotation count (0, 1, 2, or 3)
+
+        Returns:
+            rotated: [B, K, C, H, W]
+        """
+        B, K, _, _, _ = patches.shape
+        result = patches.clone()
+
+        for b in range(B):
+            for i in range(K):
+                ki = k[b, i].item()
+                if ki > 0:
+                    # torch.rot90 expects [C, H, W], rotate in dims (1, 2)
+                    result[b, i] = torch.rot90(patches[b, i], int(ki), dims=(1, 2))
+
+        return result
+
+    def _rotate_continuous(
+        self,
+        patches: torch.Tensor,
+        angles: torch.Tensor,
+        mode: str = "bilinear",
+    ) -> torch.Tensor:
+        """
+        Rotate patches by arbitrary angles using affine grid.
+
+        Args:
+            patches: [B, K, C, H, W]
+            angles: [B, K] - rotation angles in radians
+            mode: Interpolation mode ("bilinear" for images, "nearest" for labels)
+
+        Returns:
+            rotated: [B, K, C, H, W]
+        """
+        B, K, C, H, W = patches.shape
+        device = patches.device
+
+        # Flatten batch and K dimensions for grid_sample
+        patches_flat = patches.view(B * K, C, H, W)
+        angles_flat = angles.view(B * K)
+
+        # Build rotation matrices
+        cos_a = torch.cos(angles_flat)
+        sin_a = torch.sin(angles_flat)
+
+        # Affine matrix: [cos, -sin, 0; sin, cos, 0]
+        theta = torch.zeros(B * K, 2, 3, device=device)
+        theta[:, 0, 0] = cos_a
+        theta[:, 0, 1] = -sin_a
+        theta[:, 1, 0] = sin_a
+        theta[:, 1, 1] = cos_a
+
+        # Generate grid and sample
+        grid = F.affine_grid(theta, patches_flat.shape, align_corners=False)
+        rotated_flat = F.grid_sample(
+            patches_flat, grid, mode=mode, padding_mode="zeros", align_corners=False
+        )
+
+        return rotated_flat.view(B, K, C, H, W)
+
+    def _flip(
+        self,
+        patches: torch.Tensor,
+        flip_h: torch.Tensor,
+        flip_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Flip patches horizontally and/or vertically.
+
+        Args:
+            patches: [B, K, C, H, W]
+            flip_h: [B, K] - boolean mask for horizontal flip
+            flip_v: [B, K] - boolean mask for vertical flip
+
+        Returns:
+            flipped: [B, K, C, H, W]
+        """
+        B, K, _, _, _ = patches.shape
+        result = patches.clone()
+
+        for b in range(B):
+            for i in range(K):
+                p = result[b, i]
+                if flip_h[b, i]:
+                    p = torch.flip(p, dims=[2])  # Flip W dimension
+                if flip_v[b, i]:
+                    p = torch.flip(p, dims=[1])  # Flip H dimension
+                result[b, i] = p
+
+        return result
+
+    def forward(
+        self,
+        patches: torch.Tensor,
+        patch_labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        Apply augmentation to patches and labels.
+
+        Args:
+            patches: [B, K, C, H, W] - image patches
+            patch_labels: [B, K, 1, H, W] - label patches
+
+        Returns:
+            aug_patches: [B, K, C, H, W]
+            aug_labels: [B, K, 1, H, W]
+            aug_params: dict with augmentation parameters for inverse transform
+        """
+        B, K = patches.shape[:2]
+        device = patches.device
+
+        # Store augmentation parameters for inverse transform
+        aug_params = {
+            'rotation_k': None,      # For 90° rotation
+            'rotation_angles': None,  # For continuous rotation
+            'flip_h': None,
+            'flip_v': None,
+            'scales': None,
+        }
+
+        if not self.training:
+            return patches, patch_labels, aug_params
+
+        aug_patches = patches
+        aug_labels = patch_labels
+
+        # Rotation
+        if self.rotation == "90":
+            k = torch.randint(0, 4, (B, K), device=device)
+            aug_params['rotation_k'] = k
+            aug_patches = self._rotate_90(aug_patches, k)
+            aug_labels = self._rotate_90(aug_labels, k)
+
+        elif self.rotation == "continuous":
+            angles = torch.empty(B, K, device=device).uniform_(
+                -self.rotation_range, self.rotation_range
+            )
+            aug_params['rotation_angles'] = angles
+            aug_patches = self._rotate_continuous(aug_patches, angles, mode="bilinear")
+            aug_labels = self._rotate_continuous(aug_labels, angles, mode="nearest")
+
+        # Flipping
+        if self.flip_horizontal or self.flip_vertical:
+            flip_h = torch.zeros(B, K, dtype=torch.bool, device=device)
+            flip_v = torch.zeros(B, K, dtype=torch.bool, device=device)
+
+            if self.flip_horizontal:
+                flip_h = torch.rand(B, K, device=device) > 0.5
+            if self.flip_vertical:
+                flip_v = torch.rand(B, K, device=device) > 0.5
+
+            aug_params['flip_h'] = flip_h
+            aug_params['flip_v'] = flip_v
+            aug_patches = self._flip(aug_patches, flip_h, flip_v)
+            aug_labels = self._flip(aug_labels, flip_h, flip_v)
+
+        # Scaling (uses grid_sample)
+        if self.scale_range is not None:
+            min_s, max_s = self.scale_range
+            scales = torch.empty(B, K, device=device).uniform_(min_s, max_s)
+            aug_params['scales'] = scales
+
+            # Build scale matrices
+            B_K = B * K
+            _, _, C, H, W = patches.shape
+
+            patches_flat = aug_patches.view(B_K, C, H, W)
+            labels_flat = aug_labels.view(B_K, 1, H, W)
+            scales_flat = scales.view(B_K)
+
+            theta = torch.zeros(B_K, 2, 3, device=device)
+            theta[:, 0, 0] = scales_flat
+            theta[:, 1, 1] = scales_flat
+
+            grid = F.affine_grid(theta, patches_flat.shape, align_corners=False)
+            aug_patches = F.grid_sample(
+                patches_flat, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+            ).view(B, K, C, H, W)
+            aug_labels = F.grid_sample(
+                labels_flat, grid, mode="nearest", padding_mode="zeros", align_corners=False
+            ).view(B, K, 1, H, W)
+
+        return aug_patches, aug_labels, aug_params
+
+    def inverse(
+        self,
+        predictions: torch.Tensor,
+        aug_params: dict,
+    ) -> torch.Tensor:
+        """
+        Apply inverse augmentation to predictions before aggregation.
+
+        Transformations are applied in reverse order.
+
+        Args:
+            predictions: [B, K, C, H, W] - model predictions on augmented patches
+            aug_params: dict from forward() with augmentation parameters
+
+        Returns:
+            inv_predictions: [B, K, C, H, W] - predictions in original orientation
+        """
+        if all(v is None for v in aug_params.values()):
+            return predictions
+
+        inv_pred = predictions
+
+        # Inverse scaling first (reverse order)
+        if aug_params['scales'] is not None:
+            scales = aug_params['scales']
+            B, K, C, H, W = predictions.shape
+            B_K = B * K
+
+            pred_flat = inv_pred.view(B_K, C, H, W)
+            # Inverse scale = 1 / scale
+            inv_scales_flat = (1.0 / scales).view(B_K)
+
+            theta = torch.zeros(B_K, 2, 3, device=predictions.device)
+            theta[:, 0, 0] = inv_scales_flat
+            theta[:, 1, 1] = inv_scales_flat
+
+            grid = F.affine_grid(theta, pred_flat.shape, align_corners=False)
+            inv_pred = F.grid_sample(
+                pred_flat, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+            ).view(B, K, C, H, W)
+
+        # Inverse flipping (flip is its own inverse)
+        if aug_params['flip_h'] is not None or aug_params['flip_v'] is not None:
+            flip_h = aug_params['flip_h'] if aug_params['flip_h'] is not None else torch.zeros_like(aug_params['flip_v'])
+            flip_v = aug_params['flip_v'] if aug_params['flip_v'] is not None else torch.zeros_like(aug_params['flip_h'])
+            inv_pred = self._flip(inv_pred, flip_h, flip_v)
+
+        # Inverse rotation
+        if aug_params['rotation_k'] is not None:
+            # Inverse of k rotations is (4 - k) % 4 rotations
+            k = aug_params['rotation_k']
+            inv_k = (4 - k) % 4
+            inv_pred = self._rotate_90(inv_pred, inv_k)
+
+        elif aug_params['rotation_angles'] is not None:
+            # Inverse rotation is negative angle
+            angles = aug_params['rotation_angles']
+            inv_pred = self._rotate_continuous(inv_pred, -angles, mode="bilinear")
+
+        return inv_pred
+
+
 class PatchSampler(nn.Module):
     """
     Samples K patches from an image based on a weight map.
@@ -25,6 +315,7 @@ class PatchSampler(nn.Module):
         temperature: float = 0.3,
         exploration_noise: float = 0.5,
         stride_divisor: int = 4,
+        augmenter: PatchAugmenter | None = None,
     ):
         """
         Args:
@@ -33,6 +324,7 @@ class PatchSampler(nn.Module):
             temperature: Softmax temperature (lower = sharper distribution)
             exploration_noise: Noise magnitude during training (0 = no noise)
             stride_divisor: patch_size // stride_divisor = stride between candidates
+            augmenter: Optional PatchAugmenter for rotation/flip augmentation
         """
         super().__init__()
         self.patch_size = patch_size
@@ -40,6 +332,7 @@ class PatchSampler(nn.Module):
         self.temperature = temperature
         self.exploration_noise = exploration_noise
         self.stride_divisor = stride_divisor
+        self.augmenter = augmenter
 
     def compute_scores(
         self,
@@ -209,7 +502,7 @@ class PatchSampler(nn.Module):
         image: torch.Tensor,
         labels: torch.Tensor,
         weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         Sample K patches from image based on weight map.
 
@@ -222,6 +515,7 @@ class PatchSampler(nn.Module):
             patches: [B, K, C, ps, ps]
             patch_labels: [B, K, 1, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
+            aug_params: dict with augmentation parameters (for inverse transform)
         """
         _, _, H, W = image.shape
         ps = self.patch_size
@@ -249,7 +543,12 @@ class PatchSampler(nn.Module):
             image, labels, h_coords, w_coords,
         )
 
-        return patches, patch_labels, coords
+        # Apply augmentation if enabled
+        aug_params = {}
+        if self.augmenter is not None:
+            patches, patch_labels, aug_params = self.augmenter(patches, patch_labels)
+
+        return patches, patch_labels, coords, aug_params
 
 
 class UniformSampler(PatchSampler):
@@ -310,6 +609,7 @@ class GumbelSoftmaxSampler(PatchSampler):
         tau_min: float = 0.1,
         hard: bool = True,
         stride_divisor: int = 4,
+        augmenter: PatchAugmenter | None = None,
     ):
         """
         Args:
@@ -320,6 +620,7 @@ class GumbelSoftmaxSampler(PatchSampler):
             tau_min: Minimum tau for annealing
             hard: If True, use straight-through estimator (hard forward, soft backward)
             stride_divisor: patch_size // stride_divisor = stride between candidates
+            augmenter: Optional PatchAugmenter for rotation/flip augmentation
         """
         super().__init__(
             patch_size=patch_size,
@@ -327,6 +628,7 @@ class GumbelSoftmaxSampler(PatchSampler):
             temperature=temperature,
             exploration_noise=0.0,  # Gumbel noise replaces exploration noise
             stride_divisor=stride_divisor,
+            augmenter=augmenter,
         )
         self.tau = tau
         self.tau_min = tau_min
@@ -490,7 +792,7 @@ class GumbelSoftmaxSampler(PatchSampler):
         image: torch.Tensor,
         labels: torch.Tensor,
         weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         Sample K patches using differentiable Gumbel-Softmax.
 
@@ -503,6 +805,7 @@ class GumbelSoftmaxSampler(PatchSampler):
             patches: [B, K, C, ps, ps]
             patch_labels: [B, K, 1, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
+            aug_params: dict with augmentation parameters (for inverse transform)
         """
         _, _, H, W = image.shape
         ps = self.patch_size
@@ -524,4 +827,9 @@ class GumbelSoftmaxSampler(PatchSampler):
             image, labels, soft_indices, grid_h, grid_w, stride,
         )
 
-        return patches, patch_labels, coords
+        # Apply augmentation if enabled
+        aug_params = {}
+        if self.augmenter is not None:
+            patches, patch_labels, aug_params = self.augmenter(patches, patch_labels)
+
+        return patches, patch_labels, coords, aug_params
