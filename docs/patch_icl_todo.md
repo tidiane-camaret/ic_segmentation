@@ -40,7 +40,10 @@ else:
 
 **Impact**: The model never learns to find relevant regions from scratch - it's always guided by GT.
 
+**Update**: Added `oracle_levels` config to control this per-level. Set to `[false]` to disable oracle and use uniform sampling.
+
 **TODO**:
+- [x] Add per-level oracle config (`oracle_levels` in config.yaml)
 - [ ] Train a lightweight coarse segmentation head for the first level
 - [ ] Or use uniform sampling initially and let the model learn from mistakes
 - [ ] Or implement a separate "proposal network" for initial patch selection
@@ -49,20 +52,35 @@ else:
 
 ### 2. Non-Differentiable Patch Selection
 
-**Location**: `src/models/patch_icl.py:122`
+**Location**: `src/models/sampling.py:PatchSampler.sample_indices()`
 
 ```python
-top_indices = torch.multinomial(probs, k_safe, replacement=False)
+indices = torch.multinomial(probs, k_safe, replacement=False)
 ```
 
 **Problem**: `torch.multinomial` is non-differentiable. Gradients cannot flow through the patch selection process, so the model cannot learn to improve *which* patches to select.
 
 **Impact**: The patch sampling strategy remains fixed (temperature-based softmax over avg-pooled weights). The model only learns to segment given patches, not which patches matter.
 
+**Update**: Patch sampling has been refactored into a modular `PatchSampler` class in `src/models/sampling.py`. Three sampler types available:
+- `weighted` (default): Temperature-scaled softmax + multinomial sampling
+- `uniform`: Ignores weights, samples uniformly at random
+- `topk`: Deterministic top-K selection (for reproducible inference)
+
+Config in `config.yaml`:
+```yaml
+sampler:
+  type: "weighted"  # Options: "weighted", "uniform", "topk"
+  exploration_noise: 0.5
+  stride_divisor: 4
+```
+
 **TODO**:
-- [ ] Implement Gumbel-softmax for differentiable sampling
-- [ ] Or use REINFORCE/policy gradient methods
-- [ ] Or use attention-based soft patch weighting instead of hard selection
+- [x] Refactor patch sampling into separate `PatchSampler` class
+- [x] Add configurable sampler types (weighted, uniform, topk)
+- [x] Implement `GumbelSoftmaxSampler` for differentiable sampling
+- [ ] Or use REINFORCE/policy gradient methods (alternative approach)
+- [ ] Or use attention-based soft patch weighting instead of hard selection (alternative approach)
 
 ---
 
@@ -313,7 +331,7 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 **Impact**: Validation metrics are overly optimistic and don't reflect true inference performance.
 
 **TODO**:
-- [ ] Remove labels from validation forward pass
+- [x] Remove labels from validation forward pass (DONE - `train_utils.py`)
 - [ ] Add separate "oracle" vs "realistic" validation modes
 - [ ] Track both metrics to measure oracle gap
 
@@ -323,9 +341,9 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 
 | Issue | Severity | Category | Status |
 |-------|----------|----------|--------|
-| Oracle dependency at first level | **Critical** | Train/test gap | TODO |
-| Non-differentiable patch selection | **High** | Architecture | TODO |
-| Validation uses GT labels | **High** | Evaluation | TODO |
+| Oracle dependency at first level | **Critical** | Train/test gap | PARTIAL (per-level oracle config added) |
+| Non-differentiable patch selection | **High** | Architecture | DONE (GumbelSoftmaxSampler implemented) |
+| Validation uses GT labels | **High** | Evaluation | DONE |
 | 2D-only (project needs 3D) | **High** | Scope | TODO |
 | Single level active in config | **Medium** | Configuration | TODO |
 | Naive aggregation | **Medium** | Architecture | TODO |
@@ -341,20 +359,24 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 ## Priority Action Items
 
 ### Immediate (before next training run)
-1. [ ] Fix validation to not use GT labels
-2. [ ] Enable multi-level configuration
-3. [ ] Add loss weighting configuration
+1. [x] Fix validation to not use GT labels
+2. [x] Add per-level oracle config (`oracle_levels` in config.yaml)
+3. [x] Refactor patch sampling into modular `PatchSampler` class
+4. [ ] Enable multi-level configuration
+5. [ ] Add loss weighting configuration
 
 ### Short-term (next iteration)
-4. [ ] Implement non-oracle first-level sampling
-5. [ ] Improve aggregation mechanism
-6. [ ] Add proper padding masking
+6. [ ] Implement non-oracle first-level sampling (use `oracle_levels: [false]`)
+7. [ ] Improve aggregation mechanism
+8. [ ] Add proper padding masking
 
 ### Medium-term (architecture improvements)
-7. [ ] Implement differentiable patch selection
-8. [ ] Add explicit context cross-attention
-9. [ ] Extend to 3D
+9. [x] Implement `GumbelSoftmaxSampler` for differentiable patch selection
+10. [ ] Add explicit context cross-attention
+11. [ ] Extend to 3D
 
 ---
 
 *Analysis generated: 2026-01-20*
+*Updated: 2026-01-20 - Added PatchSampler refactoring, per-level oracle config*
+*Updated: 2026-01-20 - Implemented GumbelSoftmaxSampler for differentiable patch selection*

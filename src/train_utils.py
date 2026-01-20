@@ -230,6 +230,44 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
                 nib.save(ctx_p_gt_nib, case_dir / f"context_patch{c}_gt_mask.nii.gz")
 
 
+def _extract_patch_labels(labels: torch.Tensor, coords: torch.Tensor, patch_size: int, level_res: int) -> torch.Tensor:
+    """Extract GT patch labels using coordinates from model output.
+
+    Args:
+        labels: [B, 1, H, W] - full resolution GT labels
+        coords: [B, K, 2] - patch coordinates at level resolution
+        patch_size: size of patches at level resolution
+        level_res: resolution of the level
+
+    Returns:
+        patch_labels: [B, K, 1, ps, ps] - extracted GT patches
+    """
+    B, _, H, W = labels.shape
+    K = coords.shape[1]
+    scale = H / level_res
+
+    # Scale coordinates to full resolution
+    coords_scaled = (coords.float() * scale).long()
+    ps_scaled = int(patch_size * scale)
+
+    patch_labels = []
+    for b in range(B):
+        batch_patches = []
+        for k in range(K):
+            h, w = coords_scaled[b, k].tolist()
+            h = min(h, H - ps_scaled)
+            w = min(w, W - ps_scaled)
+            patch = labels[b, :, h:h+ps_scaled, w:w+ps_scaled]
+            # Resize to match model's patch size
+            patch = torch.nn.functional.interpolate(
+                patch.unsqueeze(0).float(), size=(patch_size, patch_size), mode='nearest'
+            ).squeeze(0)
+            batch_patches.append(patch)
+        patch_labels.append(torch.stack(batch_patches))
+
+    return torch.stack(patch_labels)  # [B, K, 1, ps, ps]
+
+
 @torch.no_grad()
 def validate(
     model,
@@ -239,7 +277,7 @@ def validate(
     save_dir: Optional[Path] = None,
     max_save_batches: int = 2,
 ):
-    """Run validation with optional saving of predictions."""
+    """Run validation without oracle guidance (realistic inference)."""
     model.eval()
     total_loss = 0.0
     total_local_dice = 0.0
@@ -261,16 +299,30 @@ def validate(
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
-        # Pass labels for oracle global branch (for now - later replace with learned global)
-        outputs = model(images, labels=labels, context_in=context_in, context_out=context_out, mode="test")
+        # No oracle: don't pass labels to model (realistic inference)
+        outputs = model(images, labels=None, context_in=context_in, context_out=context_out, mode="test")
         predictions = outputs["final_logit"]
 
         loss = criterion(predictions, labels.float())
         total_loss += loss.item()
 
-        # Local dice: on sampled patches
+        # Local dice: extract GT patches using coordinates from model
         patch_logits = outputs["patch_logits"]  # [B, K, 1, ps, ps]
-        patch_labels = outputs["patch_labels"]  # [B, K, 1, ps, ps]
+        patch_coords = outputs["patch_coords"]  # [B, K, 2]
+        patch_size = patch_logits.shape[-1]
+
+        # Get level resolution from level_outputs if available
+        level_outputs = outputs.get("level_outputs", [])
+        if level_outputs:
+            level_res = level_outputs[-1]["pred"].shape[-1]
+        else:
+            # Fallback: assume single level at coarse_pred resolution
+            level_res = outputs["coarse_pred"].shape[-1]
+
+        # Extract GT patch labels post-hoc
+        patch_labels = _extract_patch_labels(labels, patch_coords, patch_size, level_res)
+        patch_labels = patch_labels.to(device)
+
         patch_pred_binary = (torch.sigmoid(patch_logits) > 0.5).float()
         patch_labels_binary = (patch_labels > 0).float()
         # Compute dice per patch then average

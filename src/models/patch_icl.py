@@ -11,6 +11,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.local import LocalDino, LocalDinoLight
+from src.models.sampling import (
+    PatchSampler,
+    UniformSampler,
+    DeterministicTopKSampler,
+    GumbelSoftmaxSampler,
+)
 
 
 class PatchICL_Level(nn.Module):
@@ -32,6 +38,7 @@ class PatchICL_Level(nn.Module):
         backbone: nn.Module,
         level_idx: int = 0,
         sampling_temperature: float = 0.3,
+        sampler: PatchSampler | None = None,
     ):
         """
         Args:
@@ -41,6 +48,7 @@ class PatchICL_Level(nn.Module):
             backbone: Shared or level-specific backbone (e.g., LocalDino)
             level_idx: Index of this level (0 = coarsest)
             sampling_temperature: Temperature for patch sampling (lower = sharper distribution)
+            sampler: Custom patch sampler (if None, creates default PatchSampler)
         """
         super().__init__()
         self.resolution = resolution
@@ -49,6 +57,16 @@ class PatchICL_Level(nn.Module):
         self.backbone = backbone
         self.level_idx = level_idx
         self.sampling_temperature = sampling_temperature
+
+        # Initialize sampler
+        if sampler is not None:
+            self.sampler = sampler
+        else:
+            self.sampler = PatchSampler(
+                patch_size=patch_size,
+                num_patches=num_patches,
+                temperature=sampling_temperature,
+            )
 
     def downsample(self, x: torch.Tensor) -> torch.Tensor:
         """Downsample tensor to this level's resolution."""
@@ -71,6 +89,8 @@ class PatchICL_Level(nn.Module):
         """
         Select K patches based on weight map.
 
+        Delegates to the sampler module.
+
         Args:
             image: [B, C, H, W] - image at this level's resolution
             labels: [B, 1, H, W] - GT mask at this level's resolution
@@ -81,90 +101,7 @@ class PatchICL_Level(nn.Module):
             patch_labels: [B, K, 1, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
         """
-        B, C, H, W = image.shape
-        ps = self.patch_size
-        K = self.num_patches
-
-        # Compute stride for dense patch scoring
-        stride = max(1, ps // 4)
-
-        # Compute patch grid dimensions
-        grid_h = max(1, (H - ps) // stride + 1)
-        grid_w = max(1, (W - ps) // stride + 1)
-
-        # Compute scores using avg pooling on weights
-        # Map patch locations to weight map
-        scores_map = F.avg_pool2d(weights, kernel_size=ps, stride=stride, padding=0)
-
-        # Resize to grid dimensions if needed
-        if scores_map.shape[-2:] != (grid_h, grid_w):
-            scores_map = F.interpolate(scores_map, size=(grid_h, grid_w), mode='bilinear', align_corners=False)
-
-        # Flatten scores: [B, N_candidates]
-        flat_scores = scores_map.flatten(2).squeeze(1)
-
-        # Normalize and apply temperature
-        score_min = flat_scores.min(dim=1, keepdim=True)[0]
-        score_max = flat_scores.max(dim=1, keepdim=True)[0]
-        score_range = (score_max - score_min).clamp(min=1e-6)
-        normalized_scores = (flat_scores - score_min) / score_range
-        scaled_scores = normalized_scores / self.sampling_temperature
-
-        # Add noise during training for exploration
-        if self.training:
-            noise = torch.rand_like(scaled_scores) * 0.5
-            scaled_scores = scaled_scores + noise
-
-        # Sample patches using multinomial
-        num_candidates = flat_scores.shape[1]
-        k_safe = min(K, num_candidates)
-        probs = F.softmax(scaled_scores, dim=1)
-        top_indices = torch.multinomial(probs, k_safe, replacement=False)
-
-        # Convert indices to coordinates
-        row_indices = top_indices // grid_w
-        col_indices = top_indices % grid_w
-        h_starts = row_indices * stride
-        w_starts = col_indices * stride
-
-        # Clamp to valid range
-        h_starts = h_starts.clamp(0, H - ps)
-        w_starts = w_starts.clamp(0, W - ps)
-
-        # Extract patches
-        all_patches = []
-        all_labels = []
-        all_coords = []
-
-        for b in range(B):
-            batch_patches = []
-            batch_labels = []
-            batch_coords = []
-
-            for k in range(k_safe):
-                h, w = h_starts[b, k].item(), w_starts[b, k].item()
-                patch = image[b, :, h:h+ps, w:w+ps]
-                label_patch = labels[b, :, h:h+ps, w:w+ps]
-
-                batch_patches.append(patch)
-                batch_labels.append(label_patch)
-                batch_coords.append([h, w])
-
-            # Pad if fewer candidates
-            while len(batch_patches) < K:
-                batch_patches.append(torch.zeros(C, ps, ps, device=image.device))
-                batch_labels.append(torch.zeros(1, ps, ps, device=image.device))
-                batch_coords.append([0, 0])
-
-            all_patches.append(torch.stack(batch_patches))
-            all_labels.append(torch.stack(batch_labels))
-            all_coords.append(torch.tensor(batch_coords, device=image.device))
-
-        return (
-            torch.stack(all_patches),  # [B, K, C, ps, ps]
-            torch.stack(all_labels),   # [B, K, 1, ps, ps]
-            torch.stack(all_coords),   # [B, K, 2]
-        )
+        return self.sampler(image, labels, weights)
 
     def aggregate(
         self,
@@ -395,6 +332,9 @@ class PatchICL(nn.Module):
 
     Chains multiple PatchICL_Level modules, each operating at progressively
     finer resolution. Predictions flow from coarse to fine levels.
+
+    Oracle mode: Each level can optionally use GT masks instead of previous
+    level predictions for patch sampling. Controlled by `oracle_levels` config.
     """
 
     def __init__(self, config: dict, context_size: int = 0):
@@ -403,7 +343,9 @@ class PatchICL(nn.Module):
             config: Config dict with 'levels' list and 'backbone' params
                 levels: List of dicts with {resolution, patch_size, num_patches}
                 backbone: Backbone config (type, pretrained_path, etc.)
-            context_size: Number of context examples (0 = no context) - TODO
+                oracle_levels: List of bools, one per level. True = use GT mask
+                    for patch sampling, False = use previous level prediction.
+            context_size: Number of context examples (0 = no context)
         """
         super().__init__()
         self.context_size = context_size
@@ -413,6 +355,22 @@ class PatchICL(nn.Module):
             {'resolution': 128, 'patch_size': 16, 'num_patches': 32},
             {'resolution': 224, 'patch_size': 16, 'num_patches': 64},
         ])
+
+        # Oracle config: list of bools per level (default: first level only)
+        num_levels = len(levels_cfg)
+        default_oracle = [True] + [False] * (num_levels - 1)
+        self.oracle_levels = config.get('oracle_levels', default_oracle)
+
+        # Sampler config
+        sampler_cfg = config.get('sampler', {})
+        self.sampler_type = sampler_cfg.get('type', 'weighted')
+        self.exploration_noise = sampler_cfg.get('exploration_noise', 0.5)
+        self.stride_divisor = sampler_cfg.get('stride_divisor', 4)
+
+        # Gumbel-Softmax specific config
+        self.gumbel_tau = sampler_cfg.get('gumbel_tau', 1.0)
+        self.gumbel_tau_min = sampler_cfg.get('gumbel_tau_min', 0.1)
+        self.gumbel_hard = sampler_cfg.get('gumbel_hard', True)
 
         backbone_cfg = config.get('backbone', {})
 
@@ -431,6 +389,13 @@ class PatchICL(nn.Module):
         # Create levels
         self.levels = nn.ModuleList()
         for i, lcfg in enumerate(levels_cfg):
+            # Create sampler for this level
+            sampler = self._create_sampler(
+                patch_size=lcfg['patch_size'],
+                num_patches=lcfg['num_patches'],
+                temperature=lcfg.get('sampling_temperature', 0.3),
+            )
+
             level = PatchICL_Level(
                 resolution=lcfg['resolution'],
                 patch_size=lcfg['patch_size'],
@@ -438,6 +403,7 @@ class PatchICL(nn.Module):
                 backbone=backbones[i],
                 level_idx=i,
                 sampling_temperature=lcfg.get('sampling_temperature', 0.3),
+                sampler=sampler,
             )
             self.levels.append(level)
 
@@ -468,6 +434,48 @@ class PatchICL(nn.Module):
             )
         else:
             raise ValueError(f"Unknown backbone type: {backbone_type}")
+
+    def _create_sampler(
+        self,
+        patch_size: int,
+        num_patches: int,
+        temperature: float,
+    ) -> PatchSampler:
+        """Create sampler based on config."""
+        if self.sampler_type == 'uniform':
+            return UniformSampler(
+                patch_size=patch_size,
+                num_patches=num_patches,
+                temperature=temperature,
+                exploration_noise=self.exploration_noise,
+                stride_divisor=self.stride_divisor,
+            )
+        elif self.sampler_type == 'topk':
+            return DeterministicTopKSampler(
+                patch_size=patch_size,
+                num_patches=num_patches,
+                temperature=temperature,
+                exploration_noise=0.0,  # No noise for deterministic
+                stride_divisor=self.stride_divisor,
+            )
+        elif self.sampler_type == 'gumbel':
+            return GumbelSoftmaxSampler(
+                patch_size=patch_size,
+                num_patches=num_patches,
+                temperature=temperature,
+                tau=self.gumbel_tau,
+                tau_min=self.gumbel_tau_min,
+                hard=self.gumbel_hard,
+                stride_divisor=self.stride_divisor,
+            )
+        else:  # Default: 'weighted'
+            return PatchSampler(
+                patch_size=patch_size,
+                num_patches=num_patches,
+                temperature=temperature,
+                exploration_noise=self.exploration_noise,
+                stride_divisor=self.stride_divisor,
+            )
 
     def forward(
         self,
@@ -504,15 +512,21 @@ class PatchICL(nn.Module):
         # Collect outputs from all levels
         level_outputs = []
 
-        for level in self.levels:
+        for i, level in enumerate(self.levels):
             # Compute coordinate scale factor (for position encoding)
             coord_scale = H / level.resolution
+
+            # Determine whether to use oracle (GT) or previous prediction
+            # oracle_levels[i] = True means use GT mask for sampling
+            # oracle_levels[i] = False means use prev_pred (or uniform if None)
+            use_oracle = self.oracle_levels[i] if i < len(self.oracle_levels) else False
+            level_prev_pred = None if use_oracle else prev_pred
 
             # Forward through level with context
             level_out = level(
                 image=image,
                 labels=labels,
-                prev_pred=prev_pred,
+                prev_pred=level_prev_pred,
                 original_coords_scale=coord_scale,
                 context_in=context_in,
                 context_out=context_out,
@@ -565,7 +579,7 @@ class PatchICL(nn.Module):
         outputs: dict[str, torch.Tensor],
         labels: torch.Tensor,
         criterion,
-        level_weights: list[float] = None,
+        level_weights: list[float] | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute losses for all levels.
