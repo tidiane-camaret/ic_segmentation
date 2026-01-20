@@ -337,13 +337,15 @@ class LocalDino(nn.Module):
 
         return hidden_states
 
-    def forward(self, patches, coords=None):
+    def forward(self, patches, coords=None, precomputed_features=None):
         """
         Process K patches: DINO patch embedding -> DINO transformer (with custom RoPE) -> SegmentationHead.
 
         Args:
             patches: [B, K, C, ps, ps] - K patches per batch
             coords: [B, K, 2] - (h, w) top-left coordinates of each patch in original image
+            precomputed_features: [B, K, tokens_per_patch, embed_dim] - Pre-computed features (optional)
+                If provided, skips patch embedding and uses these features directly.
 
         Returns:
             patch_logits: [B, K, 1, ps, ps] - segmentation logits for each patch
@@ -352,21 +354,31 @@ class LocalDino(nn.Module):
         device = patches.device
         dtype = patches.dtype
 
-        # Ensure patches are 3-channel for DINO (repeat grayscale)
-        if C == 1:
-            patches = patches.repeat(1, 1, 3, 1, 1)
+        if precomputed_features is not None:
+            # Use pre-computed features directly
+            # precomputed_features: [B, K, tokens_per_patch, embed_dim]
+            tokens_per_patch = precomputed_features.shape[2]
+            hidden_states = precomputed_features.reshape(B, K * tokens_per_patch, self.embed_dim)
+            # Compute spatial dimensions from actual token count
+            h = w = int(math.sqrt(tokens_per_patch))
+        else:
+            # Compute features from patches
+            # Ensure patches are 3-channel for DINO (repeat grayscale)
+            if C == 1:
+                patches = patches.repeat(1, 1, 3, 1, 1)
 
-        # Reshape to [B*K, 3, ps, ps] for patch embedding
-        patches_flat = patches.reshape(B * K, 3, ps, ps)
+            # Reshape to [B*K, 3, ps, ps] for patch embedding
+            patches_flat = patches.reshape(B * K, 3, ps, ps)
 
-        # Apply DINO patch embedding (Conv2d projection only)
-        with torch.no_grad():
-            hidden_states = self.backbone.embeddings.patch_embeddings(patches_flat)
-            # hidden_states: [B*K, embed_dim, h, w] where h=w=ps/16
-            hidden_states = hidden_states.flatten(2).transpose(1, 2)  # [B*K, tokens_per_patch, embed_dim]
+            # Apply DINO patch embedding (Conv2d projection only)
+            with torch.no_grad():
+                hidden_states = self.backbone.embeddings.patch_embeddings(patches_flat)
+                # hidden_states: [B*K, embed_dim, h, w] where h=w=ps/16
+                hidden_states = hidden_states.flatten(2).transpose(1, 2)  # [B*K, tokens_per_patch, embed_dim]
 
-        # Reshape to [B, K * tokens_per_patch, embed_dim] for cross-patch attention
-        hidden_states = hidden_states.reshape(B, K * self.tokens_per_patch, self.embed_dim)
+            # Reshape to [B, K * tokens_per_patch, embed_dim] for cross-patch attention
+            hidden_states = hidden_states.reshape(B, K * self.tokens_per_patch, self.embed_dim)
+            h = w = ps // self.dino_patch_size
 
         # Compute custom RoPE based on patch coordinates and process through DINO transformer
         if coords is not None:
@@ -384,9 +396,6 @@ class LocalDino(nn.Module):
                 default_coords[:, k, 1] = w_idx * ps
             cos, sin = self.compute_rope_embeddings(default_coords, device, dtype)
             hidden_states = self.forward_with_custom_rope(hidden_states, cos, sin)
-
-        # Compute spatial dimensions for seg head (per patch)
-        h = w = ps // self.dino_patch_size
 
         # Apply segmentation head for decoding (transformer already applied via DINO layers)
         seg_output = self.seg_head(hidden_states, h, w, num_patches=K)

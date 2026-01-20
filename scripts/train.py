@@ -41,6 +41,10 @@ elif train_config["dataset"] == "totalseg":
         TotalSegmentatorDataset as DatasetClass,
     )
     collate_fn = None
+elif train_config["dataset"] == "totalseg2d":
+    from src.dataloaders.totalseg2d_dataloader import (
+        get_dataloader as get_totalseg2d_dataloader,
+    )
 elif train_config["dataset"].split("_")[0] == "medsegbench":
     from src.dataloaders.medsegbench_dataloader import get_dataloader
 else:
@@ -62,23 +66,51 @@ train_loader, val_loader = build_dataloaders(
     train_config, DatasetClass, collate_fn
 )
 """
-train_loader = get_dataloader(
-    dataset_name=train_config["dataset"],
-    split="train",
-    root=config["paths"]["medsegbench"],
-    image_size=train_config["preprocessing"]["image_size"][0],
-    download=train_config["download"],
-    label_ids=train_config["train_label_ids"],
-    context_size=train_config["context_size"],
-)
-val_loader = get_dataloader(
-    dataset_name=train_config["dataset"],
-    split="val",
-    root=config["paths"]["medsegbench"],
-    image_size=train_config["preprocessing"]["image_size"][0],
-    download=train_config["download"],
-    label_ids=train_config["val_label_ids"],
-    context_size=train_config["context_size"],
+if train_config["dataset"] == "totalseg2d":
+    train_loader = get_totalseg2d_dataloader(
+        root_dir=config["paths"]["totalseg2d"],
+        stats_path=config["paths"]["totalseg_stats"],
+        label_id_list=train_config["train_label_ids"],
+        context_size=train_config["context_size"],
+        batch_size=train_config["train_batch_size"],
+        image_size=tuple(train_config["preprocessing"]["image_size"][:2]),
+        crop_to_bbox=train_config["preprocessing"]["crop_to_bbox"],
+        bbox_padding=train_config["preprocessing"]["bbox_padding"],
+        num_workers=train_config["training_parameters"].get("num_workers", 4),
+        split="train",
+        shuffle=True,
+    )
+    val_loader = get_totalseg2d_dataloader(
+        root_dir=config["paths"]["totalseg2d"],
+        stats_path=config["paths"]["totalseg_stats"],
+        label_id_list=train_config["val_label_ids"],
+        context_size=train_config["context_size"],
+        batch_size=train_config["train_batch_size"],
+        image_size=tuple(train_config["preprocessing"]["image_size"][:2]),
+        crop_to_bbox=train_config["preprocessing"]["crop_to_bbox"],
+        bbox_padding=train_config["preprocessing"]["bbox_padding"],
+        num_workers=train_config["training_parameters"].get("num_workers", 4),
+        split="val",
+        shuffle=False,
+    )
+else:
+    train_loader = get_dataloader(
+        dataset_name=train_config["dataset"],
+        split="train",
+        root=config["paths"]["medsegbench"],
+        image_size=train_config["preprocessing"]["image_size"][0],
+        download=train_config["download"],
+        label_ids=train_config["train_label_ids"],
+        context_size=train_config["context_size"],
+    )
+    val_loader = get_dataloader(
+        dataset_name=train_config["dataset"],
+        split="val",
+        root=config["paths"]["medsegbench"],
+        image_size=train_config["preprocessing"]["image_size"][0],
+        download=train_config["download"],
+        label_ids=train_config["val_label_ids"],
+        context_size=train_config["context_size"],
     )
 
 # get model 

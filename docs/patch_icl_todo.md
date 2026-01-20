@@ -136,10 +136,29 @@ if prev_pred is not None:
 
 **Impact**: Boundary precision suffers; coarse predictions have equal weight to fine ones.
 
+**Update**: Aggregation has been refactored into a modular `PatchAggregator` class in `src/models/aggregate.py`. Multiple aggregator types available:
+- `average` (default): Simple averaging with configurable prev-level combination
+- `gaussian`: Gaussian weighting from patch centers (reduces boundary blur)
+- `confidence`: Confidence-based weighting (certain predictions contribute more)
+- `learned`: Small CNN predicts per-pixel weights
+- `learned_combine`: Learned spatially-varying blend with previous level
+
+Config in `config.yaml`:
+```yaml
+aggregator:
+  type: "average"  # Options: "average", "gaussian", "confidence", "learned", "learned_combine"
+  combine_mode: "average"  # How to combine with prev level
+  combine_weight: 0.5      # Weight for current prediction
+  sigma_ratio: 0.3         # For gaussian aggregator
+  confidence_temperature: 2.0  # For confidence aggregator
+  hidden_dim: 32           # For learned aggregators
+```
+
 **TODO**:
-- [ ] Implement learned aggregation (small CNN or attention over overlapping regions)
-- [ ] Use confidence-based weighting (higher confidence patches contribute more)
-- [ ] Consider Gaussian weighting from patch centers
+- [x] Implement learned aggregation (small CNN or attention over overlapping regions)
+- [x] Use confidence-based weighting (higher confidence patches contribute more)
+- [x] Consider Gaussian weighting from patch centers
+- [ ] Ablate different aggregation strategies on validation set
 
 ---
 
@@ -346,7 +365,7 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 | Validation uses GT labels | **High** | Evaluation | DONE |
 | 2D-only (project needs 3D) | **High** | Scope | TODO |
 | Single level active in config | **Medium** | Configuration | TODO |
-| Naive aggregation | **Medium** | Architecture | TODO |
+| Naive aggregation | **Medium** | Architecture | DONE (modular PatchAggregator) |
 | Loss design issues | **Medium** | Optimization | TODO |
 | Context integration is implicit | **Medium** | Architecture | TODO |
 | Zero-padding for missing patches | **Low** | Efficiency | TODO |
@@ -367,7 +386,7 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 
 ### Short-term (next iteration)
 6. [ ] Implement non-oracle first-level sampling (use `oracle_levels: [false]`)
-7. [ ] Improve aggregation mechanism
+7. [x] Improve aggregation mechanism (DONE - `src/models/aggregate.py`)
 8. [ ] Add proper padding masking
 
 ### Medium-term (architecture improvements)
@@ -381,3 +400,4 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 *Updated: 2026-01-20 - Added PatchSampler refactoring, per-level oracle config*
 *Updated: 2026-01-20 - Implemented GumbelSoftmaxSampler for differentiable patch selection*
 *Updated: 2026-01-20 - Added PatchAugmenter with rotation/flip/scale augmentation*
+*Updated: 2026-01-20 - Implemented modular PatchAggregator with gaussian/confidence/learned options*

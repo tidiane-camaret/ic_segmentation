@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.local import LocalDino, LocalDinoLight
+from src.models.backbone import PrecomputedFeatureBackbone, PrecomputedDinoBackbone
 from src.models.sampling import (
     PatchAugmenter,
     PatchSampler,
@@ -18,6 +19,73 @@ from src.models.sampling import (
     DeterministicTopKSampler,
     GumbelSoftmaxSampler,
 )
+from src.models.aggregate import PatchAggregator, create_aggregator
+
+
+def extract_patch_features(
+    features: torch.Tensor,
+    coords: torch.Tensor,
+    patch_size: int,
+    level_resolution: int,
+    feature_grid_size: int = 14,
+) -> torch.Tensor:
+    """
+    Extract patch features from pre-computed full-image feature maps.
+
+    Maps patch coordinates from level resolution to the feature grid and extracts
+    the corresponding feature tokens.
+
+    Args:
+        features: [B, 196, 1024] - Pre-computed DINOv3 features (14x14 grid)
+        coords: [B, K, 2] - Patch coordinates (h, w) at level resolution
+        patch_size: Size of patches at level resolution
+        level_resolution: Resolution of the current level (e.g., 64, 128, 224)
+        feature_grid_size: Size of feature grid (14 for DINOv3 with 224x224 input)
+
+    Returns:
+        patch_features: [B, K, tokens_per_patch, 1024] - Extracted features for each patch
+    """
+    B, K, _ = coords.shape
+    embed_dim = features.shape[-1]
+
+    # Reshape features to spatial grid: [B, 14, 14, 1024]
+    features_grid = features.view(B, feature_grid_size, feature_grid_size, embed_dim)
+
+    # Map patch coordinates from level resolution to feature grid
+    # coords are in level_resolution space, need to map to [0, feature_grid_size)
+    scale = feature_grid_size / level_resolution
+    patch_size_in_features = max(1, int(patch_size * scale))
+
+    # Extract features for each patch
+    all_patch_features = []
+    for b in range(B):
+        batch_features = []
+        for k in range(K):
+            h, w = coords[b, k].long().tolist()
+
+            # Map to feature grid coordinates
+            fh = int(h * scale)
+            fw = int(w * scale)
+
+            # Clamp to valid range
+            fh = min(fh, feature_grid_size - patch_size_in_features)
+            fw = min(fw, feature_grid_size - patch_size_in_features)
+            fh = max(0, fh)
+            fw = max(0, fw)
+
+            # Extract patch features: [patch_size_in_features, patch_size_in_features, embed_dim]
+            patch_feat = features_grid[b, fh:fh + patch_size_in_features, fw:fw + patch_size_in_features, :]
+
+            # Flatten to [tokens_per_patch, embed_dim]
+            patch_feat = patch_feat.reshape(-1, embed_dim)
+            batch_features.append(patch_feat)
+
+        # Stack: [K, tokens_per_patch, embed_dim]
+        batch_features = torch.stack(batch_features)
+        all_patch_features.append(batch_features)
+
+    # Stack: [B, K, tokens_per_patch, embed_dim]
+    return torch.stack(all_patch_features)
 
 
 class PatchICL_Level(nn.Module):
@@ -27,8 +95,11 @@ class PatchICL_Level(nn.Module):
     Each level:
     1. Downsamples inputs to its resolution
     2. Samples K patches weighted by previous prediction
-    3. Processes patches through backbone
+    3. Processes patches through backbone (with optional masking)
     4. Aggregates predictions back to a mask
+
+    Supports masked training where random patches are masked and the model
+    must predict their segmentation from context.
     """
 
     def __init__(
@@ -40,6 +111,9 @@ class PatchICL_Level(nn.Module):
         level_idx: int = 0,
         sampling_temperature: float = 0.3,
         sampler: PatchSampler | None = None,
+        aggregator: PatchAggregator | None = None,
+        target_mask_ratio: float = 0.0,
+        context_mask_ratio: float = 0.0,
     ):
         """
         Args:
@@ -50,6 +124,9 @@ class PatchICL_Level(nn.Module):
             level_idx: Index of this level (0 = coarsest)
             sampling_temperature: Temperature for patch sampling (lower = sharper distribution)
             sampler: Custom patch sampler (if None, creates default PatchSampler)
+            aggregator: Custom patch aggregator (if None, creates default PatchAggregator)
+            target_mask_ratio: Ratio of target patches to mask during training (0.0 = no masking)
+            context_mask_ratio: Ratio of context patches to mask during training (0.0 = no masking)
         """
         super().__init__()
         self.resolution = resolution
@@ -58,6 +135,8 @@ class PatchICL_Level(nn.Module):
         self.backbone = backbone
         self.level_idx = level_idx
         self.sampling_temperature = sampling_temperature
+        self.target_mask_ratio = target_mask_ratio
+        self.context_mask_ratio = context_mask_ratio
 
         # Initialize sampler
         if sampler is not None:
@@ -68,6 +147,12 @@ class PatchICL_Level(nn.Module):
                 num_patches=num_patches,
                 temperature=sampling_temperature,
             )
+
+        # Initialize aggregator
+        if aggregator is not None:
+            self.aggregator = aggregator
+        else:
+            self.aggregator = PatchAggregator(patch_size=patch_size)
 
     def downsample(self, x: torch.Tensor) -> torch.Tensor:
         """Downsample tensor to this level's resolution."""
@@ -115,6 +200,8 @@ class PatchICL_Level(nn.Module):
         """
         Aggregate patch predictions back to a full mask.
 
+        Delegates to the aggregator module.
+
         Args:
             patch_logits: [B, K, 1, ps, ps] - predictions for each patch
             coords: [B, K, 2] - patch coordinates
@@ -124,41 +211,7 @@ class PatchICL_Level(nn.Module):
         Returns:
             aggregated: [B, 1, H, W] - aggregated prediction at output_size
         """
-        B = patch_logits.shape[0]
-        K = patch_logits.shape[1]
-        ps = self.patch_size
-        H, W = output_size
-        device = patch_logits.device
-
-        # Initialize output and count tensors
-        output = torch.zeros(B, 1, H, W, device=device)
-        counts = torch.zeros(B, 1, H, W, device=device)
-
-        # Place patches back
-        for b in range(B):
-            for k in range(K):
-                h, w = coords[b, k].tolist()
-                h, w = int(h), int(w)
-                # Clamp to valid range
-                h_end = min(h + ps, H)
-                w_end = min(w + ps, W)
-                patch_h = h_end - h
-                patch_w = w_end - w
-
-                output[b, :, h:h_end, w:w_end] += patch_logits[b, k, :, :patch_h, :patch_w]
-                counts[b, :, h:h_end, w:w_end] += 1
-
-        # Average overlapping regions
-        counts = counts.clamp(min=1)
-        aggregated = output / counts
-
-        # Optionally combine with previous prediction
-        if prev_pred is not None:
-            # Simple average for now (can be learned)
-            prev_resized = F.interpolate(prev_pred, size=(H, W), mode='bilinear', align_corners=False)
-            aggregated = (aggregated + prev_resized) / 2
-
-        return aggregated
+        return self.aggregator(patch_logits, coords, output_size, prev_pred)
 
     def _select_context_patches(
         self,
@@ -215,6 +268,38 @@ class PatchICL_Level(nn.Module):
             torch.stack(all_ctx_coords),   # [B, K*k, 2]
         )
 
+    def _generate_patch_mask(
+        self,
+        num_patches: int,
+        mask_ratio: float,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Generate random mask for patches.
+
+        Args:
+            num_patches: Number of patches (K or K*k)
+            mask_ratio: Fraction of patches to mask
+            batch_size: Batch size
+            device: Device for tensor
+
+        Returns:
+            mask: [B, num_patches] - Boolean tensor, True = masked
+        """
+        if mask_ratio <= 0.0:
+            return torch.zeros(batch_size, num_patches, dtype=torch.bool, device=device)
+
+        num_to_mask = max(1, int(num_patches * mask_ratio))
+        mask = torch.zeros(batch_size, num_patches, dtype=torch.bool, device=device)
+
+        for b in range(batch_size):
+            # Randomly select patches to mask
+            indices = torch.randperm(num_patches, device=device)[:num_to_mask]
+            mask[b, indices] = True
+
+        return mask
+
     def forward(
         self,
         image: torch.Tensor,
@@ -223,6 +308,9 @@ class PatchICL_Level(nn.Module):
         original_coords_scale: float = 1.0,
         context_in: torch.Tensor = None,
         context_out: torch.Tensor = None,
+        target_features: torch.Tensor = None,
+        context_features: torch.Tensor = None,
+        training: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for this level.
@@ -234,9 +322,12 @@ class PatchICL_Level(nn.Module):
             original_coords_scale: Scale factor for coordinates (to map back to original image)
             context_in: [B, k, C, H, W] - context images (optional)
             context_out: [B, k, 1, H, W] - context masks (optional)
+            target_features: [B, 196, 1024] - Pre-computed DINOv3 features for target (optional)
+            context_features: [B, k, 196, 1024] - Pre-computed DINOv3 features for context (optional)
+            training: Whether in training mode (enables masking)
 
         Returns:
-            Dict with: pred, patches, patch_labels, patch_logits, coords, context_*
+            Dict with: pred, patches, patch_labels, patch_logits, coords, context_*, masks
         """
         B = image.shape[0]
         device = image.device
@@ -267,6 +358,16 @@ class PatchICL_Level(nn.Module):
         # Scale coordinates for backbone
         coords_for_backbone = coords.float() * original_coords_scale
 
+        # Extract patch features from pre-computed features if provided
+        precomputed_patch_features = None
+        if target_features is not None:
+            precomputed_patch_features = extract_patch_features(
+                features=target_features,
+                coords=coords,
+                patch_size=self.patch_size,
+                level_resolution=self.resolution,
+            )
+
         # Process context if provided
         context_patches = None
         context_patch_labels = None
@@ -293,21 +394,95 @@ class PatchICL_Level(nn.Module):
             # Scale context coordinates
             context_coords_for_backbone = context_coords.float() * original_coords_scale
 
+            # Extract context patch features if pre-computed features provided
+            precomputed_context_features = None
+            if context_features is not None:
+                # context_features: [B, k, 196, 1024]
+                # context_coords: [B, K*k, 2]
+                # We need to extract features for each context image separately
+                K_per_ctx = context_coords.shape[1] // k
+                ctx_features_list = []
+                for ctx_idx in range(k):
+                    ctx_feats = context_features[:, ctx_idx]  # [B, 196, 1024]
+                    ctx_coords = context_coords[:, ctx_idx * K_per_ctx:(ctx_idx + 1) * K_per_ctx]  # [B, K, 2]
+                    extracted = extract_patch_features(
+                        features=ctx_feats,
+                        coords=ctx_coords,
+                        patch_size=self.patch_size,
+                        level_resolution=self.resolution,
+                    )
+                    ctx_features_list.append(extracted)
+                # Concatenate: [B, K*k, tokens, embed_dim]
+                precomputed_context_features = torch.cat(ctx_features_list, dim=1)
+
             # Concatenate target and context patches for joint processing
             all_patches = torch.cat([patches, context_patches], dim=1)
             all_coords = torch.cat([coords_for_backbone, context_coords_for_backbone], dim=1)
 
-            # Process all patches through backbone
-            all_logits = self.backbone(all_patches, coords=all_coords)
+            # Combine pre-computed features if available
+            all_precomputed = None
+            if precomputed_patch_features is not None:
+                if precomputed_context_features is not None:
+                    all_precomputed = torch.cat([precomputed_patch_features, precomputed_context_features], dim=1)
+                else:
+                    all_precomputed = precomputed_patch_features
 
-            # Split back: target predictions are first K
+            # Generate masks for training (only if backbone supports masking)
             K = patches.shape[1]
+            K_ctx = context_patches.shape[1]
+            target_mask = None
+            context_mask = None
+            all_mask = None
+
+            supports_masking = hasattr(self.backbone, 'mask_token') and self.backbone.mask_token is not None
+            if training and supports_masking and (self.target_mask_ratio > 0 or self.context_mask_ratio > 0):
+                target_mask = self._generate_patch_mask(K, self.target_mask_ratio, B, device)
+                context_mask = self._generate_patch_mask(K_ctx, self.context_mask_ratio, B, device)
+                all_mask = torch.cat([target_mask, context_mask], dim=1)
+
+            # Process all patches through backbone
+            if supports_masking:
+                all_logits = self.backbone(
+                    all_patches,
+                    coords=all_coords,
+                    precomputed_features=all_precomputed,
+                    patch_mask=all_mask,
+                )
+            else:
+                all_logits = self.backbone(
+                    all_patches,
+                    coords=all_coords,
+                    precomputed_features=all_precomputed,
+                )
+
+            # Split back: target predictions are first K, context are the rest
             patch_logits = all_logits[:, :K]  # [B, K, 1, ps, ps]
-            # context_logits = all_logits[:, K:]  # Not used, but context influences target via attention
+            context_patch_logits = all_logits[:, K:]  # [B, K_ctx, 1, ps, ps]
 
         else:
             # No context: process target patches only
-            patch_logits = self.backbone(patches, coords=coords_for_backbone)
+            K = patches.shape[1]
+            target_mask = None
+            context_mask = None
+            context_patch_logits = None
+
+            supports_masking = hasattr(self.backbone, 'mask_token') and self.backbone.mask_token is not None
+            if training and supports_masking and self.target_mask_ratio > 0:
+                target_mask = self._generate_patch_mask(K, self.target_mask_ratio, B, device)
+
+            if supports_masking:
+                patch_logits = self.backbone(
+                    patches,
+                    coords=coords_for_backbone,
+                    precomputed_features=precomputed_patch_features,
+                    patch_mask=target_mask,
+                )
+            else:
+                patch_logits = self.backbone(
+                    patches,
+                    coords=coords_for_backbone,
+                    precomputed_features=precomputed_patch_features,
+                )
 
         # Apply inverse augmentation to predictions before aggregation
         # This ensures predictions are in the original orientation for correct placement
@@ -330,7 +505,10 @@ class PatchICL_Level(nn.Module):
             'coords': coords,  # [B, K, 2]
             'context_patches': context_patches,  # [B, K*k, C, ps, ps] or None
             'context_patch_labels': context_patch_labels,  # [B, K*k, 1, ps, ps] or None
+            'context_patch_logits': context_patch_logits,  # [B, K*k, 1, ps, ps] or None
             'context_coords': context_coords,  # [B, K*k, 2] or None
+            'target_mask': target_mask,  # [B, K] or None - which target patches were masked
+            'context_mask': context_mask,  # [B, K*k] or None - which context patches were masked
         }
 
 
@@ -393,6 +571,15 @@ class PatchICL(nn.Module):
         else:
             self.augmenter = None
 
+        # Aggregator config
+        self.aggregator_cfg = config.get('aggregator', {})
+        self.aggregator_type = self.aggregator_cfg.get('type', 'average')
+
+        # Masking config for masked training
+        masking_cfg = config.get('masking', {})
+        self.target_mask_ratio = masking_cfg.get('target_mask_ratio', 0.0)
+        self.context_mask_ratio = masking_cfg.get('context_mask_ratio', 0.0)
+
         backbone_cfg = config.get('backbone', {})
 
         # Create shared or per-level backbone
@@ -417,6 +604,9 @@ class PatchICL(nn.Module):
                 temperature=lcfg.get('sampling_temperature', 0.3),
             )
 
+            # Create aggregator for this level
+            aggregator = self._create_aggregator(patch_size=lcfg['patch_size'])
+
             level = PatchICL_Level(
                 resolution=lcfg['resolution'],
                 patch_size=lcfg['patch_size'],
@@ -425,6 +615,9 @@ class PatchICL(nn.Module):
                 level_idx=i,
                 sampling_temperature=lcfg.get('sampling_temperature', 0.3),
                 sampler=sampler,
+                aggregator=aggregator,
+                target_mask_ratio=self.target_mask_ratio,
+                context_mask_ratio=self.context_mask_ratio,
             )
             self.levels.append(level)
 
@@ -452,6 +645,23 @@ class PatchICL(nn.Module):
                 embed_dim=backbone_cfg.get('embed_dim', 768),
                 num_heads=backbone_cfg.get('num_heads', 8),
                 num_layers=backbone_cfg.get('num_layers', 4),
+            )
+        elif backbone_type == 'precomputed':
+            # Lightweight backbone for pre-computed features
+            return PrecomputedFeatureBackbone(
+                embed_dim=backbone_cfg.get('embed_dim', 1024),
+                num_heads=backbone_cfg.get('num_heads', 8),
+                num_layers=backbone_cfg.get('num_layers', 4),
+                patch_size=patch_size,
+                image_size=backbone_cfg.get('image_size', 224),
+            )
+        elif backbone_type == 'precomputed_dino':
+            # Full DINO transformer with pre-computed features
+            return PrecomputedDinoBackbone(
+                pretrained_path=backbone_cfg.get('pretrained_path', ''),
+                patch_size=patch_size,
+                image_size=backbone_cfg.get('image_size', 224),
+                freeze_backbone=backbone_cfg.get('freeze', True),
             )
         else:
             raise ValueError(f"Unknown backbone type: {backbone_type}")
@@ -502,13 +712,23 @@ class PatchICL(nn.Module):
                 augmenter=self.augmenter,
             )
 
+    def _create_aggregator(self, patch_size: int) -> PatchAggregator:
+        """Create aggregator based on config."""
+        return create_aggregator(
+            aggregator_type=self.aggregator_type,
+            patch_size=patch_size,
+            **self.aggregator_cfg,
+        )
+
     def forward(
         self,
         image: torch.Tensor,
         labels: torch.Tensor = None,
         context_in: torch.Tensor = None,
         context_out: torch.Tensor = None,
-        mode: str = "train",  # Unused, kept for compatibility
+        target_features: torch.Tensor = None,
+        context_features: torch.Tensor = None,
+        mode: str = "train",
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through all levels.
@@ -518,12 +738,14 @@ class PatchICL(nn.Module):
             labels: [B, 1, H, W] or [B, H, W] - GT mask
             context_in: [B, k, C, H, W] - context images
             context_out: [B, k, 1, H, W] - context masks
-            mode: "train" or "test" (unused, kept for compatibility)
+            target_features: [B, 196, 1024] - Pre-computed DINOv3 features for target (optional)
+            context_features: [B, k, 196, 1024] - Pre-computed DINOv3 features for context (optional)
+            mode: "train" or "test" - enables masking during training
 
         Returns:
             Dict with predictions and intermediate outputs per level
         """
-        del mode  # Unused
+        training = (mode == "train")
         _, _, H, W = image.shape
         self.original_size = (H, W)
 
@@ -547,7 +769,7 @@ class PatchICL(nn.Module):
             use_oracle = self.oracle_levels[i] if i < len(self.oracle_levels) else False
             level_prev_pred = None if use_oracle else prev_pred
 
-            # Forward through level with context
+            # Forward through level with context and features
             level_out = level(
                 image=image,
                 labels=labels,
@@ -555,6 +777,9 @@ class PatchICL(nn.Module):
                 original_coords_scale=coord_scale,
                 context_in=context_in,
                 context_out=context_out,
+                target_features=target_features,
+                context_features=context_features,
+                training=training,
             )
             level_outputs.append(level_out)
 
@@ -596,7 +821,12 @@ class PatchICL(nn.Module):
             # Context patches from finest level
             'context_patches': finest_level.get('context_patches'),
             'context_patch_labels': finest_level.get('context_patch_labels'),
+            'context_patch_logits': finest_level.get('context_patch_logits'),
             'context_coords': finest_level.get('context_coords'),
+
+            # Masking info from finest level
+            'target_mask': finest_level.get('target_mask'),
+            'context_mask': finest_level.get('context_mask'),
         }
 
     def compute_loss(
@@ -629,17 +859,38 @@ class PatchICL(nn.Module):
         losses = {}
         total_loss = 0.0
 
+        total_context_loss = 0.0
+        context_loss_count = 0
+
         for i, (level_out, weight) in enumerate(zip(outputs['level_outputs'], level_weights)):
-            # Patch-level loss
+            # Target patch loss
             patch_logits = level_out['patch_logits']  # [B, K, 1, ps, ps]
             patch_labels = level_out['patch_labels']  # [B, K, 1, ps, ps]
             K = patch_logits.shape[1]
 
-            patch_loss = criterion(
+            target_patch_loss = criterion(
                 patch_logits.reshape(B * K, -1),
                 patch_labels.reshape(B * K, -1),
             )
-            losses[f'level_{i}_patch_loss'] = patch_loss
+            losses[f'level_{i}_target_patch_loss'] = target_patch_loss
+            # Keep 'patch_loss' as alias for backward compatibility
+            losses[f'level_{i}_patch_loss'] = target_patch_loss
+
+            # Context patch loss (if context patches exist)
+            context_patch_logits = level_out.get('context_patch_logits')
+            context_patch_labels = level_out.get('context_patch_labels')
+
+            if context_patch_logits is not None and context_patch_labels is not None:
+                K_ctx = context_patch_logits.shape[1]
+                context_patch_loss = criterion(
+                    context_patch_logits.reshape(B * K_ctx, -1),
+                    context_patch_labels.reshape(B * K_ctx, -1),
+                )
+                losses[f'level_{i}_context_patch_loss'] = context_patch_loss
+                total_context_loss = total_context_loss + weight * context_patch_loss
+                context_loss_count += 1
+            else:
+                losses[f'level_{i}_context_patch_loss'] = torch.tensor(0.0, device=patch_logits.device)
 
             # Level prediction loss (vs downsampled GT)
             pred = level_out['pred']  # [B, 1, res, res]
@@ -651,8 +902,8 @@ class PatchICL(nn.Module):
             level_loss = criterion(pred, labels_ds)
             losses[f'level_{i}_pred_loss'] = level_loss
 
-            # Combined level loss
-            level_total = patch_loss + level_loss
+            # Combined level loss (target patches + prediction)
+            level_total = target_patch_loss + level_loss
             losses[f'level_{i}_loss'] = level_total
             total_loss = total_loss + weight * level_total
 
@@ -661,7 +912,19 @@ class PatchICL(nn.Module):
         losses['final_loss'] = final_loss
         total_loss = total_loss + final_loss
 
+        # Add context loss to total (weighted equally to target loss)
+        if context_loss_count > 0:
+            total_loss = total_loss + total_context_loss
+
         losses['total_loss'] = total_loss
+
+        # Aggregate context loss across levels
+        losses['context_loss'] = total_context_loss if context_loss_count > 0 else torch.tensor(0.0)
+
+        # Aggregate target patch loss across levels for logging
+        target_patch_losses = [losses.get(f'level_{i}_target_patch_loss', torch.tensor(0.0))
+                              for i in range(self.num_levels)]
+        losses['target_patch_loss'] = sum(target_patch_losses) / len(target_patch_losses)
 
         # Compatibility with GlobalLocalModel / train_utils
         # Map first level pred_loss to global_loss, last level patch_loss to local_loss

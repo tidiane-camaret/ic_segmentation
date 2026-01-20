@@ -9,6 +9,9 @@ paths:
   RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
   totalseg: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg" 
   medsegbench: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/MedSegBench"
+  totalseg2d: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg2D"
+  totalseg_stats: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg/totalseg_stats.pkl"
+
   ckpts:
       save_dir: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/checkpoints"
       medverse: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
@@ -16,23 +19,38 @@ paths:
       dino_convnext: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3"
 
 train:
-  dataset: "medsegbench_abdomenus"
+  dataset: totalseg2d #"medsegbench_abdomenus"
   download: false
   context_size: 1
   method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
-  train_label_ids: [1,2,3,4,5] # 0 should be excluded (background)
-  val_label_ids: [6,7,8]
-
+  train_label_ids: # [1,2,3,4,5] # 0 should be excluded (background)
+      - heart
+      - spinal_cord
+      - autochthon_left
+      - autochthon_right
+      - aorta
+      - esophagus
+      - lung_upper_lobe_left
+  val_label_ids: # [6,7,8]
+      - lung_upper_lobe_right
+      - costal_cartilages
+      - liver
+      - colon
+      - stomach
+      - femur_left
+      - femur_right 
 
   preprocessing:
     image_size: [512, 512, 512]
     spacing: [1.5, 1.5, 1.5]
+    crop_to_bbox: false
+    bbox_padding: 20
 
   # Dataloader
   train_batch_size: 64
   val_batch_size: 32
   num_workers: 4
-  max_ds_len: null  # null = use full dataset
+  max_ds_len: 500  # null = use full dataset
 
   # Loss
   loss_fn:
@@ -70,42 +88,7 @@ train:
     save_imgs_masks: true
 
 
-eval:
-  dataset: "totalseg"
-  method: "medverse"
-  val_label_ids: # -"train", "val", "all" (predefined splits) or list
-    - heart
-    - spinal_cord
-    - autochthon_left
-    - autochthon_right
-    - aorta
-    - esophagus
-    - lung_upper_lobe_left
-    - lung_upper_lobe_right
-    - costal_cartilages
-    - liver
-    - colon
-    - stomach
-    - femur_left
-    - femur_right
-    
-  # Dataloader parameters
-  batch_size: 1 # if > 1, images must have same size
-  image_size: null  # null = original size
-  num_workers: 4
-  split: "val"  # Dataset split to use ("train", "val", "test")
-  shuffle: false
-  random_context: false
-  max_ds_len: null  # null = use full dataset, or integer to limit number of samples
 
-  # Logging and inspection
-  logging:
-    use_wandb: true
-    save_imgs_masks: false
-    enable_inspection: false
-    max_inspect_cases: 1
-
-  
 # model parameters
 model_params:
   patch_icl:
@@ -146,6 +129,23 @@ model_params:
         flip_horizontal: true
         flip_vertical: true
         # scale_range: [0.9, 1.1]  # Optional random scaling
+
+    # Aggregator configuration (inspired by NMSW - No More Sliding Window)
+    aggregator:
+      type: "gaussian"  # Options: "average", "gaussian", "confidence", "learned", "learned_combine"
+      combine_mode: "coverage"  # How to combine with prev level:
+                                # "average" - weighted blend everywhere
+                                # "replace" - ignore prev prediction
+                                # "coverage" - use prev only where no patch coverage (NMSW style)
+      combine_weight: 0.5      # Weight for current prediction when combine_mode="average"
+      fill_uncovered: "zero"   # How to fill uncovered regions (when no prev_pred): "zero" (prob~0) or "prev" (prob~0.5)
+      min_coverage: 0.000001   # Threshold for considering a pixel "covered"
+      # Gaussian aggregator options (only used when type: "gaussian")
+      sigma_ratio: 0.125       # Gaussian sigma as ratio of patch size (0.125 = NMSW default)
+      # Confidence aggregator options (only used when type: "confidence")
+      confidence_temperature: 2.0  # Higher = more uniform, lower = sharper
+      # Learned aggregator options (only used when type: "learned" or "learned_combine")
+      hidden_dim: 32           # Hidden dimension for weight predictor CNN
 
     # Backbone configuration
     backbone:
@@ -233,3 +233,39 @@ model_params:
     #   - "foreground": Custom method (samples from locations with foreground voxels)
     sampling_method: "foreground"  # Context sampling strategy
 
+eval:
+  dataset: "totalseg"
+  method: "medverse"
+  val_label_ids: # -"train", "val", "all" (predefined splits) or list
+    - heart
+    - spinal_cord
+    - autochthon_left
+    - autochthon_right
+    - aorta
+    - esophagus
+    - lung_upper_lobe_left
+    - lung_upper_lobe_right
+    - costal_cartilages
+    - liver
+    - colon
+    - stomach
+    - femur_left
+    - femur_right
+    
+  # Dataloader parameters
+  batch_size: 1 # if > 1, images must have same size
+  image_size: null  # null = original size
+  num_workers: 4
+  split: "val"  # Dataset split to use ("train", "val", "test")
+  shuffle: false
+  random_context: false
+  max_ds_len: null  # null = use full dataset, or integer to limit number of samples
+
+  # Logging and inspection
+  logging:
+    use_wandb: true
+    save_imgs_masks: false
+    enable_inspection: false
+    max_inspect_cases: 1
+
+  
