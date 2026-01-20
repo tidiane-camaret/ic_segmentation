@@ -115,14 +115,14 @@ model_params:
         patch_size: 16
         num_patches: 16
         sampling_temperature: 0.3
-      - resolution: 128
-        patch_size: 16
-        num_patches: 32
-        sampling_temperature: 0.3
-      - resolution: 224
-        patch_size: 16
-        num_patches: 64
-        sampling_temperature: 0.3
+      #- resolution: 128
+      #  patch_size: 16
+      #  num_patches: 32
+      #  sampling_temperature: 0.3
+      #- resolution: 224
+      #  patch_size: 16
+      #  num_patches: 64
+      #  sampling_temperature: 0.3
 
     # Backbone configuration
     backbone:
@@ -135,7 +135,7 @@ model_params:
       pretrained_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
 
     # Loss weights per level (optional, defaults to 1.0 each)
-    level_weights: [1.0, 1.0, 1.0]
+    # level_weights: [1.0, 1.0, 1.0]
 
   global_local:
     global:
