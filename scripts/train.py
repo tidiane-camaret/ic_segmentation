@@ -91,6 +91,12 @@ elif train_config["method"] == "global_local":
         config["model_params"]["global_local"],
         context_size=train_config.get("context_size", 0),
     ).to(device)
+elif train_config["method"] == "patch_icl":
+    from src.models.patch_icl import PatchICL
+    model = PatchICL(
+        config["model_params"]["patch_icl"],
+        context_size=train_config.get("context_size", 0),
+    ).to(device)
 else:
     raise ValueError(f"Unknown method: {train_config['method']}")
 

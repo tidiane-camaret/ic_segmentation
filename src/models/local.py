@@ -499,7 +499,7 @@ class LocalDinoLight(nn.Module):
             h_idx = (coords[:, :, 0] // self.patch_size).clamp(0, grid_size - 1)
             w_idx = (coords[:, :, 1] // self.patch_size).clamp(0, grid_size - 1)
             pos_idx = (h_idx * grid_size + w_idx).reshape(B * K)
-            pos_idx = pos_idx.clamp(0, self.num_patch_positions - 1)
+            pos_idx = pos_idx.clamp(0, self.num_patch_positions - 1).long()
 
             patch_pos = self.patch_pos_embed[:, pos_idx, :].squeeze(0)
             features = features + patch_pos.unsqueeze(1)
