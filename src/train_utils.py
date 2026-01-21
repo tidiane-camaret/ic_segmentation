@@ -80,6 +80,14 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
     total_agg = 0.0
     total_local_dice = 0.0
     total_final_dice = 0.0
+    
+    # Track detailed losses
+    total_target_patch = 0.0
+    total_target_global = 0.0
+    total_context_patch = 0.0
+    total_context_global = 0.0
+    total_context_dice = 0.0
+    context_dice_count = 0
 
     for idx, batch in enumerate(train_loader):
         images = batch["image"].to(device)
@@ -142,6 +150,23 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
             final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
             total_final_dice += final_dice.mean().item()
 
+            # Context dice: on aggregated context predictions vs context GT
+            # Get from finest level outputs
+            level_outputs = outputs.get("level_outputs")
+            if level_outputs:
+                finest_level = level_outputs[-1]
+                context_pred = finest_level.get("context_pred")  # [B, k, 1, res, res]
+                context_labels = finest_level.get("context_labels")  # [B, k, 1, res, res]
+                if context_pred is not None and context_labels is not None:
+                    ctx_pred_binary = (torch.sigmoid(context_pred) > 0.5).float()
+                    ctx_labels_binary = (context_labels > 0).float()
+                    # Compute dice per context image then average
+                    ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(dim=(2, 3, 4))
+                    ctx_union = ctx_pred_binary.sum(dim=(2, 3, 4)) + ctx_labels_binary.sum(dim=(2, 3, 4))
+                    ctx_dice = (2 * ctx_intersection + 1e-6) / (ctx_union + 1e-6)
+                    total_context_dice += ctx_dice.mean().item()
+                    context_dice_count += 1
+
         loss.backward()
         optimizer.step()
 
@@ -149,26 +174,49 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
         total_global += losses["global_loss"].item()
         total_local += losses["local_loss"].item()
         total_agg += losses["agg_loss"].item()
+        
+        # Track detailed losses (use .item() to get scalar, handle tensor(0.0) case)
+        total_target_patch += losses.get("target_patch_loss", torch.tensor(0.0)).item()
+        total_target_global += losses.get("target_global_loss", torch.tensor(0.0)).item()
+        total_context_patch += losses.get("context_patch_loss", torch.tensor(0.0)).item()
+        total_context_global += losses.get("context_global_loss", torch.tensor(0.0)).item()
 
         if print_every and idx % print_every == 0:
+            ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
                 f"Loss: {total_loss / (idx + 1):.5f} | "
                 f"LocalDice: {total_local_dice / (idx + 1):.5f} | "
                 f"FinalDice: {total_final_dice / (idx + 1):.5f} | "
-                f"Global: {total_global / (idx + 1):.5f} | "
-                f"Local: {total_local / (idx + 1):.5f} | "
-                f"Agg: {total_agg / (idx + 1):.5f}"
+                f"CtxDice: {ctx_dice_avg:.5f}"
+            )
+            print(
+                f"  Losses -> "
+                f"TargetPatch: {total_target_patch / (idx + 1):.4f} | "
+                f"TargetGlobal: {total_target_global / (idx + 1):.4f} | "
+                f"ContextPatch: {total_context_patch / (idx + 1):.4f} | "
+                f"ContextGlobal: {total_context_global / (idx + 1):.4f}"
             )
 
     n = len(train_loader)
+    ctx_dice_final = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
     return {
         "loss": total_loss / n,
         "local_dice": total_local_dice / n,
         "final_dice": total_final_dice / n,
+        "context_dice": ctx_dice_final,
         "global_loss": total_global / n,
         "local_loss": total_local / n,
         "agg_loss": total_agg / n,
+        # Detailed losses
+        "target_patch_loss": total_target_patch / n,
+        "target_global_loss": total_target_global / n,
+        "context_patch_loss": total_context_patch / n,
+        "context_global_loss": total_context_global / n,
+        "target_loss": (total_target_patch + total_target_global) / n,
+        "context_loss": (total_context_patch + total_context_global) / n,
+        "patch_loss_total": (total_target_patch + total_context_patch) / n,
+        "global_loss_total": (total_target_global + total_context_global) / n,
     }
 
 def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=4,
@@ -298,6 +346,8 @@ def validate(
     total_loss = 0.0
     total_local_dice = 0.0
     total_final_dice = 0.0
+    total_context_dice = 0.0
+    context_dice_count = 0
 
     for batch_idx, batch in enumerate(val_loader):
         images = batch["image"].to(device)
@@ -374,6 +424,21 @@ def validate(
         final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
         total_final_dice += final_dice.mean().item()
 
+        # Context dice: on aggregated context predictions vs context GT
+        if level_outputs:
+            finest_level = level_outputs[-1]
+            context_pred = finest_level.get("context_pred")  # [B, k, 1, res, res]
+            context_labels = finest_level.get("context_labels")  # [B, k, 1, res, res]
+            if context_pred is not None and context_labels is not None:
+                ctx_pred_binary = (torch.sigmoid(context_pred) > 0.5).float()
+                ctx_labels_binary = (context_labels > 0).float()
+                # Compute dice per context image then average
+                ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(dim=(2, 3, 4))
+                ctx_union = ctx_pred_binary.sum(dim=(2, 3, 4)) + ctx_labels_binary.sum(dim=(2, 3, 4))
+                ctx_dice = (2 * ctx_intersection + 1e-6) / (ctx_union + 1e-6)
+                total_context_dice += ctx_dice.mean().item()
+                context_dice_count += 1
+
         # Save outputs if requested
         if save_dir is not None and batch_idx < max_save_batches:
             case_ids = batch.get("case_id", None)
@@ -384,5 +449,6 @@ def validate(
         print(f"  Saved validation outputs to {save_dir}")
 
     n = len(val_loader)
-    return total_loss / n, total_local_dice / n, total_final_dice / n
+    ctx_dice_final = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
+    return total_loss / n, total_local_dice / n, total_final_dice / n, ctx_dice_final
 

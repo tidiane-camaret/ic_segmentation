@@ -210,7 +210,7 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
     if save_imgs and epoch % 10 == 0:  # Save every 10 epochs
         save_dir = Path(paths["RESULTS_DIR"]) / f"{train_config['dataset']}"
 
-    val_loss, val_local_dice, val_final_dice = validate(
+    val_loss, val_local_dice, val_final_dice, val_context_dice = validate(
         model, val_loader, criterion, device,
         save_dir=save_dir, max_save_batches=2
     )
@@ -225,23 +225,54 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         f"Val Loss: {val_loss:.5f} | "
         f"Val LocalDice: {val_local_dice:.5f} | "
         f"Val FinalDice: {val_final_dice:.5f} | "
+        f"Val CtxDice: {val_context_dice:.5f} | "
         f"LR: {scheduler.get_last_lr()[0]:.2e}"
+    )
+    print(
+        f"  Losses -> "
+        f"TargetPatch: {train_losses.get('target_patch_loss', 0):.4f} | "
+        f"TargetGlobal: {train_losses.get('target_global_loss', 0):.4f} | "
+        f"ContextPatch: {train_losses.get('context_patch_loss', 0):.4f} | "
+        f"ContextGlobal: {train_losses.get('context_global_loss', 0):.4f}"
     )
 
     if train_config["logging"]["use_wandb"]:
-        wandb.log({
+        log_dict = {
             "epoch": epoch,
             "train_loss": train_losses["loss"],
             "train_local_dice": train_losses["local_dice"],
             "train_final_dice": train_losses["final_dice"],
+            "train_context_dice": train_losses.get("context_dice", 0),
+            # Legacy losses
             "train_global_loss": train_losses["global_loss"],
             "train_local_loss": train_losses["local_loss"],
             "train_agg_loss": train_losses["agg_loss"],
+            # Patch vs Global losses
+            "train_target_patch_loss": train_losses.get("target_patch_loss", 0),
+            "train_target_global_loss": train_losses.get("target_global_loss", 0),
+            "train_context_patch_loss": train_losses.get("context_patch_loss", 0),
+            "train_context_global_loss": train_losses.get("context_global_loss", 0),
+            # Target vs Context losses
+            "train_target_loss": train_losses.get("target_loss", 0),
+            "train_context_loss": train_losses.get("context_loss", 0),
+            # Combined totals
+            "train_patch_loss_total": train_losses.get("patch_loss_total", 0),
+            "train_global_loss_total": train_losses.get("global_loss_total", 0),
+            # Validation
             "val_loss": val_loss,
             "val_local_dice": val_local_dice,
             "val_final_dice": val_final_dice,
+            "val_context_dice": val_context_dice,
             "lr": scheduler.get_last_lr()[0],
-        })
+        }
+        # Add per-level losses if available
+        for i in range(10):  # Support up to 10 levels
+            if f"level_{i}_target_patch_loss" in train_losses:
+                log_dict[f"train_level_{i}_target_patch_loss"] = train_losses[f"level_{i}_target_patch_loss"]
+                log_dict[f"train_level_{i}_target_global_loss"] = train_losses.get(f"level_{i}_target_global_loss", 0)
+                log_dict[f"train_level_{i}_context_patch_loss"] = train_losses.get(f"level_{i}_context_patch_loss", 0)
+                log_dict[f"train_level_{i}_context_global_loss"] = train_losses.get(f"level_{i}_context_global_loss", 0)
+        wandb.log(log_dict)
 
     # Save best (based on final dice)
     if val_final_dice > best_dice:

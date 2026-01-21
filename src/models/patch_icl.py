@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.aggregate import PatchAggregator, create_aggregator
-from src.models.backbone import PrecomputedDinoBackbone, PrecomputedFeatureBackbone
+from src.models.backbone import PrecomputedFeatureBackbone
 from src.models.sampling import (
     DeterministicTopKSampler,
     GumbelSoftmaxSampler,
@@ -33,15 +33,20 @@ def extract_patch_features(
     Maps patch coordinates from level resolution to the feature grid and extracts
     the corresponding feature tokens.
 
+    Coordinate mapping:
+    - coords are in level_resolution space (e.g., 64x64)
+    - features are in feature_grid_size space (e.g., 14x14)
+    - scale = feature_grid_size / level_resolution
+
     Args:
-        features: [B, 196, 1024] - Pre-computed DINOv3 features (14x14 grid)
+        features: [B, N, D] - Pre-computed features (N = feature_grid_size^2)
         coords: [B, K, 2] - Patch coordinates (h, w) at level resolution
         patch_size: Size of patches at level resolution
         level_resolution: Resolution of the current level (e.g., 64, 128, 224)
-        feature_grid_size: Size of feature grid (14 for DINOv3 with 224x224 input)
+        feature_grid_size: Size of feature grid (e.g., 14 for ViT with 224x224 input and patch_size=16)
 
     Returns:
-        patch_features: [B, K, tokens_per_patch, 1024] - Extracted features for each patch
+        patch_features: [B, K, tokens_per_patch, D] - Extracted features for each patch
     """
     B, K, _ = coords.shape
     device = features.device
@@ -118,7 +123,7 @@ class PatchICL_Level(nn.Module):
             resolution: Target resolution for this level (image will be resized to resolution x resolution)
             patch_size: Size of sampled patches (patch_size x patch_size)
             num_patches: Number of patches to sample
-            backbone: Shared or level-specific backbone (e.g., LocalDino)
+            backbone: Shared or level-specific backbone module
             level_idx: Index of this level (0 = coarsest)
             sampling_temperature: Temperature for patch sampling (lower = sharper distribution)
             sampler: Custom patch sampler (if None, creates default PatchSampler)
@@ -322,8 +327,8 @@ class PatchICL_Level(nn.Module):
             original_coords_scale: Scale factor for coordinates (to map back to original image)
             context_in: [B, k, C, H, W] - context images (optional)
             context_out: [B, k, 1, H, W] - context masks (optional)
-            target_features: [B, 196, 1024] - Pre-computed DINOv3 features for target (optional)
-            context_features: [B, k, 196, 1024] - Pre-computed DINOv3 features for context (optional)
+            target_features: [B, N, D] - Pre-computed features for target (optional)
+            context_features: [B, k, N, D] - Pre-computed features for context (optional)
             training: Whether in training mode (enables masking)
 
         Returns:
@@ -675,7 +680,7 @@ class PatchICL(nn.Module):
 
     def _create_backbone(self, backbone_cfg: dict, patch_size: int) -> nn.Module:
         """Create backbone module based on config."""
-        backbone_type = backbone_cfg.get('type', 'dino_light')
+        backbone_type = backbone_cfg.get('type', 'precomputed')
         
         if backbone_type == 'precomputed':
             # Lightweight backbone for pre-computed features
@@ -688,26 +693,6 @@ class PatchICL(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported backbone type: {backbone_type}")
-        """
-        elif backbone_type == 'dino_light':
-            return LocalDinoLight(
-                pretrained_path=backbone_cfg.get('pretrained_path'),
-                patch_size=patch_size,
-                image_size=backbone_cfg.get('image_size', 224),
-                embed_dim=backbone_cfg.get('embed_dim', 768),
-                num_heads=backbone_cfg.get('num_heads', 8),
-                num_layers=backbone_cfg.get('num_layers', 4),
-            )
-         
-        elif backbone_type == 'precomputed_dino':
-            # Full DINO transformer with pre-computed features
-            return PrecomputedDinoBackbone(
-                pretrained_path=backbone_cfg.get('pretrained_path', ''),
-                patch_size=patch_size,
-                image_size=backbone_cfg.get('image_size', 224),
-                freeze_backbone=backbone_cfg.get('freeze', True),
-            )
-        """
 
     def _create_sampler(
         self,
@@ -781,8 +766,8 @@ class PatchICL(nn.Module):
             labels: [B, 1, H, W] or [B, H, W] - GT mask
             context_in: [B, k, C, H, W] - context images
             context_out: [B, k, 1, H, W] - context masks
-            target_features: [B, 196, 1024] - Pre-computed DINOv3 features for target (optional)
-            context_features: [B, k, 196, 1024] - Pre-computed DINOv3 features for context (optional)
+            target_features: [B, N, D] - Pre-computed features for target (optional)
+            context_features: [B, k, N, D] - Pre-computed features for context (optional)
             mode: "train" or "test" - enables masking during training
 
         Returns:

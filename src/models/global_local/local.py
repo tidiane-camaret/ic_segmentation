@@ -533,3 +533,123 @@ class LocalDinoLight(nn.Module):
 
         return seg_output.reshape(B, K, -1, ps, ps)
 
+class PrecomputedDinoBackbone(nn.Module):
+    """
+    Backbone using pre-computed features with DINO's transformer layers.
+
+    Loads DINO transformer weights but skips patch embedding,
+    using pre-computed features directly.
+
+    Supports masked training where random patches are replaced with a
+    learnable mask token before processing.
+    """
+
+    def __init__(
+        self,
+        pretrained_path: str,
+        patch_size: int = 16,
+        image_size: int = 224,
+        freeze_backbone: bool = True,
+        num_classes: int = 1,
+        use_mask_token: bool = True,
+    ):
+        """
+        Args:
+            pretrained_path: Path to pretrained DINO model
+            patch_size: Size of input patches
+            image_size: Original image size
+            freeze_backbone: Whether to freeze DINO backbone weights
+            num_classes: Number of segmentation classes
+            use_mask_token: Whether to initialize a learnable mask token
+        """
+        super().__init__()
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.dino_patch_size = 16
+
+        # Load DINO backbone
+        self.backbone = AutoModel.from_pretrained(pretrained_path)
+        self.embed_dim = self.backbone.config.hidden_size
+
+        # Learnable mask token for masked training
+        if use_mask_token:
+            self.mask_token = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
+        else:
+            self.mask_token = None
+        self.num_heads = self.backbone.config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.rope_theta = self.backbone.config.rope_theta
+
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        # Compute RoPE inverse frequencies
+        inv_freq = 1 / self.rope_theta ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Segmentation head
+        self.seg_head = SegmentationHead(
+            embed_dim=self.embed_dim,
+            num_classes=num_classes,
+            patch_size=self.dino_patch_size,
+        )
+
+    def compute_rope_embeddings(
+        self,
+        coords: torch.Tensor,
+        tokens_per_patch: int,
+        device,
+        dtype,
+        actual_image_size: int | None = None,
+    ):
+        """Compute RoPE embeddings for tokens based on patch coordinates.
+
+        Args:
+            coords: [B, K, 2] patch coordinates in actual_image_size space
+            tokens_per_patch: number of tokens per patch
+            device: torch device
+            dtype: torch dtype
+            actual_image_size: the image size coords are relative to (if None, uses self.image_size)
+        """
+        B, K, _ = coords.shape
+        tokens_h = tokens_w = int(math.sqrt(tokens_per_patch))
+
+        inv_freq = self.inv_freq.to(device)
+
+        # Token offset grid - scale offsets to actual image size
+        img_size = actual_image_size if actual_image_size is not None else self.image_size
+        offset_scale = img_size / self.image_size  # Scale from 224 space to actual space
+
+        ti = torch.arange(tokens_h, device=device, dtype=torch.float32)
+        tj = torch.arange(tokens_w, device=device, dtype=torch.float32)
+        grid_i, grid_j = torch.meshgrid(ti, tj, indexing='ij')
+
+        token_offsets_h = (grid_i + 0.5) * self.dino_patch_size * offset_scale
+        token_offsets_w = (grid_j + 0.5) * self.dino_patch_size * offset_scale
+        token_offsets = torch.stack([token_offsets_h, token_offsets_w], dim=-1)
+        token_offsets = token_offsets.reshape(1, 1, tokens_per_patch, 2)
+
+        coords_expanded = coords.unsqueeze(2).float()
+        token_coords = coords_expanded + token_offsets
+        token_coords = token_coords.reshape(B, K * tokens_per_patch, 2)
+
+        # Normalize to [-1, +1] using actual image size
+        token_coords = token_coords / img_size
+        token_coords = 2.0 * token_coords - 1.0
+
+        # Compute angles
+        angles = 2 * math.pi * token_coords[:, :, :, None] * inv_freq[None, None, None, :]
+        angles = angles.flatten(2, 3)
+        angles = angles.tile(2)
+
+        return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
+
+    def apply_rotary_pos_emb(self, q, k, cos, sin):
+        """Apply rotary position embeddings."""
+        def rotate_half(x):
+            x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+            return torch.cat([-x2, x1], dim=-1)
+
+        return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
