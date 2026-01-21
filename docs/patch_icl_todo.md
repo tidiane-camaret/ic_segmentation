@@ -40,12 +40,17 @@ else:
 
 **Impact**: The model never learns to find relevant regions from scratch - it's always guided by GT.
 
-**Update**: Added `oracle_levels` config to control this per-level. Set to `[false]` to disable oracle and use uniform sampling.
+**Update**: Added separate `oracle_levels_train` and `oracle_levels_valid` configs to control oracle per-level and per-mode. This allows GT-guided sampling during training but uniform sampling during validation to avoid train/test mismatch.
+
+```yaml
+oracle_levels_train: [true]   # Training: use GT mask for focused sampling
+oracle_levels_valid: [false]  # Validation: uniform sampling (realistic test scenario)
+```
 
 **TODO**:
 - [x] Add per-level oracle config (`oracle_levels` in config.yaml)
+- [x] Separate oracle settings for train vs validation (`oracle_levels_train`, `oracle_levels_valid`)
 - [ ] Train a lightweight coarse segmentation head for the first level
-- [ ] Or use uniform sampling initially and let the model learn from mistakes
 - [ ] Or implement a separate "proposal network" for initial patch selection
 
 ---
@@ -242,29 +247,23 @@ while len(batch_patches) < K:
 
 ---
 
-### 8. Training Data Flow Issues
+### 8. Training Data Flow Issues - PARTIAL
 
-**Location**: `scripts/train.py:65-82` and `src/dataloaders/medsegbench_dataloader.py`
+**Location**: `scripts/train.py` and `src/train_utils.py`
 
-```python
-# In train.py - hardcoded to medsegbench
-train_loader = get_dataloader(
-    dataset_name=train_config["dataset"],
-    ...
-)
+**Fixed**:
+- Features now properly passed to model: `target_features` and `context_features` from batch are sent to model forward()
+- Validation uses correct `val_batch_size` instead of `train_batch_size`
+- Warmup scheduler properly implemented with LinearLR + SequentialLR
 
-# In dataloader - random label selection per sample
-if len(available_labels) > 0:
-    label_id = random.choice(available_labels)
-```
-
-**Problems**:
-1. **Hardcoded dataloader**: The commented-out `build_dataloaders` is unused; code is tied to MedSegBench
-2. **Random label per sample**: Each sample randomly selects which label to segment, creating inconsistent batches
-3. **Config mismatch**: `train_batch_size: 64` but context examples require loading multiple images per sample
+**Remaining Problems**:
+1. **Random label per sample**: Each sample randomly selects which label to segment, creating inconsistent batches
+2. **Dataloader coupling**: Code assumes specific dataloader structure
 
 **TODO**:
-- [ ] Generalize dataloader selection based on config
+- [x] Pass precomputed features to model (DONE - train_utils.py)
+- [x] Fix validation batch size (DONE - train.py)
+- [x] Implement warmup scheduler (DONE - train.py)
 - [ ] Consider episode-based sampling (consistent label within episode)
 - [ ] Verify batch size is feasible with context loading overhead
 
@@ -295,23 +294,24 @@ levels:
 
 ---
 
-### 10. Backbone Coordinate Handling
+### 10. Backbone Coordinate Handling - RESOLVED
 
-**Location**: `src/models/patch_icl.py:329` and `src/models/local.py:243-244`
+**Location**: `src/models/backbone.py`
 
+**Problem**: Coordinate scaling assumed coordinates fit within `image_size` (224). But actual image coordinates were in 512 space, causing position embeddings to be incorrectly scaled.
+
+**Solution**: Added `actual_image_size` parameter to backbone methods:
 ```python
-# In patch_icl.py
-coords_for_backbone = coords.float() * original_coords_scale
-
-# In LocalDino.compute_rope_embeddings
-token_coords = token_coords / self.image_size  # Normalize to [0,1]
-token_coords = 2.0 * token_coords - 1.0  # Map to [-1,+1]
+def forward(self, target_patches, context_patches=None, coords=None,
+            context_coords=None, actual_image_size=None):
+    # Scale coordinates from actual image space to backbone space
+    img_size = actual_image_size if actual_image_size is not None else self.image_size
+    coord_scale = self.image_size / img_size
+    scaled_coords = coords.float() * coord_scale
 ```
 
-**Problem**: Coordinate scaling assumes coordinates fit within `image_size`. If `original_coords_scale` produces coordinates > `image_size`, the RoPE normalization breaks (values exceed [-1, +1]).
-
 **TODO**:
-- [ ] Add coordinate clamping or proper normalization
+- [x] Add coordinate clamping or proper normalization (DONE - actual_image_size param)
 - [ ] Verify coordinate ranges during training with assertions
 - [ ] Document expected coordinate ranges
 
@@ -336,22 +336,20 @@ if self.training:
 
 ---
 
-### 12. Validation Uses Oracle Guidance
+### 12. Validation Uses Oracle Guidance - RESOLVED
 
-**Location**: `src/train_utils.py:265`
+**Location**: `src/train_utils.py` and `src/models/patch_icl.py`
 
-```python
-# Pass labels for oracle global branch (for now - later replace with learned global)
-outputs = model(images, labels=labels, context_in=context_in, context_out=context_out, mode="test")
-```
+**Problem**: Validation was passing GT labels to the model, enabling oracle patch sampling even during evaluation.
 
-**Problem**: Validation passes GT labels to the model, enabling oracle patch sampling even during evaluation.
-
-**Impact**: Validation metrics are overly optimistic and don't reflect true inference performance.
+**Solution**:
+1. Added `oracle_levels_train` and `oracle_levels_valid` config options
+2. PatchICL.forward() selects appropriate oracle based on `self.training` mode
+3. Validation now uses uniform sampling by default (`oracle_levels_valid: [false]`)
 
 **TODO**:
 - [x] Remove labels from validation forward pass (DONE - `train_utils.py`)
-- [ ] Add separate "oracle" vs "realistic" validation modes
+- [x] Add separate "oracle" vs "realistic" validation modes (DONE - separate train/valid oracle configs)
 - [ ] Track both metrics to measure oracle gap
 
 ---
@@ -360,18 +358,40 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 
 | Issue | Severity | Category | Status |
 |-------|----------|----------|--------|
-| Oracle dependency at first level | **Critical** | Train/test gap | PARTIAL (per-level oracle config added) |
+| Oracle dependency at first level | **Critical** | Train/test gap | DONE (separate train/valid oracle configs) |
 | Non-differentiable patch selection | **High** | Architecture | DONE (GumbelSoftmaxSampler implemented) |
-| Validation uses GT labels | **High** | Evaluation | DONE |
+| Validation uses GT labels | **High** | Evaluation | DONE (oracle_levels_valid) |
+| Position embedding scale mismatch | **High** | Bug | DONE (actual_image_size param) |
+| Output size mismatch | **High** | Bug | DONE (target_size in SegmentationHead) |
+| embed_dim mismatch | **High** | Config | DONE (768→1024 for DINOv3 ViT-L) |
 | 2D-only (project needs 3D) | **High** | Scope | TODO |
 | Single level active in config | **Medium** | Configuration | TODO |
 | Naive aggregation | **Medium** | Architecture | DONE (modular PatchAggregator) |
 | Loss design issues | **Medium** | Optimization | TODO |
 | Context integration is implicit | **Medium** | Architecture | TODO |
+| Slow feature extraction | **Medium** | Performance | DONE (vectorized) |
 | Zero-padding for missing patches | **Low** | Efficiency | TODO |
 | Exploration noise train/test gap | **Low** | Train/test gap | TODO |
-| Coordinate handling edge cases | **Low** | Robustness | TODO |
-| Training data flow issues | **Low** | Code quality | TODO |
+| Coordinate handling edge cases | **Low** | Robustness | DONE (actual_image_size) |
+| Training data flow issues | **Low** | Code quality | PARTIAL (features now passed) |
+
+---
+
+## Recent Bug Fixes (2026-01-21)
+
+### Config/Setup Fixes
+- **embed_dim**: Fixed 768→1024 to match DINOv3 ViT-L feature dimension
+- **val_batch_size**: Fixed train.py to use `val_batch_size` instead of `train_batch_size`
+- **Warmup scheduler**: Implemented LinearLR warmup + SequentialLR in train.py
+- **Features passed to model**: Fixed train_utils.py to pass `target_features` and `context_features`
+
+### Position Embedding / Coordinate Fixes
+- **actual_image_size**: Added parameter to backbone.py to correctly scale coordinates
+  - Coords in 512 space but backbone assumed 224 → now scales correctly
+- **target_size in SegmentationHead**: Output was tokens_h×16, now resizes to actual patch_size
+
+### Performance
+- **Vectorized feature extraction**: Replaced Python loops with tensor operations in `extract_patch_features()`
 
 ---
 
@@ -380,19 +400,24 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 ### Immediate (before next training run)
 1. [x] Fix validation to not use GT labels
 2. [x] Add per-level oracle config (`oracle_levels` in config.yaml)
-3. [x] Refactor patch sampling into modular `PatchSampler` class
-4. [ ] Enable multi-level configuration
-5. [ ] Add loss weighting configuration
+3. [x] Separate train/valid oracle settings (`oracle_levels_train`, `oracle_levels_valid`)
+4. [x] Refactor patch sampling into modular `PatchSampler` class
+5. [x] Fix embed_dim mismatch (768→1024)
+6. [x] Fix position embedding scaling (actual_image_size)
+7. [x] Fix SegmentationHead output size (target_size)
+8. [x] Implement warmup scheduler
+9. [ ] Enable multi-level configuration
+10. [ ] Add loss weighting configuration
 
 ### Short-term (next iteration)
-6. [ ] Implement non-oracle first-level sampling (use `oracle_levels: [false]`)
-7. [x] Improve aggregation mechanism (DONE - `src/models/aggregate.py`)
-8. [ ] Add proper padding masking
+11. [x] Improve aggregation mechanism (DONE - `src/models/aggregate.py`)
+12. [ ] Add proper padding masking
+13. [ ] Ablate aggregation strategies
 
 ### Medium-term (architecture improvements)
-9. [x] Implement `GumbelSoftmaxSampler` for differentiable patch selection
-10. [ ] Add explicit context cross-attention
-11. [ ] Extend to 3D
+14. [x] Implement `GumbelSoftmaxSampler` for differentiable patch selection
+15. [ ] Add explicit context cross-attention
+16. [ ] Extend to 3D
 
 ---
 
@@ -401,3 +426,5 @@ outputs = model(images, labels=labels, context_in=context_in, context_out=contex
 *Updated: 2026-01-20 - Implemented GumbelSoftmaxSampler for differentiable patch selection*
 *Updated: 2026-01-20 - Added PatchAugmenter with rotation/flip/scale augmentation*
 *Updated: 2026-01-20 - Implemented modular PatchAggregator with gaussian/confidence/learned options*
+*Updated: 2026-01-21 - Fixed embed_dim, position embedding, output size, warmup scheduler, feature passing, vectorized extraction*
+*Updated: 2026-01-21 - Separated oracle_levels into train/valid configs*

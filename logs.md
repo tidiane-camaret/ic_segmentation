@@ -71,3 +71,37 @@ Aggregate → Final prediction [128³]
 **Config:** All parameters in `config.yaml` under `train_totalseg.token_nmsw`
 
 **Run:** `python scripts/train_token_nmsw.py` or `python scripts/train_token_nmsw.py --pos-encoding relative`
+
+## 2026-01-21: PatchICL Training Pipeline Bug Fixes
+
+**Fixed critical bugs preventing proper training:**
+
+### Config Fixes
+- `embed_dim`: 768 → 1024 (DINOv3 ViT-L produces 1024-dim features, not 768)
+- `val_batch_size`: Was using `train_batch_size` for validation loader
+
+### Training Pipeline
+- **Features not passed to model**: `train_utils.py` extracted `target_features` and `context_features` from batch but didn't pass them to `model()`. Now properly passed.
+- **Warmup scheduler**: Config specified warmup but train.py used plain CosineAnnealingLR. Implemented `LinearLR` warmup with `SequentialLR` to chain warmup → main scheduler.
+
+### Position Embedding / Coordinate Bugs
+- **Scale mismatch**: Patch coordinates were in 512 space but backbone assumed 224. Added `actual_image_size` parameter to `PrecomputedFeatureBackbone` and `PrecomputedDinoBackbone` for correct scaling.
+- **Output size mismatch**: `SegmentationHead` output was `tokens_h × 16` but needed `patch_size`. Added `target_size` parameter with bilinear resize.
+
+### Train/Test Distribution Mismatch
+- **Oracle sampling**: Training used GT mask for patch sampling but validation had no alternative. Added separate configs:
+  - `oracle_levels_train: [true]` - GT-guided sampling during training
+  - `oracle_levels_valid: [false]` - Uniform sampling during validation
+- PatchICL.forward() now selects oracle based on `self.training` mode
+
+### Performance
+- **Vectorized feature extraction**: `extract_patch_features()` used Python loops over B×K patches. Replaced with tensor operations (batch indexing).
+
+**Files modified:**
+- `config.yaml`: embed_dim, oracle_levels_train/valid
+- `scripts/train.py`: val_batch_size, warmup scheduler
+- `src/train_utils.py`: Pass features to model
+- `src/models/backbone.py`: actual_image_size, target_size
+- `src/models/patch_icl.py`: Separate train/valid oracle, vectorized extraction
+
+**Training now runs successfully.**
