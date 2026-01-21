@@ -93,14 +93,27 @@ class TotalSeg2DDataset(Dataset):
             self.stats = pickle.load(f)
         print(f"Loaded stats for {len(self.stats)} cases")
 
+        # Convert label_id_list to set for faster lookup
+        label_id_set = set(self.label_id_list)
+
         # Build label_id -> case_ids mapping
         self.label_to_cases: Dict[str, List[str]] = {}
+        all_labels_in_stats = set()
         for case_id, labels in self.stats.items():
             for label_id in labels.keys():
-                if label_id in label_id_list:
+                all_labels_in_stats.add(label_id)
+                if label_id in label_id_set:
                     self.label_to_cases.setdefault(label_id, []).append(case_id)
 
-        print(f"Built mapping for {len(self.label_to_cases)} labels")
+        # Debug: show mismatch if no labels found
+        if len(self.label_to_cases) == 0:
+            sample_stats_labels = list(all_labels_in_stats)[:5]
+            sample_requested_labels = self.label_id_list[:5]
+            print(f"WARNING: No matching labels found!")
+            print(f"  Sample labels in stats: {sample_stats_labels}")
+            print(f"  Sample requested labels: {sample_requested_labels}")
+
+        print(f"Built mapping for {len(self.label_to_cases)} labels (stats has {len(all_labels_in_stats)} unique labels)")
 
         # Filter by split if provided
         if split is not None:
@@ -110,7 +123,7 @@ class TotalSeg2DDataset(Dataset):
         self.samples = []
         for case_id, labels in self.stats.items():
             for label_id in labels.keys():
-                if label_id in label_id_list:
+                if label_id in label_id_set:
                     # Check case exists in root_dir
                     case_dir = self.root_dir / case_id / label_id
                     if case_dir.exists():

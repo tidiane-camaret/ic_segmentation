@@ -323,10 +323,12 @@ def validate(
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
-        # No oracle: don't pass labels to model (realistic inference)
+        # Pass labels to model - oracle behavior is controlled by model config
+        # (oracle_levels_valid). If oracle=False, model uses prev_pred for sampling.
+        # If oracle=True, model uses GT. This allows config to control behavior.
         outputs = model(
             images,
-            labels=None,
+            labels=labels,
             context_in=context_in,
             context_out=context_out,
             target_features=target_features,

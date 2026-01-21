@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.local import LocalDino, LocalDinoLight
 from src.models.backbone import PrecomputedFeatureBackbone, PrecomputedDinoBackbone
 from src.models.sampling import (
     PatchAugmenter,
@@ -305,6 +304,7 @@ class PatchICL_Level(nn.Module):
         image: torch.Tensor,
         labels: torch.Tensor = None,
         prev_pred: torch.Tensor = None,
+        use_oracle: bool = False,
         original_coords_scale: float = 1.0,
         context_in: torch.Tensor = None,
         context_out: torch.Tensor = None,
@@ -317,8 +317,9 @@ class PatchICL_Level(nn.Module):
 
         Args:
             image: [B, C, H, W] - original resolution image
-            labels: [B, 1, H, W] - GT mask (for training)
+            labels: [B, 1, H, W] - GT mask (for training/loss computation)
             prev_pred: [B, 1, H, W] - prediction from previous level (at original resolution)
+            use_oracle: If True, use GT mask for sampling. If False, use prev_pred or uniform.
             original_coords_scale: Scale factor for coordinates (to map back to original image)
             context_in: [B, k, C, H, W] - context images (optional)
             context_out: [B, k, 1, H, W] - context masks (optional)
@@ -340,11 +341,13 @@ class PatchICL_Level(nn.Module):
         image_ds = self.downsample(image)
         labels_ds = self.downsample_mask(labels) if labels is not None else None
 
-        # Create weight map for sampling
-        if prev_pred is not None:
-            weights = self.downsample(prev_pred)
-        elif labels is not None:
+        # Create weight map for sampling based on oracle setting
+        # Oracle=True: use GT mask for focused sampling
+        # Oracle=False: use prev_pred if available, else uniform (realistic inference)
+        if use_oracle and labels is not None:
             weights = labels_ds
+        elif prev_pred is not None:
+            weights = self.downsample(prev_pred)
         else:
             weights = torch.ones(B, 1, self.resolution, self.resolution, device=device)
 
@@ -788,13 +791,14 @@ class PatchICL(nn.Module):
             # Use separate oracle settings for train vs validation
             oracle_levels = self.oracle_levels_train if training else self.oracle_levels_valid
             use_oracle = oracle_levels[i] if i < len(oracle_levels) else False
-            level_prev_pred = None if use_oracle else prev_pred
 
             # Forward through level with context and features
+            # Pass use_oracle flag so level knows whether to use GT for sampling
             level_out = level(
                 image=image,
                 labels=labels,
-                prev_pred=level_prev_pred,
+                prev_pred=prev_pred,
+                use_oracle=use_oracle,
                 original_coords_scale=coord_scale,
                 context_in=context_in,
                 context_out=context_out,
