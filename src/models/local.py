@@ -116,15 +116,16 @@ class SegmentationHead(nn.Module):
             nn.Conv2d(64, num_classes, kernel_size=1),
         )
 
-    def forward(self, patch_features, h, w, num_patches: int = 1):
+    def forward(self, patch_features, h, w, num_patches: int = 1, target_size: int | None = None):
         """
         Args:
             patch_features: [B, total_tokens, embed_dim] where total_tokens = K * tokens_per_patch
             h, w: spatial grid dimensions of tokens within a single patch
             num_patches: K, number of patches per example
+            target_size: Target output size (H=W). If None, uses h*16.
 
         Returns:
-            [B, K, num_classes, H, W] where H=h*patch_size, W=w*patch_size
+            [B, K, num_classes, target_size, target_size]
         """
         B, _, C = patch_features.shape
         tokens_per_patch = h * w
@@ -139,8 +140,15 @@ class SegmentationHead(nn.Module):
         feature_map = patch_features.transpose(1, 2).reshape(B * num_patches, C, h, w)
         output = self.decoder(feature_map)
 
-        # Reshape to [B, K, num_classes, H, W]
+        # Resize to target size if specified
         _, nc, H, W = output.shape
+        if target_size is not None and (H != target_size or W != target_size):
+            output = nn.functional.interpolate(
+                output, size=(target_size, target_size), mode='bilinear', align_corners=False
+            )
+            H, W = target_size, target_size
+
+        # Reshape to [B, K, num_classes, H, W]
         output = output.reshape(B, num_patches, nc, H, W)
 
         return output

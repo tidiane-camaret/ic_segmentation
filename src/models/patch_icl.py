@@ -30,7 +30,7 @@ def extract_patch_features(
     feature_grid_size: int = 14,
 ) -> torch.Tensor:
     """
-    Extract patch features from pre-computed full-image feature maps.
+    Extract patch features from pre-computed full-image feature maps (vectorized).
 
     Maps patch coordinates from level resolution to the feature grid and extracts
     the corresponding feature tokens.
@@ -46,46 +46,46 @@ def extract_patch_features(
         patch_features: [B, K, tokens_per_patch, 1024] - Extracted features for each patch
     """
     B, K, _ = coords.shape
-    embed_dim = features.shape[-1]
-
-    # Reshape features to spatial grid: [B, 14, 14, 1024]
-    features_grid = features.view(B, feature_grid_size, feature_grid_size, embed_dim)
+    device = features.device
 
     # Map patch coordinates from level resolution to feature grid
-    # coords are in level_resolution space, need to map to [0, feature_grid_size)
     scale = feature_grid_size / level_resolution
     patch_size_in_features = max(1, int(patch_size * scale))
+    tokens_per_patch = patch_size_in_features * patch_size_in_features
 
-    # Extract features for each patch
-    all_patch_features = []
-    for b in range(B):
-        batch_features = []
-        for k in range(K):
-            h, w = coords[b, k].long().tolist()
+    # Compute feature grid coordinates: [B, K]
+    fh = (coords[:, :, 0].float() * scale).long()
+    fw = (coords[:, :, 1].float() * scale).long()
 
-            # Map to feature grid coordinates
-            fh = int(h * scale)
-            fw = int(w * scale)
+    # Clamp to valid range
+    max_start = feature_grid_size - patch_size_in_features
+    fh = fh.clamp(0, max_start)
+    fw = fw.clamp(0, max_start)
 
-            # Clamp to valid range
-            fh = min(fh, feature_grid_size - patch_size_in_features)
-            fw = min(fw, feature_grid_size - patch_size_in_features)
-            fh = max(0, fh)
-            fw = max(0, fw)
+    # Create offset grid for patch extraction: [patch_size_in_features, patch_size_in_features]
+    offset_h = torch.arange(patch_size_in_features, device=device)
+    offset_w = torch.arange(patch_size_in_features, device=device)
+    offset_grid_h, offset_grid_w = torch.meshgrid(offset_h, offset_w, indexing='ij')
+    # Flatten offsets: [tokens_per_patch]
+    offset_grid_h = offset_grid_h.reshape(-1)
+    offset_grid_w = offset_grid_w.reshape(-1)
 
-            # Extract patch features: [patch_size_in_features, patch_size_in_features, embed_dim]
-            patch_feat = features_grid[b, fh:fh + patch_size_in_features, fw:fw + patch_size_in_features, :]
+    # Expand fh, fw to include all tokens in each patch
+    # fh: [B, K] -> [B, K, tokens_per_patch]
+    fh_expanded = fh.unsqueeze(-1) + offset_grid_h.view(1, 1, -1)
+    fw_expanded = fw.unsqueeze(-1) + offset_grid_w.view(1, 1, -1)
 
-            # Flatten to [tokens_per_patch, embed_dim]
-            patch_feat = patch_feat.reshape(-1, embed_dim)
-            batch_features.append(patch_feat)
+    # Convert 2D indices to flat indices: [B, K, tokens_per_patch]
+    flat_indices = fh_expanded * feature_grid_size + fw_expanded
 
-        # Stack: [K, tokens_per_patch, embed_dim]
-        batch_features = torch.stack(batch_features)
-        all_patch_features.append(batch_features)
+    # Expand batch indices: [B, K, tokens_per_patch]
+    batch_indices = torch.arange(B, device=device).view(B, 1, 1).expand(B, K, tokens_per_patch)
 
-    # Stack: [B, K, tokens_per_patch, embed_dim]
-    return torch.stack(all_patch_features)
+    # Gather features using advanced indexing
+    # features: [B, 196, embed_dim] -> index with [B, K, tokens_per_patch]
+    patch_features = features[batch_indices, flat_indices]  # [B, K, tokens_per_patch, embed_dim]
+
+    return patch_features
 
 
 class PatchICL_Level(nn.Module):
@@ -440,6 +440,9 @@ class PatchICL_Level(nn.Module):
                 context_mask = self._generate_patch_mask(K_ctx, self.context_mask_ratio, B, device)
                 all_mask = torch.cat([target_mask, context_mask], dim=1)
 
+            # Compute actual image size from scale factor
+            actual_image_size = int(original_coords_scale * self.resolution)
+
             # Process all patches through backbone
             if supports_masking:
                 all_logits = self.backbone(
@@ -447,12 +450,14 @@ class PatchICL_Level(nn.Module):
                     coords=all_coords,
                     precomputed_features=all_precomputed,
                     patch_mask=all_mask,
+                    actual_image_size=actual_image_size,
                 )
             else:
                 all_logits = self.backbone(
                     all_patches,
                     coords=all_coords,
                     precomputed_features=all_precomputed,
+                    actual_image_size=actual_image_size,
                 )
 
             # Split back: target predictions are first K, context are the rest
@@ -470,18 +475,23 @@ class PatchICL_Level(nn.Module):
             if training and supports_masking and self.target_mask_ratio > 0:
                 target_mask = self._generate_patch_mask(K, self.target_mask_ratio, B, device)
 
+            # Compute actual image size from scale factor
+            actual_image_size = int(original_coords_scale * self.resolution)
+
             if supports_masking:
                 patch_logits = self.backbone(
                     patches,
                     coords=coords_for_backbone,
                     precomputed_features=precomputed_patch_features,
                     patch_mask=target_mask,
+                    actual_image_size=actual_image_size,
                 )
             else:
                 patch_logits = self.backbone(
                     patches,
                     coords=coords_for_backbone,
                     precomputed_features=precomputed_patch_features,
+                    actual_image_size=actual_image_size,
                 )
 
         # Apply inverse augmentation to predictions before aggregation
@@ -542,10 +552,21 @@ class PatchICL(nn.Module):
             {'resolution': 224, 'patch_size': 16, 'num_patches': 64},
         ])
 
-        # Oracle config: list of bools per level (default: first level only)
+        # Oracle config: separate settings for train vs validation
+        # This avoids train/test distribution mismatch when using oracle during training
         num_levels = len(levels_cfg)
-        default_oracle = [True] + [False] * (num_levels - 1)
-        self.oracle_levels = config.get('oracle_levels', default_oracle)
+        default_oracle_train = [True] + [False] * (num_levels - 1)
+        default_oracle_valid = [False] * num_levels  # Uniform sampling during validation
+
+        # Support both old single oracle_levels and new separate train/valid
+        if 'oracle_levels_train' in config or 'oracle_levels_valid' in config:
+            self.oracle_levels_train = config.get('oracle_levels_train', default_oracle_train)
+            self.oracle_levels_valid = config.get('oracle_levels_valid', default_oracle_valid)
+        else:
+            # Backward compatibility: use oracle_levels for both
+            oracle = config.get('oracle_levels', default_oracle_train)
+            self.oracle_levels_train = oracle
+            self.oracle_levels_valid = oracle
 
         # Sampler config
         sampler_cfg = config.get('sampler', {})
@@ -764,9 +785,9 @@ class PatchICL(nn.Module):
             coord_scale = H / level.resolution
 
             # Determine whether to use oracle (GT) or previous prediction
-            # oracle_levels[i] = True means use GT mask for sampling
-            # oracle_levels[i] = False means use prev_pred (or uniform if None)
-            use_oracle = self.oracle_levels[i] if i < len(self.oracle_levels) else False
+            # Use separate oracle settings for train vs validation
+            oracle_levels = self.oracle_levels_train if training else self.oracle_levels_valid
+            use_oracle = oracle_levels[i] if i < len(oracle_levels) else False
             level_prev_pred = None if use_oracle else prev_pred
 
             # Forward through level with context and features

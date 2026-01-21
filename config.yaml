@@ -21,6 +21,7 @@ paths:
 train:
   dataset: totalseg2d #"medsegbench_abdomenus"
   download: false
+  load_dinov3_features: true
   context_size: 1
   method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
   train_label_ids: # [1,2,3,4,5] # 0 should be excluded (background)
@@ -47,10 +48,10 @@ train:
     bbox_padding: 20
 
   # Dataloader
-  train_batch_size: 64
-  val_batch_size: 32
+  train_batch_size: 24
+  val_batch_size: 24
   num_workers: 4
-  max_ds_len: 500  # null = use full dataset
+  max_ds_len: 10000  # null = use full dataset
 
   # Loss
   loss_fn:
@@ -94,7 +95,7 @@ model_params:
   patch_icl:
     # Multi-resolution levels (coarse to fine)
     levels:
-      - resolution: 64
+      - resolution: 32
         patch_size: 16
         num_patches: 16
         sampling_temperature: 0.3
@@ -109,8 +110,10 @@ model_params:
 
     # Oracle mode per level: true = use GT mask for sampling, false = use prev prediction
     # Length must match number of levels. First level has no prev_pred so oracle=false means uniform sampling.
-    oracle_levels: [false]  # For single level: use GT during training
-    # oracle_levels: [true, false, false]  # For 3 levels: oracle on first only
+    # Separate settings for train vs validation to avoid train/test distribution mismatch.
+    oracle_levels_train: [true]   # Training: use GT mask for focused sampling
+    oracle_levels_valid: [true]  # Validation: uniform sampling (realistic test scenario)
+    # oracle_levels_train: [true, false, false]  # For 3 levels: oracle on first only
 
     # Patch sampling configuration
     sampler:
@@ -123,8 +126,8 @@ model_params:
       gumbel_hard: true     # Use straight-through estimator (hard forward, soft backward)
       # Patch augmentation (applied after sampling, during training only)
       augmentation:
-        enabled: true
-        rotation: "continuous"         # "none", "90" (fast), "continuous" (slow, uses grid_sample)
+        enabled: false
+        rotation: "none"         # "none", "90" (fast), "continuous" (slow, uses grid_sample)
         rotation_range: 0.5    # Max rotation in radians (for continuous mode)
         flip_horizontal: true
         flip_vertical: true
@@ -149,14 +152,17 @@ model_params:
 
     # Backbone configuration
     backbone:
-      type: "dino"  # Options: "dino", "dino_light"
+      type: "precomputed"  # Options: "dino", "dino_light"
       share_backbone: false  # Share weights across levels
       image_size: 224
-      embed_dim: 768
+      embed_dim: 1024  # DINOv3 ViT-L features are 1024-dim
       num_heads: 8
       num_layers: 4
       pretrained_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
-
+    
+    masking : 
+      target_mask_ratio: 0.5
+      context_mask_ratio: 0.5
     # Loss weights per level (optional, defaults to 1.0 each)
     # level_weights: [1.0, 1.0, 1.0]
 

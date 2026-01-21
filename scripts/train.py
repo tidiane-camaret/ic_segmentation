@@ -1,7 +1,6 @@
 """ training script for image segmentation models """
 import sys
 from pathlib import Path
-from turtle import down
 
 import torch
 from tqdm import tqdm
@@ -79,19 +78,21 @@ if train_config["dataset"] == "totalseg2d":
         num_workers=train_config["training_parameters"].get("num_workers", 4),
         split="train",
         shuffle=True,
+        load_dinov3_features=train_config.get("load_dinov3_features", True),
     )
     val_loader = get_totalseg2d_dataloader(
         root_dir=config["paths"]["totalseg2d"],
         stats_path=config["paths"]["totalseg_stats"],
         label_id_list=train_config["val_label_ids"],
         context_size=train_config["context_size"],
-        batch_size=train_config["train_batch_size"],
+        batch_size=train_config["val_batch_size"],
         image_size=tuple(train_config["preprocessing"]["image_size"][:2]),
         crop_to_bbox=train_config["preprocessing"]["crop_to_bbox"],
         bbox_padding=train_config["preprocessing"]["bbox_padding"],
         num_workers=train_config["training_parameters"].get("num_workers", 4),
         split="val",
         shuffle=False,
+        load_dinov3_features=train_config.get("load_dinov3_features", True),
     )
 else:
     train_loader = get_dataloader(
@@ -102,6 +103,7 @@ else:
         download=train_config["download"],
         label_ids=train_config["train_label_ids"],
         context_size=train_config["context_size"],
+        load_dinov3_features=train_config.get("load_dinov3_features", True),
     )
     val_loader = get_dataloader(
         dataset_name=train_config["dataset"],
@@ -111,6 +113,7 @@ else:
         download=train_config["download"],
         label_ids=train_config["val_label_ids"],
         context_size=train_config["context_size"],
+        load_dinov3_features=train_config.get("load_dinov3_features", True),
     )
 
 # get model 
@@ -149,12 +152,46 @@ optimizer = torch.optim.AdamW(
     weight_decay=opt_cfg["optimizer_args"]["weight_decay"],
 )
 
-# Scheduler
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer,
-    T_max=train_config["training_parameters"]["num_epochs"],
-    eta_min=1e-6,
-)
+# Schedulers
+warmup_cfg = train_config.get("warmup_scheduler", {})
+sched_cfg = train_config.get("train_scheduler", {})
+
+# Main scheduler (after warmup)
+sched_type = sched_cfg.get("scheduler_type", "cosine_annealing")
+sched_args = sched_cfg.get("scheduler_args", {})
+
+if sched_type == "cosine_annealing_wr":
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=sched_args.get("t_0_epochs", 100),
+        T_mult=sched_args.get("t_mult", 1),
+        eta_min=sched_args.get("min_lr", 1e-6),
+    )
+else:
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=train_config["training_parameters"]["num_epochs"],
+        eta_min=sched_args.get("min_lr", 1e-6),
+    )
+
+# Warmup scheduler (linear warmup)
+warmup_enabled = warmup_cfg.get("enabled", False)
+warmup_epochs = warmup_cfg.get("warmup_epochs", 10) if warmup_enabled else 0
+
+if warmup_enabled:
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.01,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, main_scheduler],
+        milestones=[warmup_epochs],
+    )
+else:
+    scheduler = main_scheduler
 
 # Training loop
 best_dice = 0.0

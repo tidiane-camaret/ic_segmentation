@@ -52,15 +52,23 @@ class SegmentationHead(nn.Module):
             nn.Conv2d(64, num_classes, kernel_size=1),
         )
 
-    def forward(self, patch_features: torch.Tensor, h: int, w: int, num_patches: int = 1):
+    def forward(
+        self,
+        patch_features: torch.Tensor,
+        h: int,
+        w: int,
+        num_patches: int = 1,
+        target_size: int | None = None,
+    ):
         """
         Args:
             patch_features: [B, total_tokens, embed_dim] where total_tokens = K * tokens_per_patch
             h, w: spatial grid dimensions of tokens within a single patch
             num_patches: K, number of patches per example
+            target_size: Target output size (H=W). If None, uses h*16.
 
         Returns:
-            [B, K, num_classes, H, W] where H=h*patch_size, W=w*patch_size
+            [B, K, num_classes, target_size, target_size]
         """
         B, _, C = patch_features.shape
         tokens_per_patch = h * w
@@ -72,8 +80,15 @@ class SegmentationHead(nn.Module):
         feature_map = patch_features.transpose(1, 2).reshape(B * num_patches, C, h, w)
         output = self.decoder(feature_map)
 
-        # Reshape to [B, K, num_classes, H, W]
+        # Resize to target size if specified and different from output
         _, nc, H, W = output.shape
+        if target_size is not None and (H != target_size or W != target_size):
+            output = F.interpolate(
+                output, size=(target_size, target_size), mode='bilinear', align_corners=False
+            )
+            H, W = target_size, target_size
+
+        # Reshape to [B, K, num_classes, H, W]
         output = output.reshape(B, num_patches, nc, H, W)
 
         return output
@@ -193,15 +208,17 @@ class PrecomputedFeatureBackbone(nn.Module):
         coords: torch.Tensor = None,
         precomputed_features: torch.Tensor = None,
         patch_mask: torch.Tensor = None,
+        actual_image_size: int | None = None,
     ) -> torch.Tensor:
         """
         Process patches using pre-computed features.
 
         Args:
             patches: [B, K, C, ps, ps] - Raw patches (used for shape info, ignored if features provided)
-            coords: [B, K, 2] - Patch coordinates in original image
+            coords: [B, K, 2] - Patch coordinates in original image space
             precomputed_features: [B, K, tokens_per_patch, embed_dim] - Pre-computed DINOv3 features
             patch_mask: [B, K] - Boolean mask, True = mask this patch (optional)
+            actual_image_size: Actual image size that coords are relative to. If None, uses self.image_size.
 
         Returns:
             patch_logits: [B, K, 1, ps, ps] - Segmentation logits for each patch
@@ -234,9 +251,14 @@ class PrecomputedFeatureBackbone(nn.Module):
 
         # Add patch position embeddings based on coordinates
         if coords is not None:
+            # Scale coords from actual_image_size to backbone's image_size for position lookup
+            img_size = actual_image_size if actual_image_size is not None else self.image_size
+            coord_scale = self.image_size / img_size
+            scaled_coords = coords.float() * coord_scale
+
             grid_size = max(1, self.image_size // self.patch_size)
-            h_idx = (coords[:, :, 0] / self.patch_size).clamp(0, grid_size - 1)
-            w_idx = (coords[:, :, 1] / self.patch_size).clamp(0, grid_size - 1)
+            h_idx = (scaled_coords[:, :, 0] / self.patch_size).clamp(0, grid_size - 1)
+            w_idx = (scaled_coords[:, :, 1] / self.patch_size).clamp(0, grid_size - 1)
             pos_idx = (h_idx * grid_size + w_idx).reshape(B * K)
             pos_idx = pos_idx.clamp(0, self.num_patch_positions - 1).long()
 
@@ -249,8 +271,8 @@ class PrecomputedFeatureBackbone(nn.Module):
         # Apply transformer
         features = self.transformer(features)
 
-        # Apply segmentation head
-        seg_output = self.seg_head(features, h, w, num_patches=K)
+        # Apply segmentation head with target size matching patch size
+        seg_output = self.seg_head(features, h, w, num_patches=K, target_size=ps)
 
         return seg_output
 
@@ -317,20 +339,38 @@ class PrecomputedDinoBackbone(nn.Module):
             patch_size=self.dino_patch_size,
         )
 
-    def compute_rope_embeddings(self, coords: torch.Tensor, tokens_per_patch: int, device, dtype):
-        """Compute RoPE embeddings for tokens based on patch coordinates."""
+    def compute_rope_embeddings(
+        self,
+        coords: torch.Tensor,
+        tokens_per_patch: int,
+        device,
+        dtype,
+        actual_image_size: int | None = None,
+    ):
+        """Compute RoPE embeddings for tokens based on patch coordinates.
+
+        Args:
+            coords: [B, K, 2] patch coordinates in actual_image_size space
+            tokens_per_patch: number of tokens per patch
+            device: torch device
+            dtype: torch dtype
+            actual_image_size: the image size coords are relative to (if None, uses self.image_size)
+        """
         B, K, _ = coords.shape
         tokens_h = tokens_w = int(math.sqrt(tokens_per_patch))
 
         inv_freq = self.inv_freq.to(device)
 
-        # Token offset grid
+        # Token offset grid - scale offsets to actual image size
+        img_size = actual_image_size if actual_image_size is not None else self.image_size
+        offset_scale = img_size / self.image_size  # Scale from 224 space to actual space
+
         ti = torch.arange(tokens_h, device=device, dtype=torch.float32)
         tj = torch.arange(tokens_w, device=device, dtype=torch.float32)
         grid_i, grid_j = torch.meshgrid(ti, tj, indexing='ij')
 
-        token_offsets_h = (grid_i + 0.5) * self.dino_patch_size
-        token_offsets_w = (grid_j + 0.5) * self.dino_patch_size
+        token_offsets_h = (grid_i + 0.5) * self.dino_patch_size * offset_scale
+        token_offsets_w = (grid_j + 0.5) * self.dino_patch_size * offset_scale
         token_offsets = torch.stack([token_offsets_h, token_offsets_w], dim=-1)
         token_offsets = token_offsets.reshape(1, 1, tokens_per_patch, 2)
 
@@ -338,8 +378,8 @@ class PrecomputedDinoBackbone(nn.Module):
         token_coords = coords_expanded + token_offsets
         token_coords = token_coords.reshape(B, K * tokens_per_patch, 2)
 
-        # Normalize to [-1, +1]
-        token_coords = token_coords / self.image_size
+        # Normalize to [-1, +1] using actual image size
+        token_coords = token_coords / img_size
         token_coords = 2.0 * token_coords - 1.0
 
         # Compute angles
@@ -431,15 +471,17 @@ class PrecomputedDinoBackbone(nn.Module):
         coords: torch.Tensor = None,
         precomputed_features: torch.Tensor = None,
         patch_mask: torch.Tensor = None,
+        actual_image_size: int | None = None,
     ) -> torch.Tensor:
         """
         Process patches using pre-computed features through DINO transformer.
 
         Args:
             patches: [B, K, C, ps, ps] - Raw patches (for shape info)
-            coords: [B, K, 2] - Patch coordinates
+            coords: [B, K, 2] - Patch coordinates in actual image space
             precomputed_features: [B, K, tokens_per_patch, embed_dim] - Pre-computed features
             patch_mask: [B, K] - Boolean mask, True = mask this patch (optional)
+            actual_image_size: Actual image size that coords are relative to. If None, uses self.image_size.
 
         Returns:
             patch_logits: [B, K, 1, ps, ps]
@@ -463,7 +505,9 @@ class PrecomputedDinoBackbone(nn.Module):
 
         # Compute RoPE and process through transformer
         if coords is not None:
-            cos, sin = self.compute_rope_embeddings(coords, tokens_per_patch, device, dtype)
+            cos, sin = self.compute_rope_embeddings(
+                coords, tokens_per_patch, device, dtype, actual_image_size
+            )
             hidden_states = self.forward_with_custom_rope(hidden_states, cos, sin)
         else:
             # Default grid coords
@@ -472,10 +516,12 @@ class PrecomputedDinoBackbone(nn.Module):
             for k in range(K):
                 default_coords[:, k, 0] = (k // grid_size) * ps
                 default_coords[:, k, 1] = (k % grid_size) * ps
-            cos, sin = self.compute_rope_embeddings(default_coords, tokens_per_patch, device, dtype)
+            cos, sin = self.compute_rope_embeddings(
+                default_coords, tokens_per_patch, device, dtype, actual_image_size
+            )
             hidden_states = self.forward_with_custom_rope(hidden_states, cos, sin)
 
-        # Decode
-        seg_output = self.seg_head(hidden_states, h, w, num_patches=K)
+        # Decode with target size matching input patch size
+        seg_output = self.seg_head(hidden_states, h, w, num_patches=K, target_size=ps)
 
         return seg_output

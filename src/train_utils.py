@@ -93,13 +93,29 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
         if context_out is not None:
             context_out = context_out.to(device)
 
+        # Get pre-computed features if available
+        target_features = batch.get("target_features", None)
+        context_features = batch.get("context_features", None)
+        if target_features is not None:
+            target_features = target_features.to(device)
+        if context_features is not None:
+            context_features = context_features.to(device)
+
         # Ensure labels have channel dim
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
         optimizer.zero_grad()
 
-        outputs = model(images, labels=labels, context_in=context_in, context_out=context_out, mode="train")
+        outputs = model(
+            images,
+            labels=labels,
+            context_in=context_in,
+            context_out=context_out,
+            target_features=target_features,
+            context_features=context_features,
+            mode="train",
+        )
         losses = model.compute_loss(outputs, labels, criterion)
         loss = losses["total_loss"]
 
@@ -295,12 +311,28 @@ def validate(
         if context_out is not None:
             context_out = context_out.to(device)
 
+        # Get pre-computed features if available
+        target_features = batch.get("target_features", None)
+        context_features = batch.get("context_features", None)
+        if target_features is not None:
+            target_features = target_features.to(device)
+        if context_features is not None:
+            context_features = context_features.to(device)
+
         # Ensure labels have channel dim
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
         # No oracle: don't pass labels to model (realistic inference)
-        outputs = model(images, labels=None, context_in=context_in, context_out=context_out, mode="test")
+        outputs = model(
+            images,
+            labels=None,
+            context_in=context_in,
+            context_out=context_out,
+            target_features=target_features,
+            context_features=context_features,
+            mode="test",
+        )
         predictions = outputs["final_logit"]
 
         loss = criterion(predictions, labels.float())
