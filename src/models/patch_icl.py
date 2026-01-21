@@ -9,16 +9,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from src.models.backbone import PrecomputedFeatureBackbone, PrecomputedDinoBackbone
+from src.models.aggregate import PatchAggregator, create_aggregator
+from src.models.backbone import PrecomputedDinoBackbone, PrecomputedFeatureBackbone
 from src.models.sampling import (
+    DeterministicTopKSampler,
+    GumbelSoftmaxSampler,
     PatchAugmenter,
     PatchSampler,
     UniformSampler,
-    DeterministicTopKSampler,
-    GumbelSoftmaxSampler,
 )
-from src.models.aggregate import PatchAggregator, create_aggregator
 
 
 def extract_patch_features(
@@ -467,12 +466,34 @@ class PatchICL_Level(nn.Module):
             patch_logits = all_logits[:, :K]  # [B, K, 1, ps, ps]
             context_patch_logits = all_logits[:, K:]  # [B, K_ctx, 1, ps, ps]
 
+            # Aggregate context patches back to full context masks (one per context image)
+            # context_patch_logits: [B, K*k, 1, ps, ps], context_coords: [B, K*k, 2]
+            K_per_ctx = K  # Same number of patches per context as target
+            context_preds = []
+            for ctx_idx in range(k):
+                start_idx = ctx_idx * K_per_ctx
+                end_idx = (ctx_idx + 1) * K_per_ctx
+                ctx_logits = context_patch_logits[:, start_idx:end_idx]  # [B, K, 1, ps, ps]
+                ctx_coords = context_coords[:, start_idx:end_idx]  # [B, K, 2]
+
+                # Aggregate this context image's patches
+                ctx_pred = self.aggregate(
+                    ctx_logits, ctx_coords,
+                    output_size=(self.resolution, self.resolution),
+                )
+                context_preds.append(ctx_pred)
+
+            # Stack: [B, k, 1, res, res]
+            context_pred = torch.stack(context_preds, dim=1)
+
         else:
             # No context: process target patches only
             K = patches.shape[1]
             target_mask = None
             context_mask = None
             context_patch_logits = None
+            context_pred = None
+            context_out_ds = None
 
             supports_masking = hasattr(self.backbone, 'mask_token') and self.backbone.mask_token is not None
             if training and supports_masking and self.target_mask_ratio > 0:
@@ -520,6 +541,8 @@ class PatchICL_Level(nn.Module):
             'context_patch_labels': context_patch_labels,  # [B, K*k, 1, ps, ps] or None
             'context_patch_logits': context_patch_logits,  # [B, K*k, 1, ps, ps] or None
             'context_coords': context_coords,  # [B, K*k, 2] or None
+            'context_pred': context_pred,  # [B, k, 1, res, res] or None - aggregated context predictions
+            'context_labels': context_out_ds,  # [B, k, 1, res, res] or None - downsampled context GT
             'target_mask': target_mask,  # [B, K] or None - which target patches were masked
             'context_mask': context_mask,  # [B, K*k] or None - which context patches were masked
         }
@@ -653,14 +676,19 @@ class PatchICL(nn.Module):
     def _create_backbone(self, backbone_cfg: dict, patch_size: int) -> nn.Module:
         """Create backbone module based on config."""
         backbone_type = backbone_cfg.get('type', 'dino_light')
-
-        if backbone_type == 'dino':
-            return LocalDino(
-                pretrained_path=backbone_cfg.get('pretrained_path', ''),
+        
+        if backbone_type == 'precomputed':
+            # Lightweight backbone for pre-computed features
+            return PrecomputedFeatureBackbone(
+                embed_dim=backbone_cfg.get('embed_dim', 1024),
+                num_heads=backbone_cfg.get('num_heads', 8),
+                num_layers=backbone_cfg.get('num_layers', 4),
                 patch_size=patch_size,
                 image_size=backbone_cfg.get('image_size', 224),
-                freeze_backbone=backbone_cfg.get('freeze', True),
             )
+        else:
+            raise ValueError(f"Unsupported backbone type: {backbone_type}")
+        """
         elif backbone_type == 'dino_light':
             return LocalDinoLight(
                 pretrained_path=backbone_cfg.get('pretrained_path'),
@@ -670,15 +698,7 @@ class PatchICL(nn.Module):
                 num_heads=backbone_cfg.get('num_heads', 8),
                 num_layers=backbone_cfg.get('num_layers', 4),
             )
-        elif backbone_type == 'precomputed':
-            # Lightweight backbone for pre-computed features
-            return PrecomputedFeatureBackbone(
-                embed_dim=backbone_cfg.get('embed_dim', 1024),
-                num_heads=backbone_cfg.get('num_heads', 8),
-                num_layers=backbone_cfg.get('num_layers', 4),
-                patch_size=patch_size,
-                image_size=backbone_cfg.get('image_size', 224),
-            )
+         
         elif backbone_type == 'precomputed_dino':
             # Full DINO transformer with pre-computed features
             return PrecomputedDinoBackbone(
@@ -687,8 +707,7 @@ class PatchICL(nn.Module):
                 image_size=backbone_cfg.get('image_size', 224),
                 freeze_backbone=backbone_cfg.get('freeze', True),
             )
-        else:
-            raise ValueError(f"Unknown backbone type: {backbone_type}")
+        """
 
     def _create_sampler(
         self,
@@ -917,6 +936,23 @@ class PatchICL(nn.Module):
             else:
                 losses[f'level_{i}_context_patch_loss'] = torch.tensor(0.0, device=patch_logits.device)
 
+            # Context global loss: compare aggregated context predictions to GT
+            context_pred = level_out.get('context_pred')
+            context_labels = level_out.get('context_labels')
+
+            if context_pred is not None and context_labels is not None:
+                # context_pred: [B, k, 1, res, res], context_labels: [B, k, 1, res, res]
+                B_ctx, k_ctx = context_pred.shape[:2]
+                context_global_loss = criterion(
+                    context_pred.reshape(B_ctx * k_ctx, -1),
+                    context_labels.reshape(B_ctx * k_ctx, -1),
+                )
+                losses[f'level_{i}_context_global_loss'] = context_global_loss
+                total_context_loss = total_context_loss + weight * context_global_loss
+                context_loss_count += 1
+            else:
+                losses[f'level_{i}_context_global_loss'] = torch.tensor(0.0, device=patch_logits.device)
+
             # Level prediction loss (vs downsampled GT)
             pred = level_out['pred']  # [B, 1, res, res]
             labels_ds = F.interpolate(
@@ -943,18 +979,64 @@ class PatchICL(nn.Module):
 
         losses['total_loss'] = total_loss
 
-        # Aggregate context loss across levels
-        losses['context_loss'] = total_context_loss if context_loss_count > 0 else torch.tensor(0.0)
+        # Aggregate losses by type for logging
+        device = outputs['final_pred'].device
 
-        # Aggregate target patch loss across levels for logging
-        target_patch_losses = [losses.get(f'level_{i}_target_patch_loss', torch.tensor(0.0))
-                              for i in range(self.num_levels)]
+        # --- Per-level loss aggregation ---
+        for i in range(self.num_levels):
+            # Total loss per level (target + context, patch + global)
+            level_target_patch = losses.get(f'level_{i}_target_patch_loss', torch.tensor(0.0, device=device))
+            level_target_global = losses.get(f'level_{i}_pred_loss', torch.tensor(0.0, device=device))
+            level_context_patch = losses.get(f'level_{i}_context_patch_loss', torch.tensor(0.0, device=device))
+            level_context_global = losses.get(f'level_{i}_context_global_loss', torch.tensor(0.0, device=device))
+
+            # Per-level: target vs context
+            losses[f'level_{i}_target_loss'] = level_target_patch + level_target_global
+            losses[f'level_{i}_context_loss'] = level_context_patch + level_context_global
+
+            # Per-level: patch vs global
+            losses[f'level_{i}_patch_loss_total'] = level_target_patch + level_context_patch
+            losses[f'level_{i}_global_loss_total'] = level_target_global + level_context_global
+
+            # Rename pred_loss to target_global_loss for consistency
+            losses[f'level_{i}_target_global_loss'] = level_target_global
+
+        # --- Patch vs Global aggregation (average across levels) ---
+        # Target patch loss (average across levels)
+        target_patch_losses = [losses.get(f'level_{i}_target_patch_loss', torch.tensor(0.0, device=device))
+                               for i in range(self.num_levels)]
         losses['target_patch_loss'] = sum(target_patch_losses) / len(target_patch_losses)
+
+        # Target global loss (average across levels)
+        target_global_losses = [losses.get(f'level_{i}_pred_loss', torch.tensor(0.0, device=device))
+                                for i in range(self.num_levels)]
+        losses['target_global_loss'] = sum(target_global_losses) / len(target_global_losses)
+
+        # Context patch loss (average across levels)
+        context_patch_losses = [losses.get(f'level_{i}_context_patch_loss', torch.tensor(0.0, device=device))
+                                for i in range(self.num_levels)]
+        losses['context_patch_loss'] = sum(context_patch_losses) / len(context_patch_losses)
+
+        # Context global loss (average across levels)
+        context_global_losses = [losses.get(f'level_{i}_context_global_loss', torch.tensor(0.0, device=device))
+                                 for i in range(self.num_levels)]
+        losses['context_global_loss'] = sum(context_global_losses) / len(context_global_losses)
+
+        # --- Target vs Context aggregation ---
+        # Total target loss (patch + global)
+        losses['target_loss'] = losses['target_patch_loss'] + losses['target_global_loss']
+
+        # Total context loss (patch + global)
+        losses['context_loss'] = losses['context_patch_loss'] + losses['context_global_loss']
+
+        # --- Patch vs Global aggregation (combined target + context) ---
+        losses['patch_loss_total'] = losses['target_patch_loss'] + losses['context_patch_loss']
+        losses['global_loss_total'] = losses['target_global_loss'] + losses['context_global_loss']
 
         # Compatibility with GlobalLocalModel / train_utils
         # Map first level pred_loss to global_loss, last level patch_loss to local_loss
-        losses['global_loss'] = losses.get('level_0_pred_loss', torch.tensor(0.0))
-        losses['local_loss'] = losses.get(f'level_{self.num_levels - 1}_patch_loss', torch.tensor(0.0))
+        losses['global_loss'] = losses.get('level_0_pred_loss', torch.tensor(0.0, device=device))
+        losses['local_loss'] = losses.get(f'level_{self.num_levels - 1}_patch_loss', torch.tensor(0.0, device=device))
         losses['agg_loss'] = final_loss  # Aggregation loss = final prediction loss
 
         return losses
