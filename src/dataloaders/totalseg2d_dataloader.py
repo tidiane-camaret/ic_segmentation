@@ -3,17 +3,21 @@ TotalSegmentator 2D DataLoader
 
 Simplified dataloader for 2D slices extracted from TotalSegmentator.
 Supports in-context learning by sampling k context examples with the same label.
+
+Label splits (train/val) are defined in data/label_ids_totalseg.py.
 """
 
 import pickle
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import nibabel as nib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+from data.label_ids_totalseg import get_label_ids
 
 
 class TotalSeg2DDataset(Dataset):
@@ -38,13 +42,14 @@ class TotalSeg2DDataset(Dataset):
     Args:
         root_dir: Path to TotalSeg2D directory
         stats_path: Path to totalseg_stats.pkl file
-        label_id_list: List of label IDs to include (e.g., ['liver', 'kidney_left'])
+        label_id_list: List of label IDs to include, OR a string specifying a predefined
+            split: "train", "val", or "all" (uses splits from data/label_ids_totalseg.py)
         context_size: Number of context examples per sample
         axes: Which axes to include ('z', 'y', 'x' or subset)
         image_size: Optional target size for resizing (H, W)
         crop_to_bbox: If True, crop images around the label bounding box
         bbox_padding: Padding (in pixels) to add around bbox when cropping
-        split: 'train', 'val', or 'test' (requires meta.csv in parent dir)
+        split: 'train', 'val', or 'test' - filters by case/patient (requires meta.csv)
         random_context: If True, randomly sample context cases
         load_dinov3_features: If True, load pre-computed DINOv3 features from
             {axis}_slice_img_dinov3.npz files. Features are [196, 1024] patch tokens.
@@ -54,7 +59,7 @@ class TotalSeg2DDataset(Dataset):
         self,
         root_dir: str,
         stats_path: str,
-        label_id_list: List[str],
+        label_id_list: Union[List[str], str],
         context_size: int = 3,
         axes: Tuple[str, ...] = ("z", "y", "x"),
         image_size: Optional[Tuple[int, int]] = None,
@@ -66,7 +71,14 @@ class TotalSeg2DDataset(Dataset):
         load_dinov3_features: bool = False,
     ):
         self.root_dir = Path(root_dir)
-        self.label_id_list = label_id_list
+
+        # Resolve label_id_list if it's a string split name
+        if isinstance(label_id_list, str):
+            self.label_id_list = get_label_ids(label_id_list)
+            print(f"Using {label_id_list} label split: {len(self.label_id_list)} labels")
+        else:
+            self.label_id_list = label_id_list
+
         self.context_size = context_size
         self.axes = axes
         self.image_size = image_size
@@ -368,7 +380,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 def get_dataloader(
     root_dir: str,
     stats_path: str,
-    label_id_list: List[str],
+    label_id_list: Union[List[str], str],
     context_size: int = 3,
     batch_size: int = 8,
     image_size: Optional[Tuple[int, int]] = (256, 256),
@@ -386,7 +398,7 @@ def get_dataloader(
     Args:
         root_dir: Path to TotalSeg2D directory
         stats_path: Path to totalseg_stats.pkl
-        label_id_list: List of label IDs to include
+        label_id_list: List of label IDs, or "train"/"val"/"all" for predefined splits
         context_size: Number of context examples
         batch_size: Batch size
         image_size: Target image size (H, W)

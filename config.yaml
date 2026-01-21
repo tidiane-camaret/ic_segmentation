@@ -24,22 +24,8 @@ train:
   load_dinov3_features: true
   context_size: 1
   method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
-  train_label_ids: # [1,2,3,4,5] # 0 should be excluded (background)
-      - heart
-      - spinal_cord
-      - autochthon_left
-      - autochthon_right
-      - aorta
-      - esophagus
-      - lung_upper_lobe_left
-  val_label_ids: # [6,7,8]
-      - lung_upper_lobe_right
-      - costal_cartilages
-      - liver
-      - colon
-      - stomach
-      - femur_left
-      - femur_right 
+  train_label_ids: "train" # [1,2,3,4,5] # 0 should be excluded (background)
+  val_label_ids: "val" # [6,7,8]
 
   preprocessing:
     image_size: [512, 512, 512]
