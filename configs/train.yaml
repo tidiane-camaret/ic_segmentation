@@ -1,0 +1,123 @@
+# Training configuration for Hydra
+# Override any parameter via CLI: python scripts/train.py dataset=medsegbench_livertumor
+
+defaults:
+  - _self_
+
+# Paths
+paths:
+  DATA_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data"
+  RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
+  totalseg: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
+  medsegbench: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/MedSegBench"
+  ckpts:
+    save_dir: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/checkpoints"
+    medverse: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
+    dino_vit: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
+    dino_convnext: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3"
+
+# Dataset
+dataset: "medsegbench_abdomenus"
+download: false
+context_size: 1
+method: "global_local"  # Options: "segformer3d", "global_local"
+train_label_ids: [0, 1, 2, 3, 4]
+val_label_ids: [5, 6, 7, 8]
+
+# Preprocessing
+preprocessing:
+  image_size: [256, 256, 256]
+  spacing: [1.5, 1.5, 1.5]
+
+# Dataloader
+train_batch_size: 64
+val_batch_size: 32
+num_workers: 4
+max_ds_len: null  # null = use full dataset
+
+# Loss
+loss_fn:
+  loss_type: "dice"
+  loss_args: null
+
+# Optimizer
+optimizer:
+  optimizer_type: "adamw"
+  optimizer_args:
+    lr: 0.0001
+    weight_decay: 0.01
+
+# Schedulers
+warmup_scheduler:
+  enabled: true
+  warmup_epochs: 10
+train_scheduler:
+  scheduler_type: "cosine_annealing_wr"
+  scheduler_args:
+    t_0_epochs: 100
+    t_mult: 1
+    min_lr: 0.000001
+
+# Training
+training:
+  seed: 42
+  num_epochs: 200
+  print_every: 50
+  grad_accumulate_steps: 1
+
+# Logging
+logging:
+  use_wandb: true
+  wandb_project: "patch_icl_train"
+  save_imgs_masks: true
+
+# Model parameters
+model:
+  segformer3d:
+    in_channels: 1
+    sr_ratios: [4, 2, 1, 1]
+    embed_dims: [32, 64, 160, 256]
+    patch_kernel_size: [7, 3, 3, 3]
+    patch_stride: [4, 2, 2, 2]
+    patch_padding: [3, 1, 1, 1]
+    mlp_ratios: [4, 4, 4, 4]
+    num_heads: [1, 2, 5, 8]
+    depths: [2, 2, 2, 2]
+    num_classes: 1
+    decoder_dropout: 0.0
+    decoder_head_embedding_dim: 256
+
+  global_local:
+    global:
+      backbone: "ground_truth"
+      down_size_rate: 16
+      base_channels: 16
+      patch_size: 16
+      overlap: 0.5
+      num_train_patches: 50
+      starting_tau: 0.6666
+      final_tau: 0.6666
+      tau_decay_epochs: 100
+      loss:
+        objective: "gt_mask"
+        weight: 1.0
+
+    local:
+      backbone: "patch_transformer"
+      loss:
+        objective: "gt_mask"
+        weight: 1.0
+
+    aggregation:
+      learnable: false
+      loss:
+        objective: "gt_mask"
+        weight: 1.0
+
+# Hydra settings
+hydra:
+  run:
+    dir: ${paths.RESULTS_DIR}/runs/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${paths.RESULTS_DIR}/sweeps/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
