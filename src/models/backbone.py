@@ -11,122 +11,39 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel
 
 
 class MaskEncoder(nn.Module):
-    """Encode spatial masks into token-compatible embeddings."""
+    """Simple encoder that converts spatial masks to token embeddings."""
 
-    def __init__(
-        self,
-        embed_dim: int = 1024,
-        mask_embed_dim: int = 64,
-        token_grid_size: int = 7,
-    ):
-        """
-        Args:
-            embed_dim: Output embedding dimension (to match feature dim)
-            mask_embed_dim: Intermediate embedding dimension for mask encoding
-            token_grid_size: Target token grid size (h x w tokens per patch)
-        """
+    def __init__(self, embed_dim: int = 1024):
         super().__init__()
-        self.token_grid_size = token_grid_size
-
-        # CNN to encode masks to spatial features
+        # Simple CNN: mask -> embedding
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, mask_embed_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(mask_embed_dim),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(64, embed_dim, kernel_size=3, padding=1),
         )
 
-        # Project to embed_dim
-        self.proj = nn.Linear(mask_embed_dim, embed_dim)
-
-    def forward(self, masks: torch.Tensor) -> torch.Tensor:
+    def forward(self, masks: torch.Tensor, token_grid_size: int) -> torch.Tensor:
         """
-        Encode masks to token embeddings.
-
         Args:
             masks: [B, K, 1, ps, ps] - Spatial masks
+            token_grid_size: Target token grid size (h=w)
 
         Returns:
-            mask_tokens: [B, K, tokens, embed_dim] where tokens = token_grid_size^2
+            mask_tokens: [B, K, tokens, embed_dim]
         """
         B, K, C, H, W = masks.shape
-
-        # Flatten batch and patches: [B*K, 1, H, W]
         masks_flat = masks.view(B * K, C, H, W)
 
-        # Encode: [B*K, mask_embed_dim, H, W]
-        encoded = self.encoder(masks_flat)
+        # Encode and pool to token grid
+        encoded = self.encoder(masks_flat)  # [B*K, embed_dim, H, W]
+        encoded = F.adaptive_avg_pool2d(encoded, (token_grid_size, token_grid_size))
 
-        # Adaptive pool to token grid: [B*K, mask_embed_dim, h, w]
-        encoded = F.adaptive_avg_pool2d(encoded, (self.token_grid_size, self.token_grid_size))
-
-        # Reshape to tokens: [B*K, tokens, mask_embed_dim]
-        tokens = encoded.flatten(2).transpose(1, 2)
-
-        # Project to embed_dim: [B*K, tokens, embed_dim]
-        tokens = self.proj(tokens)
-
-        # Reshape back: [B, K, tokens, embed_dim]
-        tokens_per_patch = self.token_grid_size * self.token_grid_size
-        return tokens.view(B, K, tokens_per_patch, -1)
-
-
-class CrossAttentionLayer(nn.Module):
-    """Cross-attention layer where queries attend to key-values."""
-
-    def __init__(
-        self,
-        embed_dim: int = 1024,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim * 4, embed_dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key_value: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            query: [B, N_q, embed_dim] - Query tokens (target features)
-            key_value: [B, N_kv, embed_dim] - Key-value tokens (context features + masks)
-
-        Returns:
-            output: [B, N_q, embed_dim] - Updated query tokens
-        """
-        # Cross-attention with residual
-        attn_out, _ = self.cross_attn(query, key_value, key_value)
-        query = self.norm1(query + attn_out)
-
-        # FFN with residual
-        ffn_out = self.ffn(query)
-        query = self.norm2(query + ffn_out)
-
-        return query
+        # Reshape to tokens: [B, K, tokens, embed_dim]
+        tokens = encoded.flatten(2).transpose(1, 2)  # [B*K, tokens, embed_dim]
+        return tokens.view(B, K, token_grid_size * token_grid_size, -1)
 
 
 class SegmentationHead(nn.Module):
@@ -216,8 +133,9 @@ class PrecomputedFeatureBackbone(nn.Module):
     Skips patch embedding and processes features through a transformer
     with custom position embeddings, then decodes to segmentation masks.
 
-    Supports masked training where random patches are replaced with a
-    learnable mask token before processing.
+    Supports:
+    - Masked training where random patches are replaced with a learnable mask token
+    - Mask conditioning: context mask embeddings are added to context features
     """
 
     def __init__(
@@ -230,6 +148,7 @@ class PrecomputedFeatureBackbone(nn.Module):
         num_classes: int = 1,
         dropout: float = 0.1,
         use_mask_token: bool = True,
+        use_mask_conditioning: bool = True,
     ):
         """
         Args:
@@ -241,18 +160,26 @@ class PrecomputedFeatureBackbone(nn.Module):
             num_classes: Number of segmentation classes
             dropout: Dropout rate
             use_mask_token: Whether to initialize a learnable mask token
+            use_mask_conditioning: Whether to add mask embeddings to context features
         """
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.image_size = image_size
         self.dino_patch_size = 16  # DINOv3's internal patch size
+        self.use_mask_conditioning = use_mask_conditioning
 
         # Learnable mask token for masked training
         if use_mask_token:
             self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         else:
             self.mask_token = None
+
+        # Mask encoder for conditioning context features
+        if use_mask_conditioning:
+            self.mask_encoder = MaskEncoder(embed_dim=embed_dim)
+        else:
+            self.mask_encoder = None
 
         # Tokens per input patch (depends on how features are extracted)
         # For a 16x16 patch from 224x224 image, we get 1 token
@@ -269,6 +196,10 @@ class PrecomputedFeatureBackbone(nn.Module):
         self.patch_pos_embed = nn.Parameter(
             torch.randn(1, max(1, self.num_patch_positions), embed_dim) * 0.02
         )
+
+        # Learnable embeddings to distinguish target vs context patches
+        self.target_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.context_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
 
         # Transformer for cross-patch attention
         encoder_layer = nn.TransformerEncoderLayer(
@@ -325,21 +256,28 @@ class PrecomputedFeatureBackbone(nn.Module):
         patch_mask: torch.Tensor = None,
         actual_image_size: int | None = None,
         return_features: bool = False,
+        context_masks: torch.Tensor = None,
+        num_target_patches: int | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Process patches using pre-computed features.
 
         Args:
-            patches: [B, K, C, ps, ps] - Raw patches (used for shape info, ignored if features provided)
+            patches: [B, K, C, ps, ps] - Raw patches (used for shape info)
             coords: [B, K, 2] - Patch coordinates in original image space
             precomputed_features: [B, K, tokens_per_patch, embed_dim] - Pre-computed DINOv3 features
             patch_mask: [B, K] - Boolean mask, True = mask this patch (optional)
-            actual_image_size: Actual image size that coords are relative to. If None, uses self.image_size.
-            return_features: If True, return dict with logits and features before seg head.
+            actual_image_size: Actual image size that coords are relative to.
+            return_features: If True, return dict with logits and features.
+            context_masks: [B, K_ctx, 1, ps, ps] - GT masks for context patches (optional).
+                When provided with num_target_patches, mask embeddings are added to
+                context features (features after first num_target_patches).
+            num_target_patches: Number of target patches (K_target). Context patches
+                are features[K_target:]. Required when context_masks is provided.
 
         Returns:
             If return_features=False: patch_logits [B, K, 1, ps, ps]
-            If return_features=True: dict with 'patch_logits' and 'features' [B, K, tokens, embed_dim]
+            If return_features=True: dict with 'patch_logits' and 'features'
         """
         B, K, _, ps, _ = patches.shape
 
@@ -353,7 +291,26 @@ class PrecomputedFeatureBackbone(nn.Module):
         # precomputed_features: [B, K, tokens_per_patch, embed_dim]
         tokens_per_patch = precomputed_features.shape[2]
         h = w = int(math.sqrt(tokens_per_patch))
-        print(f"Using {tokens_per_patch} tokens per patch ({h}x{w})")
+
+        # Add mask conditioning to context features if provided
+        if (context_masks is not None and 
+            num_target_patches is not None and 
+            self.mask_encoder is not None):
+            K_target = num_target_patches
+            K_ctx = K - K_target
+
+            if K_ctx > 0:
+                # Encode context masks to embeddings
+                # context_masks: [B, K_ctx, 1, ps, ps] -> [B, K_ctx, tokens, embed_dim]
+                mask_embeddings = self.mask_encoder(context_masks, h)
+
+                # Add mask embeddings to context features
+                # precomputed_features: [B, K, tokens, embed_dim]
+                # Context features are the last K_ctx patches
+                precomputed_features = precomputed_features.clone()
+                precomputed_features[:, K_target:] = (
+                    precomputed_features[:, K_target:] + mask_embeddings
+                )
 
         # Reshape to [B*K, tokens_per_patch, embed_dim]
         features = precomputed_features.reshape(B * K, tokens_per_patch, self.embed_dim)
@@ -383,6 +340,22 @@ class PrecomputedFeatureBackbone(nn.Module):
 
             patch_pos = self.patch_pos_embed[:, pos_idx, :].squeeze(0)  # [B*K, embed_dim]
             features = features + patch_pos.unsqueeze(1)  # Broadcast to all tokens
+
+        # Add target/context embeddings to distinguish patch types
+        # features: [B*K, tokens_per_patch, embed_dim]
+        if num_target_patches is not None:
+            K_target = num_target_patches
+            K_ctx = K - K_target
+            features = features.reshape(B, K, tokens_per_patch, self.embed_dim)
+            
+            # Add target embedding to first K_target patches
+            features[:, :K_target] = features[:, :K_target] + self.target_embed.unsqueeze(2)
+            
+            # Add context embedding to remaining K_ctx patches
+            if K_ctx > 0:
+                features[:, K_target:] = features[:, K_target:] + self.context_embed.unsqueeze(2)
+            
+            features = features.reshape(B * K, tokens_per_patch, self.embed_dim)
 
         # Reshape for cross-patch attention: [B, K * tokens_per_patch, embed_dim]
         features = features.reshape(B, K * tokens_per_patch, self.embed_dim)

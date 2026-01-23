@@ -510,6 +510,7 @@ class PatchICL_Level(nn.Module):
             actual_image_size = int(original_coords_scale * self.resolution)
 
             # Process all patches through backbone
+            # Pass context masks for mask conditioning (if backbone supports it)
             if supports_masking:
                 backbone_out = self.backbone(
                     all_patches,
@@ -518,6 +519,8 @@ class PatchICL_Level(nn.Module):
                     patch_mask=all_mask,
                     actual_image_size=actual_image_size,
                     return_features=True,
+                    context_masks=context_patch_labels,  # [B, K_ctx, 1, ps, ps]
+                    num_target_patches=K,
                 )
             else:
                 backbone_out = self.backbone(
@@ -526,6 +529,8 @@ class PatchICL_Level(nn.Module):
                     precomputed_features=all_precomputed,
                     actual_image_size=actual_image_size,
                     return_features=True,
+                    context_masks=context_patch_labels,  # [B, K_ctx, 1, ps, ps]
+                    num_target_patches=K,
                 )
 
             all_logits = backbone_out['patch_logits']
@@ -847,6 +852,7 @@ class PatchICL(nn.Module):
                 num_layers=backbone_cfg.get('num_layers', 4),
                 patch_size=patch_size,
                 image_size=backbone_cfg.get('image_size', 224),
+                use_mask_conditioning=backbone_cfg.get('use_mask_conditioning', False),
             )
         else:
             raise ValueError(f"Unsupported backbone type: {backbone_type}")
