@@ -209,7 +209,8 @@ class PrecomputedFeatureBackbone(nn.Module):
         precomputed_features: torch.Tensor = None,
         patch_mask: torch.Tensor = None,
         actual_image_size: int | None = None,
-    ) -> torch.Tensor:
+        return_features: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Process patches using pre-computed features.
 
@@ -219,9 +220,11 @@ class PrecomputedFeatureBackbone(nn.Module):
             precomputed_features: [B, K, tokens_per_patch, embed_dim] - Pre-computed DINOv3 features
             patch_mask: [B, K] - Boolean mask, True = mask this patch (optional)
             actual_image_size: Actual image size that coords are relative to. If None, uses self.image_size.
+            return_features: If True, return dict with logits and features before seg head.
 
         Returns:
-            patch_logits: [B, K, 1, ps, ps] - Segmentation logits for each patch
+            If return_features=False: patch_logits [B, K, 1, ps, ps]
+            If return_features=True: dict with 'patch_logits' and 'features' [B, K, tokens, embed_dim]
         """
         B, K, _, ps, _ = patches.shape
 
@@ -271,9 +274,17 @@ class PrecomputedFeatureBackbone(nn.Module):
         # Apply transformer
         features = self.transformer(features)
 
+        # Save features before segmentation head (reshape to per-patch format)
+        features_before_head = features.reshape(B, K, tokens_per_patch, self.embed_dim)
+
         # Apply segmentation head with target size matching patch size
         seg_output = self.seg_head(features, h, w, num_patches=K, target_size=ps)
 
+        if return_features:
+            return {
+                'patch_logits': seg_output,
+                'features': features_before_head,  # [B, K, tokens, embed_dim]
+            }
         return seg_output
 
 

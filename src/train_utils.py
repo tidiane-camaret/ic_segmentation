@@ -71,23 +71,27 @@ def build_dataloaders(config: Dict, DatasetClass, collate_fn) -> tuple:
     return train_loader, val_loader
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_every):
-    """Run one training epoch."""
+def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
+    """Run one training epoch. Model must have loss functions set via set_loss_functions()."""
     model.train()
     total_loss = 0.0
-    total_global = 0.0
+    total_aggreg = 0.0
     total_local = 0.0
     total_agg = 0.0
     total_local_dice = 0.0
     total_final_dice = 0.0
-    
+
     # Track detailed losses
     total_target_patch = 0.0
-    total_target_global = 0.0
+    total_target_aggreg = 0.0
     total_context_patch = 0.0
-    total_context_global = 0.0
+    total_context_aggreg = 0.0
     total_context_dice = 0.0
     context_dice_count = 0
+
+    # Track feature losses
+    total_feature_patch = 0.0
+    total_feature_aggreg = 0.0
 
     for idx, batch in enumerate(train_loader):
         images = batch["image"].to(device)
@@ -124,7 +128,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
             context_features=context_features,
             mode="train",
         )
-        losses = model.compute_loss(outputs, labels, criterion)
+        losses = model.compute_loss(outputs, labels)
         loss = losses["total_loss"]
 
         # Compute Dice scores
@@ -171,15 +175,19 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
         optimizer.step()
 
         total_loss += loss.item()
-        total_global += losses["global_loss"].item()
+        total_aggreg += losses.get("aggreg_loss", torch.tensor(0.0)).item()
         total_local += losses["local_loss"].item()
         total_agg += losses["agg_loss"].item()
-        
+
         # Track detailed losses (use .item() to get scalar, handle tensor(0.0) case)
         total_target_patch += losses.get("target_patch_loss", torch.tensor(0.0)).item()
-        total_target_global += losses.get("target_global_loss", torch.tensor(0.0)).item()
+        total_target_aggreg += losses.get("target_aggreg_loss", torch.tensor(0.0)).item()
         total_context_patch += losses.get("context_patch_loss", torch.tensor(0.0)).item()
-        total_context_global += losses.get("context_global_loss", torch.tensor(0.0)).item()
+        total_context_aggreg += losses.get("context_aggreg_loss", torch.tensor(0.0)).item()
+
+        # Track feature losses
+        total_feature_patch += losses.get("target_feature_patch_loss", torch.tensor(0.0)).item()
+        total_feature_aggreg += losses.get("target_feature_aggreg_loss", torch.tensor(0.0)).item()
 
         if print_every and idx % print_every == 0:
             ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
@@ -193,9 +201,11 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
             print(
                 f"  Losses -> "
                 f"TargetPatch: {total_target_patch / (idx + 1):.4f} | "
-                f"TargetGlobal: {total_target_global / (idx + 1):.4f} | "
+                f"TargetAggreg: {total_target_aggreg / (idx + 1):.4f} | "
                 f"ContextPatch: {total_context_patch / (idx + 1):.4f} | "
-                f"ContextGlobal: {total_context_global / (idx + 1):.4f}"
+                f"ContextAggreg: {total_context_aggreg / (idx + 1):.4f} | "
+                f"FeatPatch: {total_feature_patch / (idx + 1):.4f} | "
+                f"FeatAggreg: {total_feature_aggreg / (idx + 1):.4f}"
             )
 
     n = len(train_loader)
@@ -205,18 +215,21 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, print_
         "local_dice": total_local_dice / n,
         "final_dice": total_final_dice / n,
         "context_dice": ctx_dice_final,
-        "global_loss": total_global / n,
+        "aggreg_loss": total_aggreg / n,
         "local_loss": total_local / n,
         "agg_loss": total_agg / n,
         # Detailed losses
         "target_patch_loss": total_target_patch / n,
-        "target_global_loss": total_target_global / n,
+        "target_aggreg_loss": total_target_aggreg / n,
         "context_patch_loss": total_context_patch / n,
-        "context_global_loss": total_context_global / n,
-        "target_loss": (total_target_patch + total_target_global) / n,
-        "context_loss": (total_context_patch + total_context_global) / n,
+        "context_aggreg_loss": total_context_aggreg / n,
+        "target_loss": (total_target_patch + total_target_aggreg) / n,
+        "context_loss": (total_context_patch + total_context_aggreg) / n,
         "patch_loss_total": (total_target_patch + total_context_patch) / n,
-        "global_loss_total": (total_target_global + total_context_global) / n,
+        "aggreg_loss_total": (total_target_aggreg + total_context_aggreg) / n,
+        # Feature losses
+        "target_feature_patch_loss": total_feature_patch / n,
+        "target_feature_aggreg_loss": total_feature_aggreg / n,
     }
 
 def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=4,
@@ -336,12 +349,12 @@ def _extract_patch_labels(labels: torch.Tensor, coords: torch.Tensor, patch_size
 def validate(
     model,
     val_loader,
-    criterion,
     device,
     save_dir: Optional[Path] = None,
     max_save_batches: int = 2,
 ):
-    """Run validation without oracle guidance (realistic inference)."""
+    """Run validation without oracle guidance (realistic inference).
+    Uses model.aggreg_criterion for loss computation."""
     model.eval()
     total_loss = 0.0
     total_local_dice = 0.0
@@ -387,7 +400,7 @@ def validate(
         )
         predictions = outputs["final_logit"]
 
-        loss = criterion(predictions, labels.float())
+        loss = model.aggreg_criterion(predictions, labels.float())
         total_loss += loss.item()
 
         # Local dice: extract GT patches using coordinates from model

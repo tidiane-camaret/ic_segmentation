@@ -216,6 +216,65 @@ class PatchICL_Level(nn.Module):
         """
         return self.aggregator(patch_logits, coords, output_size, prev_pred)
 
+    def aggregate_features(
+        self,
+        features: torch.Tensor,
+        coords: torch.Tensor,
+        output_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Aggregate patch features back to a full feature map (same as mask aggregation).
+
+        Args:
+            features: [B, K, tokens, embed_dim] - features for each patch
+            coords: [B, K, 2] - patch coordinates
+            output_size: (H, W) - output size at level resolution
+
+        Returns:
+            aggregated: [B, embed_dim, H, W] - aggregated feature map
+        """
+        import math
+        B, K, tokens, D = features.shape
+        h = w = int(math.sqrt(tokens))
+        H, W = output_size
+        device = features.device
+
+        # Reshape features to spatial: [B, K, D, h, w]
+        features_spatial = features.transpose(2, 3).reshape(B, K, D, h, w)
+
+        # Upsample each patch's features to patch_size
+        # [B*K, D, h, w] -> [B*K, D, ps, ps]
+        ps = self.patch_size
+        features_flat = features_spatial.reshape(B * K, D, h, w)
+        features_up = F.interpolate(features_flat, size=(ps, ps), mode='bilinear', align_corners=False)
+        features_up = features_up.reshape(B, K, D, ps, ps)
+
+        # Initialize output and count tensors
+        output = torch.zeros(B, D, H, W, device=device)
+        counts = torch.zeros(B, 1, H, W, device=device)
+
+        # Place patches back (same as mask aggregation)
+        for b in range(B):
+            for k in range(K):
+                h_coord, w_coord = coords[b, k].tolist()
+                h_coord, w_coord = int(h_coord), int(w_coord)
+
+                # Clamp to valid range
+                h_end = min(h_coord + ps, H)
+                w_end = min(w_coord + ps, W)
+                patch_h = h_end - h_coord
+                patch_w = w_end - w_coord
+
+                # Add features
+                output[b, :, h_coord:h_end, w_coord:w_end] += features_up[b, k, :, :patch_h, :patch_w]
+                counts[b, :, h_coord:h_end, w_coord:w_end] += 1
+
+        # Average overlapping regions
+        counts_safe = counts.clamp(min=1e-6)
+        aggregated = output / counts_safe
+
+        return aggregated
+
     def _select_context_patches(
         self,
         context_in: torch.Tensor,
@@ -452,24 +511,30 @@ class PatchICL_Level(nn.Module):
 
             # Process all patches through backbone
             if supports_masking:
-                all_logits = self.backbone(
+                backbone_out = self.backbone(
                     all_patches,
                     coords=all_coords,
                     precomputed_features=all_precomputed,
                     patch_mask=all_mask,
                     actual_image_size=actual_image_size,
+                    return_features=True,
                 )
             else:
-                all_logits = self.backbone(
+                backbone_out = self.backbone(
                     all_patches,
                     coords=all_coords,
                     precomputed_features=all_precomputed,
                     actual_image_size=actual_image_size,
+                    return_features=True,
                 )
+
+            all_logits = backbone_out['patch_logits']
+            all_output_features = backbone_out['features']  # [B, K+K_ctx, tokens, embed_dim]
 
             # Split back: target predictions are first K, context are the rest
             patch_logits = all_logits[:, :K]  # [B, K, 1, ps, ps]
             context_patch_logits = all_logits[:, K:]  # [B, K_ctx, 1, ps, ps]
+            target_output_features = all_output_features[:, :K]  # [B, K, tokens, embed_dim]
 
             # Aggregate context patches back to full context masks (one per context image)
             # context_patch_logits: [B, K*k, 1, ps, ps], context_coords: [B, K*k, 2]
@@ -508,20 +573,25 @@ class PatchICL_Level(nn.Module):
             actual_image_size = int(original_coords_scale * self.resolution)
 
             if supports_masking:
-                patch_logits = self.backbone(
+                backbone_out = self.backbone(
                     patches,
                     coords=coords_for_backbone,
                     precomputed_features=precomputed_patch_features,
                     patch_mask=target_mask,
                     actual_image_size=actual_image_size,
+                    return_features=True,
                 )
             else:
-                patch_logits = self.backbone(
+                backbone_out = self.backbone(
                     patches,
                     coords=coords_for_backbone,
                     precomputed_features=precomputed_patch_features,
                     actual_image_size=actual_image_size,
+                    return_features=True,
                 )
+
+            patch_logits = backbone_out['patch_logits']
+            target_output_features = backbone_out['features']  # [B, K, tokens, embed_dim]
 
         # Apply inverse augmentation to predictions before aggregation
         # This ensures predictions are in the original orientation for correct placement
@@ -535,6 +605,29 @@ class PatchICL_Level(nn.Module):
             output_size=(self.resolution, self.resolution),
             # prev_pred=self.downsample(prev_pred) if prev_pred is not None else None,
         )
+
+        # Compute feature losses if we have precomputed features
+        target_feature_patch_loss = None
+        target_feature_aggreg_loss = None
+
+        if precomputed_patch_features is not None and target_output_features is not None:
+            # Patch-level feature loss: MSE between input and output features
+            # precomputed_patch_features: [B, K, tokens, embed_dim]
+            # target_output_features: [B, K, tokens, embed_dim]
+            target_feature_patch_loss = F.mse_loss(target_output_features, precomputed_patch_features)
+
+            # Aggreg feature loss: aggregate features same way as mask, then MSE
+            input_features_agg = self.aggregate_features(
+                precomputed_patch_features, coords,
+                output_size=(self.resolution, self.resolution),
+            )  # [B, embed_dim, H, W]
+
+            output_features_agg = self.aggregate_features(
+                target_output_features, coords,
+                output_size=(self.resolution, self.resolution),
+            )  # [B, embed_dim, H, W]
+
+            target_feature_aggreg_loss = F.mse_loss(output_features_agg, input_features_agg)
 
         return {
             'pred': pred,  # [B, 1, res, res]
@@ -550,6 +643,8 @@ class PatchICL_Level(nn.Module):
             'context_labels': context_out_ds,  # [B, k, 1, res, res] or None - downsampled context GT
             'target_mask': target_mask,  # [B, K] or None - which target patches were masked
             'context_mask': context_mask,  # [B, K*k] or None - which context patches were masked
+            'target_feature_patch_loss': target_feature_patch_loss,  # Scalar or None
+            'target_feature_aggreg_loss': target_feature_aggreg_loss,  # Scalar or None
         }
 
 
@@ -631,6 +726,29 @@ class PatchICL(nn.Module):
         masking_cfg = config.get('masking', {})
         self.target_mask_ratio = masking_cfg.get('target_mask_ratio', 0.0)
         self.context_mask_ratio = masking_cfg.get('context_mask_ratio', 0.0)
+
+        # Loss config
+        loss_cfg = config.get('loss', {})
+
+        # Loss functions config (will be built in set_loss_functions)
+        self.patch_loss_cfg = loss_cfg.get('patch_loss', {'type': 'dice', 'args': None})
+        self.aggreg_loss_cfg = loss_cfg.get('aggreg_loss', {'type': 'dice', 'args': None})
+        self.patch_criterion = None  # Set via set_loss_functions()
+        self.aggreg_criterion = None  # Set via set_loss_functions()
+
+        # Loss weights config
+        weights_cfg = loss_cfg.get('weights', {})
+        default_weights = weights_cfg.get('default', {})
+        self.default_loss_weights = {
+            'target_patch': default_weights.get('target_patch', 1.0),
+            'target_aggreg': default_weights.get('target_aggreg', 1.0),
+            'context_patch': default_weights.get('context_patch', 1.0),
+            'context_aggreg': default_weights.get('context_aggreg', 1.0),
+            'feature_patch': default_weights.get('feature_patch', 0.0),
+            'feature_aggreg': default_weights.get('feature_aggreg', 0.0),
+        }
+        # Per-level overrides (list of dicts, one per level)
+        self.level_loss_weights = weights_cfg.get('levels', None)
 
         backbone_cfg = config.get('backbone', {})
 
@@ -748,6 +866,35 @@ class PatchICL(nn.Module):
             **self.aggregator_cfg,
         )
 
+    def _get_loss_weights(self, level_idx: int) -> dict[str, float]:
+        """Get loss weights for a specific level.
+
+        Args:
+            level_idx: Index of the level
+
+        Returns:
+            Dict with weights for each loss type
+        """
+        weights = self.default_loss_weights.copy()
+        # Override with per-level weights if specified
+        if self.level_loss_weights is not None and level_idx < len(self.level_loss_weights):
+            level_weights = self.level_loss_weights[level_idx]
+            if level_weights is not None:
+                for key in weights:
+                    if key in level_weights:
+                        weights[key] = level_weights[key]
+        return weights
+
+    def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
+        """Set the loss functions for patch and aggreg losses.
+
+        Args:
+            patch_criterion: Loss function for patch predictions
+            aggreg_criterion: Loss function for aggregated predictions
+        """
+        self.patch_criterion = patch_criterion
+        self.aggreg_criterion = aggreg_criterion
+
     def forward(
         self,
         image: torch.Tensor,
@@ -862,166 +1009,150 @@ class PatchICL(nn.Module):
         self,
         outputs: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        criterion,
-        level_weights: list[float] | None = None,
     ) -> dict[str, torch.Tensor]:
         """
-        Compute losses for all levels.
+        Compute losses for all levels with configurable weights.
+
+        Uses self.patch_criterion for patch losses and self.aggreg_criterion for
+        aggregated prediction losses. Feature losses always use MSE.
 
         Args:
             outputs: Forward pass outputs
             labels: [B, 1, H, W] - GT mask
-            criterion: Loss function
-            level_weights: Optional weights per level (default: equal)
 
         Returns:
             Dict with total_loss and per-level losses
         """
+        if self.patch_criterion is None or self.aggreg_criterion is None:
+            raise RuntimeError("Loss functions not set. Call set_loss_functions() first.")
+
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
         B = labels.shape[0]
 
-        if level_weights is None:
-            level_weights = [1.0] * self.num_levels
-
         losses = {}
         total_loss = 0.0
 
-        total_context_loss = 0.0
-        context_loss_count = 0
+        for i, level_out in enumerate(outputs['level_outputs']):
+            # Get loss weights for this level
+            weights = self._get_loss_weights(i)
+            device = level_out['patch_logits'].device
 
-        for i, (level_out, weight) in enumerate(zip(outputs['level_outputs'], level_weights)):
-            # Target patch loss
+            # --- Target patch loss ---
             patch_logits = level_out['patch_logits']  # [B, K, 1, ps, ps]
             patch_labels = level_out['patch_labels']  # [B, K, 1, ps, ps]
             K = patch_logits.shape[1]
 
-            target_patch_loss = criterion(
+            target_patch_loss = self.patch_criterion(
                 patch_logits.reshape(B * K, -1),
                 patch_labels.reshape(B * K, -1),
             )
             losses[f'level_{i}_target_patch_loss'] = target_patch_loss
-            # Keep 'patch_loss' as alias for backward compatibility
-            losses[f'level_{i}_patch_loss'] = target_patch_loss
+            losses[f'level_{i}_patch_loss'] = target_patch_loss  # Alias
+            total_loss = total_loss + weights['target_patch'] * target_patch_loss
 
-            # Context patch loss (if context patches exist)
+            # --- Target aggreg loss (prediction vs downsampled GT) ---
+            pred = level_out['pred']  # [B, 1, res, res]
+            labels_ds = F.interpolate(labels.float(), size=pred.shape[-2:], mode='nearest')
+            target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
+            losses[f'level_{i}_target_aggreg_loss'] = target_aggreg_loss
+            losses[f'level_{i}_pred_loss'] = target_aggreg_loss  # Alias
+            total_loss = total_loss + weights['target_aggreg'] * target_aggreg_loss
+
+            # --- Context patch loss ---
             context_patch_logits = level_out.get('context_patch_logits')
             context_patch_labels = level_out.get('context_patch_labels')
 
             if context_patch_logits is not None and context_patch_labels is not None:
                 K_ctx = context_patch_logits.shape[1]
-                context_patch_loss = criterion(
+                context_patch_loss = self.patch_criterion(
                     context_patch_logits.reshape(B * K_ctx, -1),
                     context_patch_labels.reshape(B * K_ctx, -1),
                 )
                 losses[f'level_{i}_context_patch_loss'] = context_patch_loss
-                total_context_loss = total_context_loss + weight * context_patch_loss
-                context_loss_count += 1
+                total_loss = total_loss + weights['context_patch'] * context_patch_loss
             else:
-                losses[f'level_{i}_context_patch_loss'] = torch.tensor(0.0, device=patch_logits.device)
+                losses[f'level_{i}_context_patch_loss'] = torch.tensor(0.0, device=device)
 
-            # Context global loss: compare aggregated context predictions to GT
+            # --- Context aggreg loss ---
             context_pred = level_out.get('context_pred')
             context_labels = level_out.get('context_labels')
 
             if context_pred is not None and context_labels is not None:
-                # context_pred: [B, k, 1, res, res], context_labels: [B, k, 1, res, res]
                 B_ctx, k_ctx = context_pred.shape[:2]
-                context_global_loss = criterion(
+                context_aggreg_loss = self.aggreg_criterion(
                     context_pred.reshape(B_ctx * k_ctx, -1),
                     context_labels.reshape(B_ctx * k_ctx, -1),
                 )
-                losses[f'level_{i}_context_global_loss'] = context_global_loss
-                total_context_loss = total_context_loss + weight * context_global_loss
-                context_loss_count += 1
+                losses[f'level_{i}_context_aggreg_loss'] = context_aggreg_loss
+                total_loss = total_loss + weights['context_aggreg'] * context_aggreg_loss
             else:
-                losses[f'level_{i}_context_global_loss'] = torch.tensor(0.0, device=patch_logits.device)
+                losses[f'level_{i}_context_aggreg_loss'] = torch.tensor(0.0, device=device)
 
-            # Level prediction loss (vs downsampled GT)
-            pred = level_out['pred']  # [B, 1, res, res]
-            labels_ds = F.interpolate(
-                labels.float(),
-                size=pred.shape[-2:],
-                mode='nearest',
+            # --- Feature patch loss ---
+            feat_patch = level_out.get('target_feature_patch_loss')
+            if feat_patch is not None:
+                losses[f'level_{i}_target_feature_patch_loss'] = feat_patch
+                total_loss = total_loss + weights['feature_patch'] * feat_patch
+            else:
+                losses[f'level_{i}_target_feature_patch_loss'] = torch.tensor(0.0, device=device)
+
+            # --- Feature aggreg loss ---
+            feat_aggreg = level_out.get('target_feature_aggreg_loss')
+            if feat_aggreg is not None:
+                losses[f'level_{i}_target_feature_aggreg_loss'] = feat_aggreg
+                total_loss = total_loss + weights['feature_aggreg'] * feat_aggreg
+            else:
+                losses[f'level_{i}_target_feature_aggreg_loss'] = torch.tensor(0.0, device=device)
+
+            # --- Per-level totals ---
+            losses[f'level_{i}_target_loss'] = target_patch_loss + target_aggreg_loss
+            losses[f'level_{i}_context_loss'] = (
+                losses[f'level_{i}_context_patch_loss'] + losses[f'level_{i}_context_aggreg_loss']
             )
-            level_loss = criterion(pred, labels_ds)
-            losses[f'level_{i}_pred_loss'] = level_loss
+            losses[f'level_{i}_patch_loss_total'] = (
+                target_patch_loss + losses[f'level_{i}_context_patch_loss']
+            )
+            losses[f'level_{i}_aggreg_loss_total'] = (
+                target_aggreg_loss + losses[f'level_{i}_context_aggreg_loss']
+            )
+            losses[f'level_{i}_loss'] = (
+                losses[f'level_{i}_target_loss'] + losses[f'level_{i}_context_loss']
+            )
 
-            # Combined level loss (target patches + prediction)
-            level_total = target_patch_loss + level_loss
-            losses[f'level_{i}_loss'] = level_total
-            total_loss = total_loss + weight * level_total
-
-        # Final prediction loss
-        final_loss = criterion(outputs['final_pred'], labels)
+        # Final prediction loss (always weight 1.0, uses aggreg criterion)
+        final_loss = self.aggreg_criterion(outputs['final_pred'], labels)
         losses['final_loss'] = final_loss
         total_loss = total_loss + final_loss
 
-        # Add context loss to total (weighted equally to target loss)
-        if context_loss_count > 0:
-            total_loss = total_loss + total_context_loss
-
         losses['total_loss'] = total_loss
 
-        # Aggregate losses by type for logging
+        # --- Aggregate losses across levels for logging ---
         device = outputs['final_pred'].device
 
-        # --- Per-level loss aggregation ---
-        for i in range(self.num_levels):
-            # Total loss per level (target + context, patch + global)
-            level_target_patch = losses.get(f'level_{i}_target_patch_loss', torch.tensor(0.0, device=device))
-            level_target_global = losses.get(f'level_{i}_pred_loss', torch.tensor(0.0, device=device))
-            level_context_patch = losses.get(f'level_{i}_context_patch_loss', torch.tensor(0.0, device=device))
-            level_context_global = losses.get(f'level_{i}_context_global_loss', torch.tensor(0.0, device=device))
+        # Average losses across levels
+        def avg_losses(key):
+            vals = [losses.get(f'level_{i}_{key}', torch.tensor(0.0, device=device))
+                    for i in range(self.num_levels)]
+            return sum(vals) / len(vals)
 
-            # Per-level: target vs context
-            losses[f'level_{i}_target_loss'] = level_target_patch + level_target_global
-            losses[f'level_{i}_context_loss'] = level_context_patch + level_context_global
+        losses['target_patch_loss'] = avg_losses('target_patch_loss')
+        losses['target_aggreg_loss'] = avg_losses('target_aggreg_loss')
+        losses['context_patch_loss'] = avg_losses('context_patch_loss')
+        losses['context_aggreg_loss'] = avg_losses('context_aggreg_loss')
+        losses['target_feature_patch_loss'] = avg_losses('target_feature_patch_loss')
+        losses['target_feature_aggreg_loss'] = avg_losses('target_feature_aggreg_loss')
 
-            # Per-level: patch vs global
-            losses[f'level_{i}_patch_loss_total'] = level_target_patch + level_context_patch
-            losses[f'level_{i}_global_loss_total'] = level_target_global + level_context_global
-
-            # Rename pred_loss to target_global_loss for consistency
-            losses[f'level_{i}_target_global_loss'] = level_target_global
-
-        # --- Patch vs Global aggregation (average across levels) ---
-        # Target patch loss (average across levels)
-        target_patch_losses = [losses.get(f'level_{i}_target_patch_loss', torch.tensor(0.0, device=device))
-                               for i in range(self.num_levels)]
-        losses['target_patch_loss'] = sum(target_patch_losses) / len(target_patch_losses)
-
-        # Target global loss (average across levels)
-        target_global_losses = [losses.get(f'level_{i}_pred_loss', torch.tensor(0.0, device=device))
-                                for i in range(self.num_levels)]
-        losses['target_global_loss'] = sum(target_global_losses) / len(target_global_losses)
-
-        # Context patch loss (average across levels)
-        context_patch_losses = [losses.get(f'level_{i}_context_patch_loss', torch.tensor(0.0, device=device))
-                                for i in range(self.num_levels)]
-        losses['context_patch_loss'] = sum(context_patch_losses) / len(context_patch_losses)
-
-        # Context global loss (average across levels)
-        context_global_losses = [losses.get(f'level_{i}_context_global_loss', torch.tensor(0.0, device=device))
-                                 for i in range(self.num_levels)]
-        losses['context_global_loss'] = sum(context_global_losses) / len(context_global_losses)
-
-        # --- Target vs Context aggregation ---
-        # Total target loss (patch + global)
-        losses['target_loss'] = losses['target_patch_loss'] + losses['target_global_loss']
-
-        # Total context loss (patch + global)
-        losses['context_loss'] = losses['context_patch_loss'] + losses['context_global_loss']
-
-        # --- Patch vs Global aggregation (combined target + context) ---
+        # Combined totals
+        losses['target_loss'] = losses['target_patch_loss'] + losses['target_aggreg_loss']
+        losses['context_loss'] = losses['context_patch_loss'] + losses['context_aggreg_loss']
         losses['patch_loss_total'] = losses['target_patch_loss'] + losses['context_patch_loss']
-        losses['global_loss_total'] = losses['target_global_loss'] + losses['context_global_loss']
+        losses['aggreg_loss_total'] = losses['target_aggreg_loss'] + losses['context_aggreg_loss']
 
-        # Compatibility with GlobalLocalModel / train_utils
-        # Map first level pred_loss to global_loss, last level patch_loss to local_loss
-        losses['global_loss'] = losses.get('level_0_pred_loss', torch.tensor(0.0, device=device))
-        losses['local_loss'] = losses.get(f'level_{self.num_levels - 1}_patch_loss', torch.tensor(0.0, device=device))
-        losses['agg_loss'] = final_loss  # Aggregation loss = final prediction loss
+        # Legacy compatibility
+        losses['aggreg_loss'] = losses.get('level_0_target_aggreg_loss', torch.tensor(0.0, device=device))
+        losses['local_loss'] = losses.get(f'level_{self.num_levels - 1}_target_patch_loss', torch.tensor(0.0, device=device))
+        losses['agg_loss'] = final_loss
 
         return losses

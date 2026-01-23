@@ -132,17 +132,21 @@ elif train_config["method"] == "patch_icl":
         config["model_params"]["patch_icl"],
         context_size=train_config.get("context_size", 0),
     ).to(device)
+
+    # Build and set loss functions from patch_icl config
+    loss_cfg = config["model_params"]["patch_icl"].get("loss", {})
+    patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
+    aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+
+    patch_criterion = build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args"))
+    aggreg_criterion = build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args"))
+    model.set_loss_functions(patch_criterion, aggreg_criterion)
+    print(f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}")
 else:
     raise ValueError(f"Unknown method: {train_config['method']}")
 
 num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model parameters: {num_params:,}")
-
-# Loss
-criterion = build_loss_fn(
-    train_config["loss_fn"]["loss_type"],
-    train_config["loss_fn"].get("loss_args"),
-)
 
 # Optimizer
 opt_cfg = train_config["optimizer"]
@@ -200,19 +204,19 @@ print_every = train_config["training_parameters"]["print_every"]
 
 for epoch in tqdm(range(num_epochs), desc="Training"):
     train_losses = train_epoch(
-        model, train_loader, criterion, optimizer,
+        model, train_loader, optimizer,
         device, epoch, print_every
     )
 
     # Validation with optional saving (overwrites each time)
     save_imgs = train_config["logging"].get("save_imgs_masks", False)
-    save_dir = None
+    val_save_dir = None
     if save_imgs and epoch % 10 == 0:  # Save every 10 epochs
-        save_dir = Path(paths["RESULTS_DIR"]) / f"{train_config['dataset']}"
+        val_save_dir = Path(paths["RESULTS_DIR"]) / f"{train_config['dataset']}"
 
     val_loss, val_local_dice, val_final_dice, val_context_dice = validate(
-        model, val_loader, criterion, device,
-        save_dir=save_dir, max_save_batches=2
+        model, val_loader, device,
+        save_dir=val_save_dir, max_save_batches=2
     )
 
     scheduler.step()
@@ -231,9 +235,11 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
     print(
         f"  Losses -> "
         f"TargetPatch: {train_losses.get('target_patch_loss', 0):.4f} | "
-        f"TargetGlobal: {train_losses.get('target_global_loss', 0):.4f} | "
+        f"TargetAggreg: {train_losses.get('target_aggreg_loss', 0):.4f} | "
         f"ContextPatch: {train_losses.get('context_patch_loss', 0):.4f} | "
-        f"ContextGlobal: {train_losses.get('context_global_loss', 0):.4f}"
+        f"ContextAggreg: {train_losses.get('context_aggreg_loss', 0):.4f} | "
+        f"FeatPatch: {train_losses.get('target_feature_patch_loss', 0):.4f} | "
+        f"FeatAggreg: {train_losses.get('target_feature_aggreg_loss', 0):.4f}"
     )
 
     if train_config["logging"]["use_wandb"]:
@@ -244,20 +250,23 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             "train_final_dice": train_losses["final_dice"],
             "train_context_dice": train_losses.get("context_dice", 0),
             # Legacy losses
-            "train_global_loss": train_losses["global_loss"],
+            "train_aggreg_loss": train_losses.get("aggreg_loss", 0),
             "train_local_loss": train_losses["local_loss"],
             "train_agg_loss": train_losses["agg_loss"],
-            # Patch vs Global losses
+            # Patch vs Aggreg losses
             "train_target_patch_loss": train_losses.get("target_patch_loss", 0),
-            "train_target_global_loss": train_losses.get("target_global_loss", 0),
+            "train_target_aggreg_loss": train_losses.get("target_aggreg_loss", 0),
             "train_context_patch_loss": train_losses.get("context_patch_loss", 0),
-            "train_context_global_loss": train_losses.get("context_global_loss", 0),
+            "train_context_aggreg_loss": train_losses.get("context_aggreg_loss", 0),
             # Target vs Context losses
             "train_target_loss": train_losses.get("target_loss", 0),
             "train_context_loss": train_losses.get("context_loss", 0),
             # Combined totals
             "train_patch_loss_total": train_losses.get("patch_loss_total", 0),
-            "train_global_loss_total": train_losses.get("global_loss_total", 0),
+            "train_aggreg_loss_total": train_losses.get("aggreg_loss_total", 0),
+            # Feature losses
+            "train_target_feature_patch_loss": train_losses.get("target_feature_patch_loss", 0),
+            "train_target_feature_aggreg_loss": train_losses.get("target_feature_aggreg_loss", 0),
             # Validation
             "val_loss": val_loss,
             "val_local_dice": val_local_dice,
@@ -269,9 +278,11 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         for i in range(10):  # Support up to 10 levels
             if f"level_{i}_target_patch_loss" in train_losses:
                 log_dict[f"train_level_{i}_target_patch_loss"] = train_losses[f"level_{i}_target_patch_loss"]
-                log_dict[f"train_level_{i}_target_global_loss"] = train_losses.get(f"level_{i}_target_global_loss", 0)
+                log_dict[f"train_level_{i}_target_aggreg_loss"] = train_losses.get(f"level_{i}_target_aggreg_loss", 0)
                 log_dict[f"train_level_{i}_context_patch_loss"] = train_losses.get(f"level_{i}_context_patch_loss", 0)
-                log_dict[f"train_level_{i}_context_global_loss"] = train_losses.get(f"level_{i}_context_global_loss", 0)
+                log_dict[f"train_level_{i}_context_aggreg_loss"] = train_losses.get(f"level_{i}_context_aggreg_loss", 0)
+                log_dict[f"train_level_{i}_feature_patch_loss"] = train_losses.get(f"level_{i}_target_feature_patch_loss", 0)
+                log_dict[f"train_level_{i}_feature_aggreg_loss"] = train_losses.get(f"level_{i}_target_feature_aggreg_loss", 0)
         wandb.log(log_dict)
 
     # Save best (based on final dice)

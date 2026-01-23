@@ -24,8 +24,8 @@ train:
   load_dinov3_features: true
   context_size: 1
   method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
-  train_label_ids: "train" # [1,2,3,4,5] # 0 should be excluded (background)
-  val_label_ids: "val" # [6,7,8]
+  train_label_ids:  "train" #["liver"] [1,2,3,4,5] # 0 should be excluded (background)
+  val_label_ids: "val" #["liver"] # # [6,7,8]
 
   preprocessing:
     image_size: [512, 512, 512]
@@ -34,15 +34,10 @@ train:
     bbox_padding: 20
 
   # Dataloader
-  train_batch_size: 24
-  val_batch_size: 24
-  num_workers: 4
-  max_ds_len: 10000  # null = use full dataset
-
-  # Loss
-  loss_fn:
-    loss_type: "dice"
-    loss_args: null
+  train_batch_size: 32 #24
+  val_batch_size: 32 #24
+  num_workers: 8
+  max_ds_len: 1000  # null = use full dataset
 
   # Optimizer
   optimizer:
@@ -146,11 +141,35 @@ model_params:
       num_layers: 4
       pretrained_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
     
-    masking : 
-      target_mask_ratio: 0.5
-      context_mask_ratio: 0.5
-    # Loss weights per level (optional, defaults to 1.0 each)
-    # level_weights: [1.0, 1.0, 1.0]
+    masking :
+      target_mask_ratio: 1
+      context_mask_ratio: 0
+
+    # Loss configuration
+    loss:
+      # Loss functions (feature losses always use MSE)
+      patch_loss:
+        type: "binarycrossentropy"           # Loss for patch predictions
+        args: null
+      aggreg_loss:
+        type: "dice"           # Loss for aggregated predictions
+        args: null
+
+      # Loss weights (default applies to all levels; can override per-level)
+      weights:
+        default:
+          target_patch: 1.0       # Loss on target patches
+          target_aggreg: 1.0      # Loss on aggregated target prediction
+          context_patch: 0.5      # Loss on context patches
+          context_aggreg: 0.5     # Loss on aggregated context prediction
+          feature_patch: 1      # Feature MSE on patches
+          feature_aggreg: 1     # Feature MSE on aggregated features
+        # Per-level overrides (optional, indexed by level)
+        # levels:
+        #   - target_patch: 1.0   # Level 0
+        #     target_aggreg: 0.5
+        #   - target_patch: 1.0   # Level 1
+        #     target_aggreg: 1.0
 
   global_local:
     global:
