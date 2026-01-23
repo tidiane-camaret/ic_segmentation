@@ -535,6 +535,7 @@ class PatchICL_Level(nn.Module):
             patch_logits = all_logits[:, :K]  # [B, K, 1, ps, ps]
             context_patch_logits = all_logits[:, K:]  # [B, K_ctx, 1, ps, ps]
             target_output_features = all_output_features[:, :K]  # [B, K, tokens, embed_dim]
+            context_output_features = all_output_features[:, K:]  # [B, K_ctx, tokens, embed_dim]
 
             # Aggregate context patches back to full context masks (one per context image)
             # context_patch_logits: [B, K*k, 1, ps, ps], context_coords: [B, K*k, 2]
@@ -609,6 +610,8 @@ class PatchICL_Level(nn.Module):
         # Compute feature losses if we have precomputed features
         target_feature_patch_loss = None
         target_feature_aggreg_loss = None
+        context_feature_patch_loss = None
+        context_feature_aggreg_loss = None
 
         if precomputed_patch_features is not None and target_output_features is not None:
             # Patch-level feature loss: MSE between input and output features
@@ -629,6 +632,38 @@ class PatchICL_Level(nn.Module):
 
             target_feature_aggreg_loss = F.mse_loss(output_features_agg, input_features_agg)
 
+        # Compute context feature losses if we have precomputed context features
+        if precomputed_context_features is not None and context_output_features is not None:
+            # Patch-level feature loss: MSE between input and output context features
+            # precomputed_context_features: [B, K*k, tokens, embed_dim]
+            # context_output_features: [B, K*k, tokens, embed_dim]
+            context_feature_patch_loss = F.mse_loss(context_output_features, precomputed_context_features)
+
+            # Aggreg feature loss: aggregate context features same way as mask, then MSE
+            # Aggregate per context image
+            K_per_ctx = context_coords.shape[1] // k
+            ctx_feat_aggreg_losses = []
+            for ctx_idx in range(k):
+                start_idx = ctx_idx * K_per_ctx
+                end_idx = (ctx_idx + 1) * K_per_ctx
+                ctx_input_feats = precomputed_context_features[:, start_idx:end_idx]  # [B, K, tokens, embed_dim]
+                ctx_output_feats = context_output_features[:, start_idx:end_idx]  # [B, K, tokens, embed_dim]
+                ctx_coords_slice = context_coords[:, start_idx:end_idx]  # [B, K, 2]
+
+                ctx_input_agg = self.aggregate_features(
+                    ctx_input_feats, ctx_coords_slice,
+                    output_size=(self.resolution, self.resolution),
+                )  # [B, embed_dim, H, W]
+
+                ctx_output_agg = self.aggregate_features(
+                    ctx_output_feats, ctx_coords_slice,
+                    output_size=(self.resolution, self.resolution),
+                )  # [B, embed_dim, H, W]
+
+                ctx_feat_aggreg_losses.append(F.mse_loss(ctx_output_agg, ctx_input_agg))
+
+            context_feature_aggreg_loss = sum(ctx_feat_aggreg_losses) / len(ctx_feat_aggreg_losses)
+
         return {
             'pred': pred,  # [B, 1, res, res]
             'patches': patches,  # [B, K, C, ps, ps]
@@ -645,6 +680,8 @@ class PatchICL_Level(nn.Module):
             'context_mask': context_mask,  # [B, K*k] or None - which context patches were masked
             'target_feature_patch_loss': target_feature_patch_loss,  # Scalar or None
             'target_feature_aggreg_loss': target_feature_aggreg_loss,  # Scalar or None
+            'context_feature_patch_loss': context_feature_patch_loss,  # Scalar or None
+            'context_feature_aggreg_loss': context_feature_aggreg_loss,  # Scalar or None
         }
 
 
@@ -746,6 +783,8 @@ class PatchICL(nn.Module):
             'context_aggreg': default_weights.get('context_aggreg', 1.0),
             'feature_patch': default_weights.get('feature_patch', 0.0),
             'feature_aggreg': default_weights.get('feature_aggreg', 0.0),
+            'context_feature_patch': default_weights.get('context_feature_patch', 0.0),
+            'context_feature_aggreg': default_weights.get('context_feature_aggreg', 0.0),
         }
         # Per-level overrides (list of dicts, one per level)
         self.level_loss_weights = weights_cfg.get('levels', None)
@@ -1106,6 +1145,22 @@ class PatchICL(nn.Module):
             else:
                 losses[f'level_{i}_target_feature_aggreg_loss'] = torch.tensor(0.0, device=device)
 
+            # --- Context feature patch loss ---
+            ctx_feat_patch = level_out.get('context_feature_patch_loss')
+            if ctx_feat_patch is not None:
+                losses[f'level_{i}_context_feature_patch_loss'] = ctx_feat_patch
+                total_loss = total_loss + weights['context_feature_patch'] * ctx_feat_patch
+            else:
+                losses[f'level_{i}_context_feature_patch_loss'] = torch.tensor(0.0, device=device)
+
+            # --- Context feature aggreg loss ---
+            ctx_feat_aggreg = level_out.get('context_feature_aggreg_loss')
+            if ctx_feat_aggreg is not None:
+                losses[f'level_{i}_context_feature_aggreg_loss'] = ctx_feat_aggreg
+                total_loss = total_loss + weights['context_feature_aggreg'] * ctx_feat_aggreg
+            else:
+                losses[f'level_{i}_context_feature_aggreg_loss'] = torch.tensor(0.0, device=device)
+
             # --- Per-level totals ---
             losses[f'level_{i}_target_loss'] = target_patch_loss + target_aggreg_loss
             losses[f'level_{i}_context_loss'] = (
@@ -1143,6 +1198,8 @@ class PatchICL(nn.Module):
         losses['context_aggreg_loss'] = avg_losses('context_aggreg_loss')
         losses['target_feature_patch_loss'] = avg_losses('target_feature_patch_loss')
         losses['target_feature_aggreg_loss'] = avg_losses('target_feature_aggreg_loss')
+        losses['context_feature_patch_loss'] = avg_losses('context_feature_patch_loss')
+        losses['context_feature_aggreg_loss'] = avg_losses('context_feature_aggreg_loss')
 
         # Combined totals
         losses['target_loss'] = losses['target_patch_loss'] + losses['target_aggreg_loss']

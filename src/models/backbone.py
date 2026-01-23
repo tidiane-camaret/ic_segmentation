@@ -14,6 +14,121 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 
+class MaskEncoder(nn.Module):
+    """Encode spatial masks into token-compatible embeddings."""
+
+    def __init__(
+        self,
+        embed_dim: int = 1024,
+        mask_embed_dim: int = 64,
+        token_grid_size: int = 7,
+    ):
+        """
+        Args:
+            embed_dim: Output embedding dimension (to match feature dim)
+            mask_embed_dim: Intermediate embedding dimension for mask encoding
+            token_grid_size: Target token grid size (h x w tokens per patch)
+        """
+        super().__init__()
+        self.token_grid_size = token_grid_size
+
+        # CNN to encode masks to spatial features
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, mask_embed_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(mask_embed_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # Project to embed_dim
+        self.proj = nn.Linear(mask_embed_dim, embed_dim)
+
+    def forward(self, masks: torch.Tensor) -> torch.Tensor:
+        """
+        Encode masks to token embeddings.
+
+        Args:
+            masks: [B, K, 1, ps, ps] - Spatial masks
+
+        Returns:
+            mask_tokens: [B, K, tokens, embed_dim] where tokens = token_grid_size^2
+        """
+        B, K, C, H, W = masks.shape
+
+        # Flatten batch and patches: [B*K, 1, H, W]
+        masks_flat = masks.view(B * K, C, H, W)
+
+        # Encode: [B*K, mask_embed_dim, H, W]
+        encoded = self.encoder(masks_flat)
+
+        # Adaptive pool to token grid: [B*K, mask_embed_dim, h, w]
+        encoded = F.adaptive_avg_pool2d(encoded, (self.token_grid_size, self.token_grid_size))
+
+        # Reshape to tokens: [B*K, tokens, mask_embed_dim]
+        tokens = encoded.flatten(2).transpose(1, 2)
+
+        # Project to embed_dim: [B*K, tokens, embed_dim]
+        tokens = self.proj(tokens)
+
+        # Reshape back: [B, K, tokens, embed_dim]
+        tokens_per_patch = self.token_grid_size * self.token_grid_size
+        return tokens.view(B, K, tokens_per_patch, -1)
+
+
+class CrossAttentionLayer(nn.Module):
+    """Cross-attention layer where queries attend to key-values."""
+
+    def __init__(
+        self,
+        embed_dim: int = 1024,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: [B, N_q, embed_dim] - Query tokens (target features)
+            key_value: [B, N_kv, embed_dim] - Key-value tokens (context features + masks)
+
+        Returns:
+            output: [B, N_q, embed_dim] - Updated query tokens
+        """
+        # Cross-attention with residual
+        attn_out, _ = self.cross_attn(query, key_value, key_value)
+        query = self.norm1(query + attn_out)
+
+        # FFN with residual
+        ffn_out = self.ffn(query)
+        query = self.norm2(query + ffn_out)
+
+        return query
+
+
 class SegmentationHead(nn.Module):
     """Decoder head with CNN upsampling."""
 
@@ -238,6 +353,7 @@ class PrecomputedFeatureBackbone(nn.Module):
         # precomputed_features: [B, K, tokens_per_patch, embed_dim]
         tokens_per_patch = precomputed_features.shape[2]
         h = w = int(math.sqrt(tokens_per_patch))
+        print(f"Using {tokens_per_patch} tokens per patch ({h}x{w})")
 
         # Reshape to [B*K, tokens_per_patch, embed_dim]
         features = precomputed_features.reshape(B * K, tokens_per_patch, self.embed_dim)

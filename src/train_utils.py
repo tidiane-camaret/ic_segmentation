@@ -92,6 +92,8 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
     # Track feature losses
     total_feature_patch = 0.0
     total_feature_aggreg = 0.0
+    total_context_feature_patch = 0.0
+    total_context_feature_aggreg = 0.0
 
     for idx, batch in enumerate(train_loader):
         images = batch["image"].to(device)
@@ -188,15 +190,17 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
         # Track feature losses
         total_feature_patch += losses.get("target_feature_patch_loss", torch.tensor(0.0)).item()
         total_feature_aggreg += losses.get("target_feature_aggreg_loss", torch.tensor(0.0)).item()
+        total_context_feature_patch += losses.get("context_feature_patch_loss", torch.tensor(0.0)).item()
+        total_context_feature_aggreg += losses.get("context_feature_aggreg_loss", torch.tensor(0.0)).item()
 
         if print_every and idx % print_every == 0:
             ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
                 f"Loss: {total_loss / (idx + 1):.5f} | "
-                f"LocalDice: {total_local_dice / (idx + 1):.5f} | "
-                f"FinalDice: {total_final_dice / (idx + 1):.5f} | "
-                f"CtxDice: {ctx_dice_avg:.5f}"
+                f"Last level target patch Dice: {total_local_dice / (idx + 1):.5f} | "
+                f"Last level target aggreg Dice: {total_final_dice / (idx + 1):.5f} | "
+                f"Last level context aggreg Dice: {ctx_dice_avg:.5f}"
             )
             print(
                 f"  Losses -> "
@@ -205,7 +209,9 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
                 f"ContextPatch: {total_context_patch / (idx + 1):.4f} | "
                 f"ContextAggreg: {total_context_aggreg / (idx + 1):.4f} | "
                 f"FeatPatch: {total_feature_patch / (idx + 1):.4f} | "
-                f"FeatAggreg: {total_feature_aggreg / (idx + 1):.4f}"
+                f"FeatAggreg: {total_feature_aggreg / (idx + 1):.4f} | "
+                f"CtxFeatPatch: {total_context_feature_patch / (idx + 1):.4f} | "
+                f"CtxFeatAggreg: {total_context_feature_aggreg / (idx + 1):.4f}"
             )
 
     n = len(train_loader)
@@ -230,6 +236,8 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
         # Feature losses
         "target_feature_patch_loss": total_feature_patch / n,
         "target_feature_aggreg_loss": total_feature_aggreg / n,
+        "context_feature_patch_loss": total_context_feature_patch / n,
+        "context_feature_aggreg_loss": total_context_feature_aggreg / n,
     }
 
 def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=4,

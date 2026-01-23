@@ -34,8 +34,8 @@ train:
     bbox_padding: 20
 
   # Dataloader
-  train_batch_size: 32 #24
-  val_batch_size: 32 #24
+  train_batch_size: 50 #24
+  val_batch_size: 64 #24
   num_workers: 8
   max_ds_len: 1000  # null = use full dataset
 
@@ -158,12 +158,14 @@ model_params:
       # Loss weights (default applies to all levels; can override per-level)
       weights:
         default:
-          target_patch: 1.0       # Loss on target patches
-          target_aggreg: 1.0      # Loss on aggregated target prediction
+          target_patch: 0.5       # Loss on target patches
+          target_aggreg: 0.5      # Loss on aggregated target prediction
           context_patch: 0.5      # Loss on context patches
           context_aggreg: 0.5     # Loss on aggregated context prediction
-          feature_patch: 1      # Feature MSE on patches
-          feature_aggreg: 1     # Feature MSE on aggregated features
+          feature_patch: 1.0      # Target feature MSE on patches
+          feature_aggreg: 1.0     # Target feature MSE on aggregated features
+          context_feature_patch: 1.0    # Context feature MSE on patches
+          context_feature_aggreg: 1.0   # Context feature MSE on aggregated features
         # Per-level overrides (optional, indexed by level)
         # levels:
         #   - target_patch: 1.0   # Level 0

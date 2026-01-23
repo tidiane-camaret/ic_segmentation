@@ -239,7 +239,9 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         f"ContextPatch: {train_losses.get('context_patch_loss', 0):.4f} | "
         f"ContextAggreg: {train_losses.get('context_aggreg_loss', 0):.4f} | "
         f"FeatPatch: {train_losses.get('target_feature_patch_loss', 0):.4f} | "
-        f"FeatAggreg: {train_losses.get('target_feature_aggreg_loss', 0):.4f}"
+        f"FeatAggreg: {train_losses.get('target_feature_aggreg_loss', 0):.4f} | "
+        f"CtxFeatPatch: {train_losses.get('context_feature_patch_loss', 0):.4f} | "
+        f"CtxFeatAggreg: {train_losses.get('context_feature_aggreg_loss', 0):.4f}"
     )
 
     if train_config["logging"]["use_wandb"]:
@@ -267,6 +269,8 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             # Feature losses
             "train_target_feature_patch_loss": train_losses.get("target_feature_patch_loss", 0),
             "train_target_feature_aggreg_loss": train_losses.get("target_feature_aggreg_loss", 0),
+            "train_context_feature_patch_loss": train_losses.get("context_feature_patch_loss", 0),
+            "train_context_feature_aggreg_loss": train_losses.get("context_feature_aggreg_loss", 0),
             # Validation
             "val_loss": val_loss,
             "val_local_dice": val_local_dice,
@@ -283,6 +287,8 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
                 log_dict[f"train_level_{i}_context_aggreg_loss"] = train_losses.get(f"level_{i}_context_aggreg_loss", 0)
                 log_dict[f"train_level_{i}_feature_patch_loss"] = train_losses.get(f"level_{i}_target_feature_patch_loss", 0)
                 log_dict[f"train_level_{i}_feature_aggreg_loss"] = train_losses.get(f"level_{i}_target_feature_aggreg_loss", 0)
+                log_dict[f"train_level_{i}_context_feature_patch_loss"] = train_losses.get(f"level_{i}_context_feature_patch_loss", 0)
+                log_dict[f"train_level_{i}_context_feature_aggreg_loss"] = train_losses.get(f"level_{i}_context_feature_aggreg_loss", 0)
         wandb.log(log_dict)
 
     # Save best (based on final dice)
