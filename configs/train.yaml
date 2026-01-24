@@ -1,44 +1,32 @@
 # Training configuration for Hydra
 # Override any parameter via CLI: python scripts/train.py dataset=medsegbench_livertumor
+# Multi-run sweep: python scripts/train.py -m context_size=1,2,3
 
 defaults:
+  - paths: nfs  # Options: nfs, local, dlclarge
+  - experiment: null  # Optional: override with +experiment=baseline
   - _self_
 
-# Paths
-paths:
-  DATA_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data"
-  RESULTS_DIR: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results"
-  totalseg: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/TotalSeg"
-  medsegbench: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/MedSegBench"
-  ckpts:
-    save_dir: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/results/checkpoints"
-    medverse: "/nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt"
-    dino_vit: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
-    dino_convnext: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3"
-
 # Dataset
-dataset: "medsegbench_abdomenus"
+dataset: totalseg2d
 download: false
+load_dinov3_features: true
 context_size: 1
-method: "global_local"  # Options: "segformer3d", "global_local"
-train_label_ids: [0, 1, 2, 3, 4]
-val_label_ids: [5, 6, 7, 8]
+method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
+train_label_ids: "train"
+val_label_ids: "val"
 
 # Preprocessing
 preprocessing:
-  image_size: [256, 256, 256]
+  image_size: [512, 512, 512]
   spacing: [1.5, 1.5, 1.5]
+  crop_to_bbox: false
+  bbox_padding: 20
 
 # Dataloader
-train_batch_size: 64
-val_batch_size: 32
-num_workers: 4
-max_ds_len: null  # null = use full dataset
-
-# Loss
-loss_fn:
-  loss_type: "dice"
-  loss_args: null
+train_batch_size: 50
+val_batch_size: 64
+max_ds_len: 1000
 
 # Optimizer
 optimizer:
@@ -58,12 +46,13 @@ train_scheduler:
     t_mult: 1
     min_lr: 0.000001
 
-# Training
+# Training (renamed from training_parameters for cleaner access)
 training:
   seed: 42
   num_epochs: 200
   print_every: 50
   grad_accumulate_steps: 1
+  num_workers: 8
 
 # Logging
 logging:
@@ -73,25 +62,78 @@ logging:
 
 # Model parameters
 model:
-  segformer3d:
-    in_channels: 1
-    sr_ratios: [4, 2, 1, 1]
-    embed_dims: [32, 64, 160, 256]
-    patch_kernel_size: [7, 3, 3, 3]
-    patch_stride: [4, 2, 2, 2]
-    patch_padding: [3, 1, 1, 1]
-    mlp_ratios: [4, 4, 4, 4]
-    num_heads: [1, 2, 5, 8]
-    depths: [2, 2, 2, 2]
-    num_classes: 1
-    decoder_dropout: 0.0
-    decoder_head_embedding_dim: 256
+  patch_icl:
+    levels:
+      - resolution: 32
+        patch_size: 16
+        num_patches: 16
+        sampling_temperature: 0.3
+
+    oracle_levels_train: [true]
+    oracle_levels_valid: [true]
+
+    sampler:
+      type: "gumbel"
+      exploration_noise: 0.5
+      stride_divisor: 4
+      gumbel_tau: 1.0
+      gumbel_tau_min: 0.1
+      gumbel_hard: true
+      augmentation:
+        enabled: false
+        rotation: "none"
+        rotation_range: 0.5
+        flip_horizontal: true
+        flip_vertical: true
+
+    aggregator:
+      type: "gaussian"
+      combine_mode: "coverage"
+      combine_weight: 0.5
+      fill_uncovered: "zero"
+      min_coverage: 0.000001
+      sigma_ratio: 0.125
+      confidence_temperature: 2.0
+      hidden_dim: 32
+
+    backbone:
+      type: "precomputed"
+      share_backbone: false
+      image_size: 224
+      embed_dim: 1024
+      num_heads: 8
+      num_layers: 4
+      pretrained_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
+      use_mask_conditioning: true
+
+    masking:
+      target_mask_ratio: 1
+      context_mask_ratio: 0
+
+    loss:
+      patch_loss:
+        type: "binarycrossentropy"
+        args: null
+      aggreg_loss:
+        type: "dice"
+        args: null
+      weights:
+        default:
+          target_patch: 0.5
+          target_aggreg: 0.5
+          context_patch: 0.5
+          context_aggreg: 0.5
+          feature_patch: 1.0
+          feature_aggreg: 1.0
+          context_feature_patch: 1.0
+          context_feature_aggreg: 1.0
 
   global_local:
     global:
       backbone: "ground_truth"
       down_size_rate: 16
       base_channels: 16
+      image_size: 512
       patch_size: 16
       overlap: 0.5
       num_train_patches: 50
@@ -113,6 +155,20 @@ model:
       loss:
         objective: "gt_mask"
         weight: 1.0
+
+  segformer3d:
+    in_channels: 1
+    sr_ratios: [4, 2, 1, 1]
+    embed_dims: [32, 64, 160, 256]
+    patch_kernel_size: [7, 3, 3, 3]
+    patch_stride: [4, 2, 2, 2]
+    patch_padding: [3, 1, 1, 1]
+    mlp_ratios: [4, 4, 4, 4]
+    num_heads: [1, 2, 5, 8]
+    depths: [2, 2, 2, 2]
+    num_classes: 1
+    decoder_dropout: 0.0
+    decoder_head_embedding_dim: 256
 
 # Hydra settings
 hydra:

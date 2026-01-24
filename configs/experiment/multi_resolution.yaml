@@ -1,0 +1,23 @@
+# @package _global_
+# Multi-resolution experiment: coarse to fine
+
+context_size: 1
+method: "patch_icl"
+
+model:
+  patch_icl:
+    levels:
+      - resolution: 32
+        patch_size: 16
+        num_patches: 16
+        sampling_temperature: 0.3
+      - resolution: 64
+        patch_size: 16
+        num_patches: 32
+        sampling_temperature: 0.3
+      - resolution: 128
+        patch_size: 16
+        num_patches: 64
+        sampling_temperature: 0.3
+    oracle_levels_train: [true, false, false]
+    oracle_levels_valid: [false, false, false]

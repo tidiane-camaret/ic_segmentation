@@ -13,3 +13,4 @@ wandb/
 temp_finetuning/
 RESULTS_DIR/
 .claude/.nfs0000000000f9159800001152
+results/runs/

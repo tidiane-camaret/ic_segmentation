@@ -71,7 +71,7 @@ def build_dataloaders(config: Dict, DatasetClass, collate_fn) -> tuple:
     return train_loader, val_loader
 
 
-def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
+def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad_accumulate_steps=1):
     """Run one training epoch. Model must have loss functions set via set_loss_functions()."""
     model.train()
     total_loss = 0.0
@@ -119,7 +119,9 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
 
-        optimizer.zero_grad()
+        # Zero gradients at start of accumulation window
+        if idx % grad_accumulate_steps == 0:
+            optimizer.zero_grad()
 
         outputs = model(
             images,
@@ -173,8 +175,13 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every):
                     total_context_dice += ctx_dice.mean().item()
                     context_dice_count += 1
 
-        loss.backward()
-        optimizer.step()
+        # Scale loss for gradient accumulation
+        scaled_loss = loss / grad_accumulate_steps
+        scaled_loss.backward()
+
+        # Step optimizer at end of accumulation window
+        if (idx + 1) % grad_accumulate_steps == 0:
+            optimizer.step()
 
         total_loss += loss.item()
         total_aggreg += losses.get("aggreg_loss", torch.tensor(0.0)).item()

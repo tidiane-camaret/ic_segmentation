@@ -1,0 +1,15 @@
+# @package _global_
+# Baseline experiment: single level, oracle sampling
+
+context_size: 1
+method: "patch_icl"
+
+model:
+  patch_icl:
+    levels:
+      - resolution: 32
+        patch_size: 16
+        num_patches: 16
+        sampling_temperature: 0.3
+    oracle_levels_train: [true]
+    oracle_levels_valid: [true]

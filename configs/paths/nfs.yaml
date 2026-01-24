@@ -1,0 +1,13 @@
+# NFS cluster paths
+root: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122
+DATA_DIR: ${.root}/data
+RESULTS_DIR: ${.root}/results
+totalseg: ${.DATA_DIR}/TotalSeg
+medsegbench: ${.DATA_DIR}/MedSegBench
+totalseg2d: ${.DATA_DIR}/TotalSeg2D
+totalseg_stats: ${.totalseg}/totalseg_stats.pkl
+ckpts:
+  save_dir: ${..RESULTS_DIR}/checkpoints
+  medverse: /nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt
+  dino_vit: ${..root}/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51
+  dino_convnext: ${..root}/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3

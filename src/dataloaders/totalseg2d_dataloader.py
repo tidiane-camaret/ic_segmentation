@@ -156,14 +156,25 @@ class TotalSeg2DDataset(Dataset):
         print(f"Filtered to {len(self.stats)} cases for split '{split}'")
 
     def _load_slice(self, case_id: str, label_id: str, axis: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Load image and label slice for a specific case/label/axis."""
+        """Load image and label slice for a specific case/label/axis.
+
+        Supports both .npy (fast) and .nii.gz (legacy) formats.
+        """
         slice_dir = self.root_dir / case_id / label_id
 
-        img_path = slice_dir / f"{axis}_slice_img.nii.gz"
-        label_path = slice_dir / f"{axis}_slice.nii.gz"
+        # Try .npy first (fast), fall back to .nii.gz (legacy)
+        img_path_npy = slice_dir / f"{axis}_slice_img.npy"
+        label_path_npy = slice_dir / f"{axis}_slice.npy"
 
-        img = nib.load(str(img_path)).get_fdata().astype(np.float32)
-        label = nib.load(str(label_path)).get_fdata().astype(np.float32)
+        if img_path_npy.exists():
+            img = np.load(img_path_npy)
+            label = np.load(label_path_npy)
+        else:
+            # Legacy .nii.gz format
+            img_path = slice_dir / f"{axis}_slice_img.nii.gz"
+            label_path = slice_dir / f"{axis}_slice.nii.gz"
+            img = nib.load(str(img_path)).get_fdata().astype(np.float32)
+            label = nib.load(str(label_path)).get_fdata().astype(np.float32)
 
         return img, label
 

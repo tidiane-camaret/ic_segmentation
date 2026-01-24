@@ -1,0 +1,8 @@
+# @package _global_
+# Experiment with larger context size
+
+context_size: 5
+method: "patch_icl"
+
+train_batch_size: 32  # Reduce batch size due to more context
+val_batch_size: 32

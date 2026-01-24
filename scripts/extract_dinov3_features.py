@@ -2,39 +2,46 @@
 """
 Extract DINOv3 features for TotalSeg2D images.
 
-Reads all *_img.nii.gz files from TotalSeg2D directory, computes DINOv3 patch features,
-and saves them to *_img_dinov3.npz.
+Reads all *_img.npy (or *_img.nii.gz) files from TotalSeg2D directory,
+computes DINOv3 patch features, and saves them to *_img_dinov3.npz.
 
 Usage:
-    python scripts/extract_dinov3_features.py --batch-size 32 --num-workers 4
+    python scripts/extract_dinov3_features.py paths=dlclarge
+    python scripts/extract_dinov3_features.py paths=dlclarge batch_size=64 skip_existing=true
 """
 
-import argparse
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 import threading
-import time
 
-import nibabel as nib
+import hydra
+from omegaconf import DictConfig
 import numpy as np
 import torch
 from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoModel
 
-from src.config import load_config
-
 
 def find_all_images(data_dir: Path) -> list[Path]:
-    """Find all *_img.nii.gz files in TotalSeg2D directory."""
+    """Find all image files in TotalSeg2D directory. Prefers .npy over .nii.gz."""
+    # First try .npy (fast format)
+    npy_files = sorted(data_dir.glob("**/*_slice_img.npy"))
+    if npy_files:
+        return npy_files
+
+    # Fall back to .nii.gz (legacy format)
     return sorted(data_dir.glob("**/*_img.nii.gz"))
 
 
 def load_image(img_path: Path) -> np.ndarray:
-    """Load a NIfTI image and return as numpy array."""
-    img = nib.load(img_path)
-    data = img.get_fdata()
-    return data.astype(np.float32)
+    """Load an image and return as numpy array."""
+    if img_path.suffix == ".npy":
+        return np.load(img_path).astype(np.float32)
+    else:
+        # Legacy .nii.gz format
+        import nibabel as nib
+        img = nib.load(img_path)
+        return img.get_fdata().astype(np.float32)
 
 
 def preprocess_batch(images: list[np.ndarray], processor) -> torch.Tensor:
@@ -43,7 +50,6 @@ def preprocess_batch(images: list[np.ndarray], processor) -> torch.Tensor:
 
     Converts grayscale to RGB (repeat 3 channels) and applies processor.
     """
-    # Convert to PIL-like format: list of [H, W, 3] arrays
     rgb_images = []
     for img in images:
         # Normalize to [0, 255] range
@@ -101,7 +107,6 @@ def process_batch(
     pbar: tqdm,
 ) -> list[tuple[Path, np.ndarray]]:
     """Process a batch of images and return features."""
-    # Load images
     images = []
     valid_paths = []
     for path in batch_paths:
@@ -125,10 +130,19 @@ def process_batch(
     return results
 
 
+def get_output_path(img_path: Path) -> Path:
+    """Get output path for features file."""
+    if img_path.suffix == ".npy":
+        # *_slice_img.npy -> *_slice_img_dinov3.npz
+        return img_path.parent / (img_path.stem + "_dinov3.npz")
+    else:
+        # *_img.nii.gz -> *_img_dinov3.npz
+        return img_path.parent / (img_path.name.replace("_img.nii.gz", "_img_dinov3.npz"))
+
+
 def save_features(path: Path, features: np.ndarray):
     """Save features to .npz file."""
-    # Output path: *_img.nii.gz -> *_img_dinov3.npz
-    output_path = path.parent / (path.name.replace("_img.nii.gz", "_img_dinov3.npz"))
+    output_path = get_output_path(path)
     np.savez_compressed(output_path, features=features)
 
 
@@ -144,31 +158,41 @@ def save_worker(save_queue: Queue, stop_event: threading.Event):
             continue
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Extract DINOv3 features for TotalSeg2D")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for GPU inference")
-    parser.add_argument("--num-workers", type=int, default=4, help="Number of save workers")
-    parser.add_argument("--skip-existing", action="store_true", help="Skip images with existing features")
-    args = parser.parse_args()
+@hydra.main(version_base=None, config_path="../configs", config_name="train")
+def main(cfg: DictConfig) -> None:
+    """Extract DINOv3 features for TotalSeg2D images."""
+    # Get config values with defaults
+    batch_size = cfg.get("batch_size", 32)
+    num_workers = cfg.get("num_save_workers", 4)
+    skip_existing = cfg.get("skip_existing", True)
 
-    config = load_config()
-    data_dir = Path(config["paths"]["totalseg2d"])
-    model_path = config["paths"]["ckpts"]["dino_vit"]
+    data_dir = Path(cfg.paths.totalseg2d)
+    model_path = cfg.paths.ckpts.dino_vit
 
     print(f"Data directory: {data_dir}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Num workers: {args.num_workers}")
+    print(f"Model path: {model_path}")
+    print(f"Batch size: {batch_size}")
+    print(f"Num save workers: {num_workers}")
+    print(f"Skip existing: {skip_existing}")
 
     # Find all images
     print("Finding all images...")
     all_images = find_all_images(data_dir)
     print(f"Found {len(all_images)} images")
 
+    if not all_images:
+        print("No images found.")
+        return
+
+    # Show format being used
+    sample_ext = all_images[0].suffix
+    print(f"Image format: {sample_ext}")
+
     # Filter out images that already have features
-    if args.skip_existing:
+    if skip_existing:
         images_to_process = []
         for img_path in all_images:
-            output_path = img_path.parent / (img_path.name.replace("_img.nii.gz", "_img_dinov3.npz"))
+            output_path = get_output_path(img_path)
             if not output_path.exists():
                 images_to_process.append(img_path)
         print(f"Skipping {len(all_images) - len(images_to_process)} existing, processing {len(images_to_process)}")
@@ -184,11 +208,11 @@ def main():
     extractor = FeatureExtractor(model_path, device)
 
     # Create save queue and workers
-    save_queue = Queue(maxsize=args.batch_size * 4)
+    save_queue = Queue(maxsize=batch_size * 4)
     stop_event = threading.Event()
 
     save_threads = []
-    for _ in range(args.num_workers):
+    for _ in range(num_workers):
         t = threading.Thread(target=save_worker, args=(save_queue, stop_event))
         t.start()
         save_threads.append(t)
@@ -197,8 +221,8 @@ def main():
     pbar = tqdm(total=len(images_to_process), desc="Extracting features")
 
     try:
-        for i in range(0, len(images_to_process), args.batch_size):
-            batch_paths = images_to_process[i:i + args.batch_size]
+        for i in range(0, len(images_to_process), batch_size):
+            batch_paths = images_to_process[i:i + batch_size]
             results = process_batch(batch_paths, extractor, pbar)
 
             # Queue results for saving

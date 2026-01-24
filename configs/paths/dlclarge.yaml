@@ -1,0 +1,13 @@
+# DLC Large cluster paths
+root: /work/dlclarge2/ndirt-SegFM3D
+DATA_DIR: ${.root}/data
+RESULTS_DIR: ${.root}/ic_segmentation/results
+totalseg: ${.DATA_DIR}/TotalSeg
+medsegbench: ${.DATA_DIR}/MedSegBench
+totalseg2d: ${.DATA_DIR}/TotalSeg2D
+totalseg_stats: ${.totalseg}/totalseg_stats.pkl
+ckpts:
+  save_dir: ${..RESULTS_DIR}/checkpoints
+  medverse: ${..root}/checkpoints/Medverse.ckpt
+  dino_vit: ${..root}/checkpoints/dinov3-vitl16
+  dino_convnext: ${..root}/checkpoints/dinov3-convnext-large
