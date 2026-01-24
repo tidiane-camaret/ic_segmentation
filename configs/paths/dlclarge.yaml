@@ -9,5 +9,6 @@ totalseg_stats: ${.totalseg}/totalseg_stats.pkl
 ckpts:
   save_dir: ${..RESULTS_DIR}/checkpoints
   medverse: ${..root}/checkpoints/Medverse.ckpt
-  dino_vit: ${..root}/checkpoints/dinov3-vitl16
+  #dino_vit: "/home/ndirt/.cache/huggingface/hub/models--facebook--dinov3-vitl16-pretrain-lvd1689m"
+  dino_vit: "facebook/dinov3-vitl16-pretrain-lvd1689m"
   dino_convnext: ${..root}/checkpoints/dinov3-convnext-large

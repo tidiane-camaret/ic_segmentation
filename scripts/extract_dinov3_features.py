@@ -162,8 +162,8 @@ def save_worker(save_queue: Queue, stop_event: threading.Event):
 def main(cfg: DictConfig) -> None:
     """Extract DINOv3 features for TotalSeg2D images."""
     # Get config values with defaults
-    batch_size = cfg.get("batch_size", 32)
-    num_workers = cfg.get("num_save_workers", 4)
+    batch_size = cfg.get("batch_size", 64)
+    num_workers = cfg.get("num_save_workers", 20)
     skip_existing = cfg.get("skip_existing", True)
 
     data_dir = Path(cfg.paths.totalseg2d)
