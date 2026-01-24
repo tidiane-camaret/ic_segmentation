@@ -8,8 +8,9 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, "/software/notebooks/camaret/repos")
-
-from SegFormer3D.architectures.segformer3d import build_segformer3d_model
+sys.path.insert(0, "/work/dlclarge2/ndirt-SegFM3D/repos")
+#from SegFormer3D.architectures.segformer3d import build_segformer3d_model
+sys.path.insert(0, "/work/dlclarge2/ndirt-SegFM3D/ic_segmentation")
 from SegFormer3D.losses.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate
 
