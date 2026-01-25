@@ -64,10 +64,14 @@ def main(cfg: DictConfig) -> None:
 
     # Build dataloaders
     if cfg.dataset == "totalseg2d":
+        # Handle label_ids: keep string for split names, convert to list for explicit IDs
+        train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
+        val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
+
         train_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d,
             stats_path=cfg.paths.totalseg_stats,
-            label_id_list=list(cfg.train_label_ids),
+            label_id_list=train_labels,
             context_size=cfg.context_size,
             batch_size=cfg.train_batch_size,
             image_size=tuple(cfg.preprocessing.image_size[:2]),
@@ -82,7 +86,7 @@ def main(cfg: DictConfig) -> None:
         val_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d,
             stats_path=cfg.paths.totalseg_stats,
-            label_id_list=list(cfg.val_label_ids),
+            label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,
             image_size=tuple(cfg.preprocessing.image_size[:2]),
