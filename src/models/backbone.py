@@ -166,6 +166,17 @@ class CrossPatchAttentionBackbone(nn.Module):
         self.num_classes = num_classes
         self.dropout = dropout
 
+        self.num_heads = 1
+        self.num_layers = 1
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=self.num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
     def forward(
         self,
         img_patches: torch.Tensor,
