@@ -4,8 +4,8 @@
 
 defaults:
   - paths: nfs  # Options: nfs, local, dlclarge
-  - experiment: null  # Optional: override with +experiment=baseline
   - _self_
+  - experiment: null  # Optional: override with experiment=attention (loaded last to override base)
 
 # Dataset
 dataset: totalseg2d

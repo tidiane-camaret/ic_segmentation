@@ -125,6 +125,74 @@ class SegmentationHead(nn.Module):
 
         return output
 
+class CrossPatchAttentionBackbone(nn.Module):
+    """
+    treats tgt/ctx patches as val/train examples
+    - val patches attend to train patches
+    - patch-level input features :
+        - img : pre-computed DINOv3 features TODO reduce size
+        - mask : random coloring in RGB space 
+    - embeddings :
+        - positional
+        - target vs context  
+    - sink tokens
+    - register tokens
+    - token masking for img and mask inputs
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 1024,
+        patch_size: int = 16,
+        image_size: int = 224,
+        num_classes: int = 1,
+        dropout: float = 0.1,
+        token_mask_tgt_prob: float = 1.0,
+        token_mask_ctx_prob: float = 0.0,
+    ):
+        """
+        Args:
+            embed_dim: Feature embedding dimension (1024 for DINOv3 ViT-L)
+            image_size: Original image size (for position embeddings)
+            patch_size: Output patch size for segmentation
+            num_classes: Number of segmentation classes
+            dropout: Dropout rate
+
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.num_classes = num_classes
+        self.dropout = dropout
+
+    def forward(
+        self,
+        img_patches: torch.Tensor,
+        mask_patches: torch.Tensor,
+        coords: torch.Tensor = None,
+        ctx_id_labels: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Process patches using pre-computed features.
+
+        Args:
+            img_patches: [B, K, C_img, (p_dims)] - image patches
+            mask_patches: [B, K, C_mask, (p_dims)] - mask patches
+            coords: [B, K, D] - Patch coords in original image space 
+            ctx_id_labels: [B, K] - 0=target, >0=context patch labels
+
+        Returns:
+            mask_patch_logit_preds: [B, K, C_mask, (p_dims)]
+        """
+
+        # apply token masking based on tgt/ctx labels
+
+        # embed patches with positional and tgt/ctx embeddings
+
+        # apply cross-patch attention 
+
+        return mask_patches[:, ctx_id_labels == 0]  # placeholder
 
 class PrecomputedFeatureBackbone(nn.Module):
     """

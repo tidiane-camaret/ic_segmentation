@@ -1,11 +1,16 @@
-    # Import images and masks to nora project
+"""Export images and masks to nora project."""
 import os
 from pathlib import Path
 
-from ic_segmentation.old.config import load_config
-config = load_config()
-dir_to_export = Path(config["paths"]["RESULTS_DIR"]) 
-patient_name = config["train"]["dataset"]
+from hydra import compose, initialize_config_dir
+
+# Initialize Hydra with the config directory
+config_path = Path(__file__).parent.parent / "configs"
+initialize_config_dir(config_dir=str(config_path.absolute()), version_base=None)
+cfg = compose(config_name="train")
+
+dir_to_export = Path(cfg.paths.RESULTS_DIR)
+patient_name = cfg.dataset
 
 project_name = "camaret___in_context_segmentation"
 

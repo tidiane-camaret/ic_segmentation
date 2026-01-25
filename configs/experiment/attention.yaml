@@ -12,3 +12,8 @@ model:
   patch_icl:
     sampler:
       type: "sliding_window"
+    backbone:
+      type: "crosspatch_attention"
+      embed_dim: 1024
+      patch_size: 16
+      image_size: 224

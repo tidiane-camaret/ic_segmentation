@@ -363,7 +363,7 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
                 vis_img[r_start:r_end, max(0, c_end-thickness):c_end] = box_value
 
             vis_nib = nib.Nifti1Image(vis_img.astype(np.float32), affine=np.eye(4))
-            nib.save(vis_nib, case_dir / f"level{level_idx}_patch_positions.nii.gz")
+            nib.save(vis_nib, case_dir / f"level{level_idx}_patch_positions_mask.nii.gz")
 
 
 def _extract_patch_labels(labels: torch.Tensor, coords: torch.Tensor, patch_size: int, level_res: int) -> torch.Tensor:

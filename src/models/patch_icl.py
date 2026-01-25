@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.aggregate import PatchAggregator, create_aggregator
-from src.models.backbone import PrecomputedFeatureBackbone
+from src.models.backbone import PrecomputedFeatureBackbone, CrossPatchAttentionBackbone
 from src.models.sampling import (
     DeterministicTopKSampler,
     GumbelSoftmaxSampler,
@@ -857,6 +857,12 @@ class PatchICL(nn.Module):
                 patch_size=patch_size,
                 image_size=backbone_cfg.get('image_size', 224),
                 use_mask_conditioning=backbone_cfg.get('use_mask_conditioning', False),
+            )
+        elif backbone_type == 'crosspatch_attention':
+            return CrossPatchAttentionBackbone(
+                embed_dim=backbone_cfg.get('embed_dim', 1024),
+                patch_size=patch_size,
+                image_size=backbone_cfg.get('image_size', 224),
             )
         else:
             raise ValueError(f"Unsupported backbone type: {backbone_type}")
