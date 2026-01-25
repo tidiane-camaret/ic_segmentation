@@ -192,7 +192,10 @@ class CrossPatchAttentionBackbone(nn.Module):
 
         # apply cross-patch attention 
 
-        return mask_patches[:, ctx_id_labels == 0]  # placeholder
+        return {
+                'mask_patch_logit_preds': mask_patches,
+                'img_patches': img_patches
+            }
 
 class PrecomputedFeatureBackbone(nn.Module):
     """
