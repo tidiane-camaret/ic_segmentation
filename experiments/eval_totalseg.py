@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import nibabel as nib
 import numpy as np
-from src.config import config
+from ic_segmentation.old.config import config
 from src.totalseg_dataloader import get_dataloader
 from data.label_ids_totalseg import get_label_ids
 

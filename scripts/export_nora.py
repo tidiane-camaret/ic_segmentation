@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-from src.config import load_config
+from ic_segmentation.old.config import load_config
 config = load_config()
 dir_to_export = Path(config["paths"]["RESULTS_DIR"]) 
 patient_name = config["train"]["dataset"]

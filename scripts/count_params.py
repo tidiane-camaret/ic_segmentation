@@ -16,7 +16,7 @@ import torch
 # Add paths
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.config import load_config
+from ic_segmentation.old.config import load_config
 from src.token_nmsw import TokenNMSW
 
 

@@ -13,7 +13,7 @@ import numpy as np
 import nibabel as nib
 from nilearn.image import resample_img
 from pathlib import Path
-from src.config import config
+from ic_segmentation.old.config import config
 from ic_segmentation.old.utils import load_seg_data
 from ic_segmentation.experiments.segfm3d_tasks_dict import tasks_dict
 

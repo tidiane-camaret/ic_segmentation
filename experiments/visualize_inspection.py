@@ -12,7 +12,7 @@ import json
 import nibabel as nib
 import matplotlib.pyplot as plt
 import numpy as np
-from src.config import config
+from ic_segmentation.old.config import config
 
 
 def visualize_patch(inspection_dir, case_id, label_id, level, patch_id, slice_axis='z'):

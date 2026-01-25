@@ -7,7 +7,7 @@ import os
 import numpy as np
 import nibabel as nib
 from pathlib import Path
-from src.config import config
+from ic_segmentation.old.config import config
 from ic_segmentation.experiments.segfm3d_tasks_dict import tasks_dict
 
 project_name = "camaret___in_context_segmentation"

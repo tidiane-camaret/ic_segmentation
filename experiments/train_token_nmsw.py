@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, "/software/notebooks/camaret/repos/SegFormer3D")
 
 from src.totalseg_dataloader import TotalSegmentatorDataset
-from src.config import load_config
+from ic_segmentation.old.config import load_config
 from src.token_nmsw import TokenNMSW
 
 # SegFormer3D imports for loss
