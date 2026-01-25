@@ -26,7 +26,7 @@ preprocessing:
 # Dataloader
 train_batch_size: 50
 val_batch_size: 64
-max_ds_len: 1000
+max_ds_len: null # Use full dataset
 
 # Optimizer
 optimizer:
@@ -73,12 +73,15 @@ model:
     oracle_levels_valid: [true]
 
     sampler:
-      type: "gumbel"
+      type: "gumbel"  # Options: "weighted", "uniform", "topk", "gumbel", "sliding_window"
       exploration_noise: 0.5
       stride_divisor: 4
+      # Gumbel-Softmax options
       gumbel_tau: 1.0
       gumbel_tau_min: 0.1
       gumbel_hard: true
+      # Sliding window options (only used when type: "sliding_window")
+      sliding_window_stride: null  # If null, uses patch_size (no overlap)
       augmentation:
         enabled: false
         rotation: "none"

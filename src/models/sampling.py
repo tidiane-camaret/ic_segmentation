@@ -589,6 +589,90 @@ class DeterministicTopKSampler(PatchSampler):
         return indices
 
 
+class SlidingWindowSampler(PatchSampler):
+    """
+    Extracts patches in a regular grid pattern (sliding window).
+
+    Ignores weights and returns all patches at fixed positions.
+    Useful for inference when full coverage is needed.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        stride: int | None = None,
+        augmenter: PatchAugmenter | None = None,
+    ):
+        """
+        Args:
+            patch_size: Size of patches (ps x ps)
+            stride: Stride between patches. If None, uses patch_size (no overlap)
+            augmenter: Optional PatchAugmenter for rotation/flip augmentation
+        """
+        super().__init__(
+            patch_size=patch_size,
+            num_patches=0,  # Computed dynamically based on image size
+            temperature=1.0,
+            exploration_noise=0.0,
+            stride_divisor=1,
+            augmenter=augmenter,
+        )
+        self.stride = stride if stride is not None else patch_size
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        labels: torch.Tensor,
+        weights: torch.Tensor,  # noqa: ARG002 - ignored for sliding window
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """
+        Extract all patches in a sliding window pattern.
+
+        Args:
+            image: [B, C, H, W] - source image
+            labels: [B, 1, H, W] - ground truth mask
+            weights: [B, 1, H, W] - ignored (kept for API compatibility)
+
+        Returns:
+            patches: [B, K, C, ps, ps] where K = grid_h * grid_w
+            patch_labels: [B, K, 1, ps, ps]
+            coords: [B, K, 2] - (h, w) coordinates
+            aug_params: dict with augmentation parameters
+        """
+        B, C, H, W = image.shape
+        ps = self.patch_size
+        stride = self.stride
+
+        # Compute grid dimensions
+        grid_h = max(1, (H - ps) // stride + 1)
+        grid_w = max(1, (W - ps) // stride + 1)
+        K = grid_h * grid_w
+
+        # Extract patches using unfold
+        patches_unfolded = image.unfold(2, ps, stride).unfold(3, ps, stride)
+        patches = patches_unfolded.reshape(B, C, -1, ps, ps).permute(0, 2, 1, 3, 4)
+        # [B, K, C, ps, ps]
+
+        labels_unfolded = labels.unfold(2, ps, stride).unfold(3, ps, stride)
+        patch_labels = labels_unfolded.reshape(B, 1, -1, ps, ps).permute(0, 2, 1, 3, 4)
+        # [B, K, 1, ps, ps]
+
+        # Generate coordinates
+        device = image.device
+        h_indices = torch.arange(grid_h, device=device) * stride
+        w_indices = torch.arange(grid_w, device=device) * stride
+        h_grid, w_grid = torch.meshgrid(h_indices, w_indices, indexing='ij')
+        coords_single = torch.stack([h_grid.flatten(), w_grid.flatten()], dim=1)  # [K, 2]
+        coords = coords_single.unsqueeze(0).expand(B, -1, -1)  # [B, K, 2]
+
+        # Apply augmentation if enabled
+        aug_params = {}
+        if self.augmenter is not None:
+            patches, patch_labels, aug_params = self.augmenter(patches, patch_labels)
+
+        return patches, patch_labels, coords, aug_params
+
+
 class GumbelSoftmaxSampler(PatchSampler):
     """
     Differentiable patch sampling using Gumbel-Softmax.

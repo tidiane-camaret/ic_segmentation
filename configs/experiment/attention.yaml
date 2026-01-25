@@ -4,5 +4,11 @@
 context_size: 5
 method: "patch_icl"
 
+
 train_batch_size: 32  # Reduce batch size due to more context
 val_batch_size: 32
+max_ds_len: 10 # Keep dataset length manageable
+model:
+  patch_icl:
+    sampler:
+      type: "sliding_window"

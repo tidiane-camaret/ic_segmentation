@@ -321,6 +321,50 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
                 ctx_p_gt_nib = nib.Nifti1Image(ctx_p_gt.astype(np.float32), affine=np.eye(4))
                 nib.save(ctx_p_gt_nib, case_dir / f"context_patch{c}_gt_mask.nii.gz")
 
+        # Save patch position visualization for each level
+        level_outputs = outputs.get("level_outputs", [])
+        for level_idx, level_out in enumerate(level_outputs):
+            coords = level_out.get("coords")  # [B, K, 2]
+            pred = level_out.get("pred")  # [B, 1, res, res]
+            if coords is None or pred is None:
+                continue
+
+            level_res = pred.shape[-1]
+            patch_size = level_out.get("patches", outputs["patches"]).shape[-1]
+
+            # Create visualization: copy of image with bounding boxes
+            # Scale coordinates from level resolution to full image resolution
+            H, W = images.shape[2], images.shape[3]
+            scale_h, scale_w = H / level_res, W / level_res
+
+            # Start with the input image
+            vis_img = images[i, 0].cpu().numpy().copy()
+
+            # Draw bounding boxes by setting border pixels to max value
+            box_value = vis_img.max() + 0.2 * (vis_img.max() - vis_img.min())
+            coords_i = coords[i].cpu().numpy()  # [K, 2]
+
+            for k in range(coords_i.shape[0]):
+                # Coordinates are (row, col) at level resolution
+                r, c = coords_i[k]
+                # Scale to full resolution
+                r_start = int(r * scale_h)
+                c_start = int(c * scale_w)
+                r_end = int(min(r_start + patch_size * scale_h, H))
+                c_end = int(min(c_start + patch_size * scale_w, W))
+
+                # Draw rectangle border (2 pixels thick)
+                thickness = 2
+                # Top and bottom edges
+                vis_img[r_start:r_start+thickness, c_start:c_end] = box_value
+                vis_img[max(0, r_end-thickness):r_end, c_start:c_end] = box_value
+                # Left and right edges
+                vis_img[r_start:r_end, c_start:c_start+thickness] = box_value
+                vis_img[r_start:r_end, max(0, c_end-thickness):c_end] = box_value
+
+            vis_nib = nib.Nifti1Image(vis_img.astype(np.float32), affine=np.eye(4))
+            nib.save(vis_nib, case_dir / f"level{level_idx}_patch_positions.nii.gz")
+
 
 def _extract_patch_labels(labels: torch.Tensor, coords: torch.Tensor, patch_size: int, level_res: int) -> torch.Tensor:
     """Extract GT patch labels using coordinates from model output.

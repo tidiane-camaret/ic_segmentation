@@ -16,6 +16,7 @@ from src.models.sampling import (
     GumbelSoftmaxSampler,
     PatchAugmenter,
     PatchSampler,
+    SlidingWindowSampler,
     UniformSampler,
 )
 
@@ -747,6 +748,9 @@ class PatchICL(nn.Module):
         self.gumbel_tau_min = sampler_cfg.get('gumbel_tau_min', 0.1)
         self.gumbel_hard = sampler_cfg.get('gumbel_hard', True)
 
+        # Sliding window specific config
+        self.sliding_window_stride = sampler_cfg.get('sliding_window_stride', None)
+
         # Augmenter config
         aug_cfg = sampler_cfg.get('augmentation', {})
         if aug_cfg.get('enabled', False):
@@ -891,6 +895,12 @@ class PatchICL(nn.Module):
                 tau_min=self.gumbel_tau_min,
                 hard=self.gumbel_hard,
                 stride_divisor=self.stride_divisor,
+                augmenter=self.augmenter,
+            )
+        elif self.sampler_type == 'sliding_window':
+            return SlidingWindowSampler(
+                patch_size=patch_size,
+                stride=self.sliding_window_stride,
                 augmenter=self.augmenter,
             )
         else:  # Default: 'weighted'
