@@ -125,18 +125,44 @@ class SegmentationHead(nn.Module):
 
         return output
 
+def build_rope_cache(seq_len: int, dim: int, base: float = 10000.0) -> torch.Tensor:
+    """Precompute RoPE sin/cos cache."""
+    theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+    positions = torch.arange(seq_len).float()
+    freqs = torch.einsum("i,j->ij", positions, theta)  # [seq_len, dim/2]
+    return torch.stack([freqs.cos(), freqs.sin()], dim=-1)  # [seq_len, dim/2, 2]
+
+
+def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
+    """Apply rotary position embedding to input tensor."""
+    # x: [B, seq_len, dim]
+    seq_len = x.shape[1]
+    dim = x.shape[2]
+
+    # Ensure cache is on same device
+    rope_cache = rope_cache[:seq_len].to(x.device)  # [seq_len, dim/2, 2]
+
+    # Split into pairs for rotation
+    x_reshape = x.view(*x.shape[:-1], dim // 2, 2)  # [B, seq_len, dim/2, 2]
+    cos = rope_cache[..., 0].unsqueeze(0)  # [1, seq_len, dim/2]
+    sin = rope_cache[..., 1].unsqueeze(0)  # [1, seq_len, dim/2]
+
+    # Apply rotation: (x * cos) + (rotate(x) * sin)
+    x0, x1 = x_reshape[..., 0], x_reshape[..., 1]
+    out0 = x0 * cos - x1 * sin
+    out1 = x0 * sin + x1 * cos
+
+    return torch.stack([out0, out1], dim=-1).view(*x.shape)
+
+
 class CrossPatchAttentionBackbone(nn.Module):
     """
-    treats tgt/ctx patches as val/train examples
+    Treats tgt/ctx patches as val/train examples.
     - val patches attend to train patches
-    - patch-level input features :
-        - img : pre-computed DINOv3 features TODO reduce size
-        - mask : random coloring in RGB space 
-    - embeddings :
-        - positional
-        - target vs context  
-    - sink tokens
-    - register tokens
+    - patch-level input features:
+        - img: pre-computed DINOv3 features
+        - mask: random coloring in RGB space
+    - embeddings: positional (RoPE), target vs context
     - token masking for img and mask inputs
     """
 
@@ -147,17 +173,16 @@ class CrossPatchAttentionBackbone(nn.Module):
         image_size: int = 224,
         num_classes: int = 1,
         dropout: float = 0.1,
-        token_mask_tgt_prob: float = 1.0,
-        token_mask_ctx_prob: float = 0.0,
+        max_seq_len: int = 1024,
     ):
         """
         Args:
-            embed_dim: Feature embedding dimension (1024 for DINOv3 ViT-L)
+            embed_dim: Embedding dimension (matches DINO feature dim, default 1024)
             image_size: Original image size (for position embeddings)
             patch_size: Output patch size for segmentation
             num_classes: Number of segmentation classes
             dropout: Dropout rate
-
+            max_seq_len: Maximum sequence length for RoPE cache
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -166,47 +191,336 @@ class CrossPatchAttentionBackbone(nn.Module):
         self.num_classes = num_classes
         self.dropout = dropout
 
-        self.num_heads = 1
-        self.num_layers = 1
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=self.num_heads,
-            dim_feedforward=embed_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
+        # Target/context type embeddings
+        self.target_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.context_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+
+        # Learnable mask token for masked inputs (applied in embed_dim space)
+        self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+
+        # Output projection: embed_dim -> 1 (binary mask logit per patch)
+        self.mask_proj_out = nn.Linear(embed_dim, 1)
+
+        # RoPE cache (registered as buffer, not parameter)
+        rope_cache = build_rope_cache(max_seq_len, embed_dim)
+        self.register_buffer("rope_cache", rope_cache, persistent=False)
+
+        # Simple per-patch MLP (no attention)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Dropout(dropout),
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
+
+    def _compute_token_mask(
+        self,
+        is_target: torch.Tensor,
+        mask_prob_tgt: float,
+        mask_prob_ctx: float,
+    ) -> torch.Tensor:
+        """
+        Compute which tokens should be masked based on target/context labels.
+
+        Args:
+            is_target: [B, K] - Boolean, True=target patch
+            mask_prob_tgt: Probability of masking target tokens
+            mask_prob_ctx: Probability of masking context tokens
+
+        Returns:
+            mask_applied: [B, K] - Boolean indicating which tokens to mask
+        """
+        B, K = is_target.shape
+        device = is_target.device
+
+        # Compute per-token mask probabilities
+        mask_probs = torch.where(is_target, mask_prob_tgt, mask_prob_ctx)
+
+        # Sample mask (only during training)
+        if self.training:
+            mask_applied = torch.rand(B, K, device=device) < mask_probs
+        else:
+            # During eval, use deterministic masking for targets only
+            mask_applied = is_target & (mask_prob_tgt > 0.5)
+
+        return mask_applied
+
+    def _apply_token_masking(
+        self,
+        tokens: torch.Tensor,
+        mask_applied: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply mask token to specified positions.
+
+        Args:
+            tokens: [B, K, embed_dim] - Input tokens (must match self.embed_dim)
+            mask_applied: [B, K] - Boolean indicating which tokens to mask
+
+        Returns:
+            masked_tokens: [B, K, embed_dim]
+        """
+        B, K, D = tokens.shape
+
+        # Apply mask token where masked
+        mask_expanded = mask_applied.unsqueeze(-1).expand(-1, -1, D)
+        masked_tokens = torch.where(mask_expanded, self.mask_token.expand(B, K, -1), tokens)
+
+        return masked_tokens
+
+    def _add_type_embeddings(
+        self,
+        tokens: torch.Tensor,
+        is_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Add target/context type embeddings.
+
+        Args:
+            tokens: [B, K, embed_dim]
+            is_target: [B, K] - Boolean, True=target patch
+
+        Returns:
+            tokens with type embeddings added: [B, K, embed_dim]
+        """
+        B, K, D = tokens.shape
+
+        # Create type embedding for each position
+        type_embed = torch.where(
+            is_target.unsqueeze(-1).expand(-1, -1, D),
+            self.target_embed.expand(B, K, -1),
+            self.context_embed.expand(B, K, -1),
+        )
+
+        return tokens + type_embed
+
     def forward(
         self,
         img_patches: torch.Tensor,
-        mask_patches: torch.Tensor,
         coords: torch.Tensor = None,
         ctx_id_labels: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """
-        Process patches using pre-computed features.
+        Process patches using only image features.
 
         Args:
-            img_patches: [B, K, C_img, (p_dims)] - image patches
-            mask_patches: [B, K, C_mask, (p_dims)] - mask patches
-            coords: [B, K, D] - Patch coords in original image space 
-            ctx_id_labels: [B, K] - 0=target, >0=context patch labels
+            img_patches: [B, K, tokens_per_patch, embed_dim] - DINO features per patch
+            coords: [B, K, 2] - Patch coordinates (optional)
+            ctx_id_labels: [B, K] - 0 for target, >0 for context patches
 
         Returns:
-            mask_patch_logit_preds: [B, K, C_mask, (p_dims)]
+            Dict with mask_patch_logit_preds [B, K, 1] and img_patches
         """
+        B, K = img_patches.shape[:2]
+        device = img_patches.device
 
-        # apply token masking based on tgt/ctx labels
+        # Average pool over tokens within each patch: [B, K, tokens, D] -> [B, K, D]
+        if img_patches.dim() == 4:
+            img_tokens = img_patches.mean(dim=2)  # [B, K, embed_dim]
+        else:
+            img_tokens = img_patches  # Already [B, K, embed_dim]
 
-        # embed patches with positional and tgt/ctx embeddings
+        # Determine context vs target
+        if ctx_id_labels is not None:
+            is_context = ctx_id_labels > 0  # [B, K]
+        else:
+            is_context = torch.ones(B, K, dtype=torch.bool, device=device)
+            is_context[:, 0] = False
 
-        # apply cross-patch attention 
+        # Add type embeddings
+        type_embed = torch.where(
+            is_context.unsqueeze(-1),
+            self.context_embed.expand(B, K, -1),
+            self.target_embed.expand(B, K, -1),
+        )
+        combined = img_tokens + type_embed
+
+        # Apply RoPE
+        combined = apply_rope(combined, self.rope_cache)
+
+        # Simple per-patch MLP (no cross-patch attention)
+        output = combined + self.mlp(combined)
+
+        # Project to output
+        mask_pred = self.mask_proj_out(output)
 
         return {
-                'mask_patch_logit_preds': mask_patches,
-                'img_patches': img_patches
-            }
+            'mask_patch_logit_preds': mask_pred,
+            'img_patches': img_patches,
+        }
+
+class ContextTargetAttention(nn.Module):
+    """
+    Attention where:
+    - Context patches do self-attention among themselves
+    - Target patches do cross-attention to context patches only
+    """
+    
+    def __init__(self, embed_dim: int, num_heads: int, append_zero_attn: bool = False):
+        super().__init__()
+        self.mha_ctx = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True
+        )
+        self.mha_tgt = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True
+        )
+        
+        if append_zero_attn:
+            self.mha_ctx = AppendZeroAttn(self.mha_ctx)
+            self.mha_tgt = AppendZeroAttn(self.mha_tgt)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        is_context: torch.Tensor,
+        need_weights: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, K, D] - all patch tokens
+            is_context: [B, K] - boolean mask, True for context patches
+            
+        Returns:
+            [B, K, D] - updated tokens
+        """
+        B, K, D = x.shape
+        device = x.device
+        
+        # Build index tensors for gathering/scattering
+        ctx_mask = is_context  # [B, K]
+        tgt_mask = ~is_context  # [B, K]
+        
+        # Count patches per type (assume uniform across batch for simplicity)
+        n_ctx = ctx_mask[0].sum().item()
+        n_tgt = tgt_mask[0].sum().item()
+        
+        # Gather context and target tokens separately
+        ctx_indices = ctx_mask.nonzero(as_tuple=False)  # [total_ctx, 2]
+        tgt_indices = tgt_mask.nonzero(as_tuple=False)  # [total_tgt, 2]
+        
+        # Reshape indices for batched gathering
+        ctx_idx = ctx_mask.long().cumsum(dim=1) - 1  # [B, K]
+        tgt_idx = tgt_mask.long().cumsum(dim=1) - 1  # [B, K]
+        
+        # Extract context tokens: [B, n_ctx, D]
+        ctx_tokens = self._gather_masked(x, ctx_mask, n_ctx)
+        
+        # Extract target tokens: [B, n_tgt, D]
+        tgt_tokens = self._gather_masked(x, tgt_mask, n_tgt)
+        
+        # Context self-attention
+        ctx_out, _ = self.mha_ctx(
+            ctx_tokens, ctx_tokens, ctx_tokens, need_weights=need_weights
+        )
+        
+        # Target cross-attention to context
+        tgt_out, _ = self.mha_tgt(
+            tgt_tokens, ctx_tokens, ctx_tokens, need_weights=need_weights
+        )
+        
+        # Scatter results back to original positions
+        output = torch.zeros_like(x)
+        output = self._scatter_masked(output, ctx_out, ctx_mask, n_ctx)
+        output = self._scatter_masked(output, tgt_out, tgt_mask, n_tgt)
+        
+        return output
+    
+    def _gather_masked(
+        self, x: torch.Tensor, mask: torch.Tensor, n: int
+    ) -> torch.Tensor:
+        """Gather tokens where mask is True into [B, n, D] tensor."""
+        B, K, D = x.shape
+        
+        # Create gather indices [B, n]
+        indices = torch.zeros(B, n, dtype=torch.long, device=x.device)
+        for b in range(B):
+            indices[b] = mask[b].nonzero(as_tuple=False).squeeze(-1)
+        
+        # Gather: [B, n, D]
+        return torch.gather(x, 1, indices.unsqueeze(-1).expand(-1, -1, D))
+    
+    def _scatter_masked(
+        self, output: torch.Tensor, values: torch.Tensor, mask: torch.Tensor, n: int
+    ) -> torch.Tensor:
+        """Scatter values back to positions where mask is True."""
+        B, K, D = output.shape
+        
+        # Create scatter indices [B, n]
+        indices = torch.zeros(B, n, dtype=torch.long, device=output.device)
+        for b in range(B):
+            indices[b] = mask[b].nonzero(as_tuple=False).squeeze(-1)
+        
+        # Scatter: [B, K, D]
+        output.scatter_(1, indices.unsqueeze(-1).expand(-1, -1, D), values)
+        return output
+
+
+class TransformerLayerContextTarget(nn.Module):
+    """Transformer layer using context/target attention pattern."""
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        mlp_dim: int,
+        bias_mlp: bool = True,
+        layernorm_affine: bool = True,
+        append_zero_attn: bool = False,
+    ):
+        super().__init__()
+        
+        self.attention = ContextTargetAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            append_zero_attn=append_zero_attn,
+        )
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim, bias=bias_mlp),
+            nn.GELU(),
+            nn.Linear(mlp_dim, embed_dim, bias=bias_mlp),
+        )
+        
+        self.norm1 = nn.LayerNorm(embed_dim, elementwise_affine=layernorm_affine)
+        self.norm2 = nn.LayerNorm(embed_dim, elementwise_affine=layernorm_affine)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        is_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, K, D] - patch tokens
+            is_context: [B, K] - True for context patches
+            
+        Returns:
+            [B, K, D] - updated tokens
+        """
+        # Pre-norm attention with residual
+        x = x + self.attention(self.norm1(x), is_context)
+        
+        # Pre-norm MLP with residual
+        x = x + self.mlp(self.norm2(x))
+        
+        return x
+    
+
+class AppendZeroAttn(nn.Module):
+    def __init__(self, mha):
+        super().__init__()
+        assert mha.batch_first, (
+            "AppendZeroAttn expects batch_first=True, otherwise rewrite the forward method"
+        )
+        self.mha = mha
+
+    def forward(self, query, key, value, **kwargs):
+        key_with_zero = torch.cat((key, torch.zeros_like(key[:, :1])), dim=1)
+        value_with_zero = torch.cat((value, torch.zeros_like(value[:, :1])), dim=1)
+        return self.mha(query, key_with_zero, value_with_zero, **kwargs)
+
 
 class PrecomputedFeatureBackbone(nn.Module):
     """

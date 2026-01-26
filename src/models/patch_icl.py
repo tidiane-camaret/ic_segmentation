@@ -192,10 +192,8 @@ class PatchICL_Level(nn.Module):
     def _prepare_backbone_inputs(
         self,
         target_features: torch.Tensor,
-        target_mask_patches: torch.Tensor,
         target_coords: torch.Tensor,
         context_features: torch.Tensor = None,
-        context_mask_patches: torch.Tensor = None,
         context_coords: torch.Tensor = None,
         num_context_images: int = 0,
     ) -> dict[str, torch.Tensor]:
@@ -204,30 +202,23 @@ class PatchICL_Level(nn.Module):
 
         Args:
             target_features: [B, K, tokens, D] - target patch features
-            target_mask_patches: [B, K, 1, ps, ps] - zeros for target (to predict)
             target_coords: [B, K, 2] - target coordinates
             context_features: [B, K_ctx, tokens, D] - context patch features
-            context_mask_patches: [B, K_ctx, 1, ps, ps] - context GT masks
             context_coords: [B, K_ctx, 2] - context coordinates
             num_context_images: k - number of context images
 
         Returns:
-            Dict with img_patches, mask_patches, coords, ctx_id_labels
+            Dict with img_patches, coords, ctx_id_labels
         """
-        B = target_features.shape[0] if target_features is not None else target_mask_patches.shape[0]
-        K = target_mask_patches.shape[1]
-        device = target_mask_patches.device
+        B = target_features.shape[0]
+        K = target_features.shape[1]
+        device = target_features.device
 
-        if context_features is not None and context_mask_patches is not None:
-            K_ctx = context_mask_patches.shape[1]
+        if context_features is not None:
+            K_ctx = context_features.shape[1]
 
-            # Concatenate target and context
-            if target_features is not None and context_features is not None:
-                img_patches = torch.cat([target_features, context_features], dim=1)
-            else:
-                img_patches = None
-
-            mask_patches = torch.cat([target_mask_patches, context_mask_patches], dim=1)
+            # Concatenate target and context features
+            img_patches = torch.cat([target_features, context_features], dim=1)
             coords = torch.cat([target_coords, context_coords], dim=1)
 
             # Build ctx_id_labels: 0 for target, 1..k for each context image
@@ -239,13 +230,11 @@ class PatchICL_Level(nn.Module):
                 ctx_id_labels[:, start:end] = ctx_idx + 1
         else:
             img_patches = target_features
-            mask_patches = target_mask_patches
             coords = target_coords
             ctx_id_labels = torch.zeros(B, K, dtype=torch.long, device=device)
 
         return {
             'img_patches': img_patches,
-            'mask_patches': mask_patches,
             'coords': coords,
             'ctx_id_labels': ctx_id_labels,
         }
@@ -319,9 +308,6 @@ class PatchICL_Level(nn.Module):
                 level_resolution=self.resolution,
             )
 
-        # Target mask patches are zeros (we want to predict these)
-        target_mask_patches = torch.zeros(B, K, 1, self.patch_size, self.patch_size, device=device)
-
         # Process context if provided
         context_patches = None
         context_patch_labels = None
@@ -369,10 +355,8 @@ class PatchICL_Level(nn.Module):
             # Prepare backbone inputs
             backbone_inputs = self._prepare_backbone_inputs(
                 target_features=target_patch_features,
-                target_mask_patches=target_mask_patches,
                 target_coords=coords_scaled,
                 context_features=context_patch_features,
-                context_mask_patches=context_patch_labels,
                 context_coords=context_coords_scaled,
                 num_context_images=k,
             )
@@ -401,7 +385,6 @@ class PatchICL_Level(nn.Module):
             # No context - target only
             backbone_inputs = self._prepare_backbone_inputs(
                 target_features=target_patch_features,
-                target_mask_patches=target_mask_patches,
                 target_coords=coords_scaled,
             )
 
