@@ -94,6 +94,7 @@ class PatchICL_Level(nn.Module):
         aggregator: PatchAggregator | None = None,
         target_mask_ratio: float = 0.0,
         context_mask_ratio: float = 0.0,
+        num_mask_channels: int = 1,
     ):
         super().__init__()
         self.resolution = resolution
@@ -104,6 +105,7 @@ class PatchICL_Level(nn.Module):
         self.sampling_temperature = sampling_temperature
         self.target_mask_ratio = target_mask_ratio
         self.context_mask_ratio = context_mask_ratio
+        self.num_mask_channels = num_mask_channels
 
         if sampler is not None:
             self.sampler = sampler
@@ -126,10 +128,37 @@ class PatchICL_Level(nn.Module):
         return F.interpolate(x, size=(self.resolution, self.resolution), mode='bilinear', align_corners=False)
 
     def downsample_mask(self, mask: torch.Tensor) -> torch.Tensor:
-        """Downsample mask using nearest neighbor to preserve labels."""
+        """Downsample mask to this level's resolution.
+        
+        For single-channel binary masks, uses nearest neighbor to preserve labels.
+        For multi-channel (e.g., RGB) masks, uses bilinear to preserve color values.
+        """
         if mask.shape[-1] == self.resolution and mask.shape[-2] == self.resolution:
             return mask
+        # Use bilinear for multi-channel masks (RGB colors), nearest for binary
+        mode = 'bilinear' if mask.shape[1] > 1 else 'nearest'
+        if mode == 'bilinear':
+            return F.interpolate(mask.float(), size=(self.resolution, self.resolution), mode='bilinear', align_corners=False)
         return F.interpolate(mask.float(), size=(self.resolution, self.resolution), mode='nearest')
+
+    def _mask_to_weights(self, mask: torch.Tensor) -> torch.Tensor:
+        """Convert mask to single-channel weight map for sampling.
+        
+        For single-channel masks, returns as-is.
+        For multi-channel masks (e.g., RGB), returns max across channels.
+        This ensures any colored region gets sampled.
+        
+        Args:
+            mask: [B, C, H, W] - mask tensor (C=1 for binary, C=3 for RGB)
+            
+        Returns:
+            weights: [B, 1, H, W] - single-channel weight map
+        """
+        if mask.shape[1] == 1:
+            return mask
+        # For multi-channel masks, take max across channels
+        # This way any non-zero color channel contributes to sampling
+        return mask.max(dim=1, keepdim=True)[0]
 
     def select_patches(
         self,
@@ -257,12 +286,12 @@ class PatchICL_Level(nn.Module):
 
         Args:
             image: [B, C, H, W] - original resolution image
-            labels: [B, 1, H, W] - GT mask
-            prev_pred: [B, 1, H, W] - prediction from previous level
+            labels: [B, C_mask, H, W] - GT mask (C_mask=1 for binary, C_mask=3 for RGB)
+            prev_pred: [B, C_mask, H, W] - prediction from previous level
             use_oracle: If True, use GT mask for sampling
             original_coords_scale: Scale factor for coordinates
             context_in: [B, k, C, H, W] - context images
-            context_out: [B, k, 1, H, W] - context masks
+            context_out: [B, k, C_mask, H, W] - context masks
             target_features: [B, N, D] - Pre-computed features for target
             context_features: [B, k, N, D] - Pre-computed features for context
             training: Whether in training mode
@@ -280,16 +309,18 @@ class PatchICL_Level(nn.Module):
         image_ds = self.downsample(image)
         labels_ds = self.downsample_mask(labels) if labels is not None else None
 
-        # Create weight map for sampling
+        # Create weight map for sampling (always single-channel)
         if use_oracle and labels is not None:
-            weights = labels_ds
+            # Convert multi-channel mask to single-channel weights
+            weights = self._mask_to_weights(labels_ds)
         elif prev_pred is not None:
-            weights = self.downsample(prev_pred)
+            weights = self._mask_to_weights(self.downsample(prev_pred))
         else:
             weights = torch.ones(B, 1, self.resolution, self.resolution, device=device)
 
+        # Initialize empty labels with correct number of channels
         if labels_ds is None:
-            labels_ds = torch.zeros(B, 1, self.resolution, self.resolution, device=device)
+            labels_ds = torch.zeros(B, self.num_mask_channels, self.resolution, self.resolution, device=device)
 
         # Select target patches
         patches, patch_labels, coords, aug_params = self.select_patches(image_ds, labels_ds, weights)
@@ -324,11 +355,14 @@ class PatchICL_Level(nn.Module):
             context_out_flat = context_out.view(B * k, *context_out.shape[2:])
 
             context_in_ds = self.downsample(context_in_flat).view(B, k, -1, self.resolution, self.resolution)
-            context_out_ds = self.downsample_mask(context_out_flat).view(B, k, 1, self.resolution, self.resolution)
+            context_out_ds = self.downsample_mask(context_out_flat).view(B, k, context_out.shape[2], self.resolution, self.resolution)
 
-            # Select patches from context (use masks as weights)
+            # Create single-channel weights from context masks for patch selection
+            context_weights = self._mask_to_weights(context_out_ds.view(B * k, *context_out_ds.shape[2:])).view(B, k, 1, self.resolution, self.resolution)
+
+            # Select patches from context (use single-channel weights for sampling)
             context_patches, context_patch_labels, context_coords = self._select_context_patches(
-                context_in_ds, context_out_ds, context_out_ds
+                context_in_ds, context_out_ds, context_weights
             )
             K_ctx = context_patches.shape[1]
 
@@ -481,6 +515,9 @@ class PatchICL(nn.Module):
         self.target_mask_ratio = masking_cfg.get('target_mask_ratio', 0.0)
         self.context_mask_ratio = masking_cfg.get('context_mask_ratio', 0.0)
 
+        # Mask channels config (1 for binary, 3 for RGB)
+        self.num_mask_channels = config.get('num_mask_channels', 1)
+
         # Loss config
         loss_cfg = config.get('loss', {})
         self.patch_loss_cfg = loss_cfg.get('patch_loss', {'type': 'dice', 'args': None})
@@ -509,6 +546,7 @@ class PatchICL(nn.Module):
             embed_dim=backbone_cfg.get('embed_dim', 1024),
             patch_size=levels_cfg[0]['patch_size'],
             image_size=backbone_cfg.get('image_size', 224),
+            num_classes=self.num_mask_channels,
         )
 
         # Create levels
@@ -532,6 +570,7 @@ class PatchICL(nn.Module):
                 aggregator=aggregator,
                 target_mask_ratio=self.target_mask_ratio,
                 context_mask_ratio=self.context_mask_ratio,
+                num_mask_channels=self.num_mask_channels,
             )
             self.levels.append(level)
 
@@ -595,6 +634,7 @@ class PatchICL(nn.Module):
         return create_aggregator(
             aggregator_type=self.aggregator_type,
             patch_size=patch_size,
+            num_mask_channels=self.num_mask_channels,
             **self.aggregator_cfg,
         )
 

@@ -7,10 +7,7 @@ from omegaconf import DictConfig, OmegaConf
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, "/software/notebooks/camaret/repos")
-sys.path.insert(0, "/work/dlclarge2/ndirt-SegFM3D/repos")
-sys.path.insert(0, "/work/dlclarge2/ndirt-SegFM3D/ic_segmentation")
-from SegFormer3D.losses.losses import build_loss_fn
+from src.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate
 
 
@@ -81,6 +78,7 @@ def main(cfg: DictConfig) -> None:
             shuffle=True,
             load_dinov3_features=cfg.get("load_dinov3_features", True),
             max_ds_len=cfg.get("max_ds_len"),
+            random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
         val_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d,
@@ -96,6 +94,7 @@ def main(cfg: DictConfig) -> None:
             shuffle=False,
             load_dinov3_features=cfg.get("load_dinov3_features", True),
             max_ds_len=cfg.get("max_ds_len"),
+            random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
     else:
         train_loader = get_dataloader(
@@ -131,13 +130,20 @@ def main(cfg: DictConfig) -> None:
         ).to(device)
     elif cfg.method == "patch_icl":
         from src.models.patch_icl import PatchICL
+
+        # Set num_mask_channels based on random_coloring_nb
+        patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
+        random_coloring_nb = cfg.get("random_coloring_nb", 0)
+        patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
+        print(f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})")
+
         model = PatchICL(
-            cfg.model.patch_icl,
+            patch_icl_cfg,
             context_size=cfg.get("context_size", 0),
         ).to(device)
 
         # Build and set loss functions from patch_icl config
-        loss_cfg = cfg.model.patch_icl.get("loss", {})
+        loss_cfg = patch_icl_cfg.get("loss", {})
         patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
         aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
 

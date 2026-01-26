@@ -12,6 +12,7 @@ dataset: totalseg2d
 download: false
 load_dinov3_features: true
 context_size: 1
+random_coloring_nb: 0  # 0: single-label binary masks, >0: multi-label RGB masks with N random labels
 method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
 train_label_ids: "train"
 val_label_ids: "val"
@@ -114,6 +115,9 @@ model:
       context_mask_ratio: 0
 
     loss:
+      # Loss types: binarycrossentropy, dice, diceCE, smoothl1, mse, l1
+      # For RGB masks (random_coloring_nb > 0), use regression losses: smoothl1, mse, l1
+      # smoothl1/mse/l1 args: {beta: 1.0, apply_sigmoid: true} (beta only for smoothl1)
       patch_loss:
         type: "binarycrossentropy"
         args: null

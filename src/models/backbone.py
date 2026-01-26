@@ -341,7 +341,7 @@ class CrossPatchAttentionBackbone(nn.Module):
 
         self.mask_proj_out = SegmentationHead(
             embed_dim=embed_proj_dim,  # D dimension after projection
-            num_classes=1,
+            num_classes=num_classes,
             patch_size=patch_size,
             feature_grid_size=self.feature_grid_size,
         )

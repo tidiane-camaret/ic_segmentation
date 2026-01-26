@@ -155,11 +155,11 @@ class PatchAugmenter(nn.Module):
 
         Args:
             patches: [B, K, C, H, W] - image patches
-            patch_labels: [B, K, 1, H, W] - label patches
+            patch_labels: [B, K, C_mask, H, W] - label patches (C_mask=1 for binary, C_mask=3 for RGB)
 
         Returns:
             aug_patches: [B, K, C, H, W]
-            aug_labels: [B, K, 1, H, W]
+            aug_labels: [B, K, C_mask, H, W]
             aug_params: dict with augmentation parameters for inverse transform
         """
         B, K = patches.shape[:2]
@@ -219,9 +219,10 @@ class PatchAugmenter(nn.Module):
             # Build scale matrices
             B_K = B * K
             _, _, C, H, W = patches.shape
+            C_mask = patch_labels.shape[2]  # Number of mask channels (1 for binary, 3 for RGB)
 
             patches_flat = aug_patches.view(B_K, C, H, W)
-            labels_flat = aug_labels.view(B_K, 1, H, W)
+            labels_flat = aug_labels.view(B_K, C_mask, H, W)
             scales_flat = scales.view(B_K)
 
             theta = torch.zeros(B_K, 2, 3, device=device)
@@ -232,9 +233,12 @@ class PatchAugmenter(nn.Module):
             aug_patches = F.grid_sample(
                 patches_flat, grid, mode="bilinear", padding_mode="zeros", align_corners=False
             ).view(B, K, C, H, W)
+
+            # Use separate grid for labels since they may have different channel count
+            grid_labels = F.affine_grid(theta, labels_flat.shape, align_corners=False)
             aug_labels = F.grid_sample(
-                labels_flat, grid, mode="nearest", padding_mode="zeros", align_corners=False
-            ).view(B, K, 1, H, W)
+                labels_flat, grid_labels, mode="nearest", padding_mode="zeros", align_corners=False
+            ).view(B, K, C_mask, H, W)
 
         return aug_patches, aug_labels, aug_params
 
@@ -446,16 +450,17 @@ class PatchSampler(nn.Module):
 
         Args:
             image: [B, C, H, W] - source image
-            labels: [B, 1, H, W] - source labels
+            labels: [B, C_mask, H, W] - source labels (C_mask=1 for binary, C_mask=3 for RGB)
             h_coords: [B, k] - row coordinates
             w_coords: [B, k] - column coordinates
 
         Returns:
             patches: [B, K, C, ps, ps]
-            patch_labels: [B, K, 1, ps, ps]
+            patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinate pairs
         """
         B, C, _, _ = image.shape
+        C_mask = labels.shape[1]  # Number of mask channels
         ps = self.patch_size
         K = self.num_patches
         k = h_coords.shape[1]
@@ -484,7 +489,7 @@ class PatchSampler(nn.Module):
             # Pad if fewer patches than requested
             while len(batch_patches) < K:
                 batch_patches.append(torch.zeros(C, ps, ps, device=device))
-                batch_labels.append(torch.zeros(1, ps, ps, device=device))
+                batch_labels.append(torch.zeros(C_mask, ps, ps, device=device))
                 batch_coords.append([0, 0])
 
             all_patches.append(torch.stack(batch_patches))
@@ -493,7 +498,7 @@ class PatchSampler(nn.Module):
 
         return (
             torch.stack(all_patches),   # [B, K, C, ps, ps]
-            torch.stack(all_labels),    # [B, K, 1, ps, ps]
+            torch.stack(all_labels),    # [B, K, C_mask, ps, ps]
             torch.stack(all_coords),    # [B, K, 2]
         )
 
@@ -508,12 +513,12 @@ class PatchSampler(nn.Module):
 
         Args:
             image: [B, C, H, W] - source image
-            labels: [B, 1, H, W] - ground truth mask
-            weights: [B, 1, H, W] - weight map for sampling
+            labels: [B, C_mask, H, W] - ground truth mask (C_mask=1 for binary, C_mask=3 for RGB)
+            weights: [B, 1, H, W] - weight map for sampling (always single-channel)
 
         Returns:
             patches: [B, K, C, ps, ps]
-            patch_labels: [B, K, 1, ps, ps]
+            patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
             aug_params: dict with augmentation parameters (for inverse transform)
         """
@@ -630,16 +635,17 @@ class SlidingWindowSampler(PatchSampler):
 
         Args:
             image: [B, C, H, W] - source image
-            labels: [B, 1, H, W] - ground truth mask
+            labels: [B, C_mask, H, W] - ground truth mask (C_mask=1 for binary, C_mask=3 for RGB)
             weights: [B, 1, H, W] - ignored (kept for API compatibility)
 
         Returns:
             patches: [B, K, C, ps, ps] where K = grid_h * grid_w
-            patch_labels: [B, K, 1, ps, ps]
+            patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
             aug_params: dict with augmentation parameters
         """
         B, C, H, W = image.shape
+        C_mask = labels.shape[1]  # Number of mask channels
         ps = self.patch_size
         stride = self.stride
 
@@ -654,8 +660,8 @@ class SlidingWindowSampler(PatchSampler):
         # [B, K, C, ps, ps]
 
         labels_unfolded = labels.unfold(2, ps, stride).unfold(3, ps, stride)
-        patch_labels = labels_unfolded.reshape(B, 1, -1, ps, ps).permute(0, 2, 1, 3, 4)
-        # [B, K, 1, ps, ps]
+        patch_labels = labels_unfolded.reshape(B, C_mask, -1, ps, ps).permute(0, 2, 1, 3, 4)
+        # [B, K, C_mask, ps, ps]
 
         # Generate coordinates
         device = image.device
@@ -808,18 +814,19 @@ class GumbelSoftmaxSampler(PatchSampler):
 
         Args:
             image: [B, C, H, W] - source image
-            labels: [B, 1, H, W] - source labels
+            labels: [B, C_mask, H, W] - source labels (C_mask=1 for binary, C_mask=3 for RGB)
             soft_indices: [B, K, N] - soft one-hot selection weights
             grid_h, grid_w: Grid dimensions
             stride: Stride between candidates
 
         Returns:
             patches: [B, K, C, ps, ps]
-            patch_labels: [B, K, 1, ps, ps]
+            patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates (from hard selection)
         """
         del grid_h  # Unused, N is derived from soft_indices
         B, C, H, W = image.shape
+        C_mask = labels.shape[1]  # Number of mask channels
         K = soft_indices.shape[1]
         N = soft_indices.shape[2]
         ps = self.patch_size
@@ -834,7 +841,7 @@ class GumbelSoftmaxSampler(PatchSampler):
 
         # Same for labels
         labels_unfolded = labels.unfold(2, ps, stride).unfold(3, ps, stride)
-        all_labels = labels_unfolded.reshape(B, 1, -1, ps, ps)
+        all_labels = labels_unfolded.reshape(B, C_mask, -1, ps, ps)
 
         # Handle case where unfold gives fewer patches than expected
         actual_N = all_patches.shape[2]
@@ -842,7 +849,7 @@ class GumbelSoftmaxSampler(PatchSampler):
             # Pad with zeros
             pad_patches = torch.zeros(B, C, N - actual_N, ps, ps, device=device)
             all_patches = torch.cat([all_patches, pad_patches], dim=2)
-            pad_labels = torch.zeros(B, 1, N - actual_N, ps, ps, device=device)
+            pad_labels = torch.zeros(B, C_mask, N - actual_N, ps, ps, device=device)
             all_labels = torch.cat([all_labels, pad_labels], dim=2)
         elif actual_N > N:
             all_patches = all_patches[:, :, :N]
@@ -851,15 +858,15 @@ class GumbelSoftmaxSampler(PatchSampler):
         # Apply soft attention: [B, K, N] @ [B, N, C*ps*ps] -> [B, K, C*ps*ps]
         # Reshape patches for matmul
         all_patches_flat = all_patches.permute(0, 2, 1, 3, 4).reshape(B, N, C * ps * ps)
-        all_labels_flat = all_labels.permute(0, 2, 1, 3, 4).reshape(B, N, ps * ps)
+        all_labels_flat = all_labels.permute(0, 2, 1, 3, 4).reshape(B, N, C_mask * ps * ps)
 
         # Weighted combination (differentiable)
         selected_patches_flat = torch.bmm(soft_indices, all_patches_flat)  # [B, K, C*ps*ps]
-        selected_labels_flat = torch.bmm(soft_indices, all_labels_flat)    # [B, K, ps*ps]
+        selected_labels_flat = torch.bmm(soft_indices, all_labels_flat)    # [B, K, C_mask*ps*ps]
 
         # Reshape back
         patches = selected_patches_flat.reshape(B, K, C, ps, ps)
-        patch_labels = selected_labels_flat.reshape(B, K, 1, ps, ps)
+        patch_labels = selected_labels_flat.reshape(B, K, C_mask, ps, ps)
 
         # Get hard coordinates for position encoding (non-differentiable, for reference)
         hard_indices = soft_indices.argmax(dim=2)  # [B, K]
@@ -882,12 +889,12 @@ class GumbelSoftmaxSampler(PatchSampler):
 
         Args:
             image: [B, C, H, W] - source image
-            labels: [B, 1, H, W] - ground truth mask
-            weights: [B, 1, H, W] - weight map for sampling
+            labels: [B, C_mask, H, W] - ground truth mask (C_mask=1 for binary, C_mask=3 for RGB)
+            weights: [B, 1, H, W] - weight map for sampling (always single-channel)
 
         Returns:
             patches: [B, K, C, ps, ps]
-            patch_labels: [B, K, 1, ps, ps]
+            patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
             aug_params: dict with augmentation parameters (for inverse transform)
         """

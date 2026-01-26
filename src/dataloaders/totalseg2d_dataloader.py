@@ -19,6 +19,22 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.label_ids_totalseg import get_label_ids
 
+def define_colors_by_mean_sep(num_colors=133, channelsep=7):
+    num_sep_per_channel = channelsep
+    separation_per_channel = 256 // num_sep_per_channel
+
+    color_dict = {}
+    for location in range(num_colors):
+        num_seq_r = location // num_sep_per_channel ** 2
+        num_seq_g = (location % num_sep_per_channel ** 2) // num_sep_per_channel
+        num_seq_b = location % num_sep_per_channel
+        
+        R = 255 - num_seq_r * separation_per_channel
+        G = 255 - num_seq_g * separation_per_channel
+        B = 255 - num_seq_b * separation_per_channel
+        
+        color_dict[location] = (R, G, B)
+    return color_dict
 
 class TotalSeg2DDataset(Dataset):
     """
@@ -69,7 +85,16 @@ class TotalSeg2DDataset(Dataset):
         random_context: bool = True,
         max_ds_len: Optional[int] = None,
         load_dinov3_features: bool = False,
+        random_coloring_nb: int = 0,
     ):
+        """
+        Args:
+            ...
+            random_coloring_nb: Number of labels to sample for random coloring mode.
+                If > 0, samples this many labels, finds cases with all labels,
+                assigns random RGB colors, and returns 3-channel masks.
+                If 0, uses standard single-label binary masks (default behavior).
+        """
         self.root_dir = Path(root_dir)
 
         # Resolve label_id_list if it's a string split name
@@ -87,6 +112,7 @@ class TotalSeg2DDataset(Dataset):
         self.random_context = random_context
         self.max_ds_len = max_ds_len
         self.load_dinov3_features = load_dinov3_features
+        self.random_coloring_nb = random_coloring_nb
 
         # Load stats dict
         with open(stats_path, "rb") as f:
@@ -98,12 +124,16 @@ class TotalSeg2DDataset(Dataset):
 
         # Build label_id -> case_ids mapping
         self.label_to_cases: Dict[str, List[str]] = {}
+        # Build case_id -> set of label_ids mapping (for multi-label queries)
+        self.case_to_labels: Dict[str, set] = {}
         all_labels_in_stats = set()
         for case_id, labels in self.stats.items():
+            self.case_to_labels[case_id] = set()
             for label_id in labels.keys():
                 all_labels_in_stats.add(label_id)
                 if label_id in label_id_set:
                     self.label_to_cases.setdefault(label_id, []).append(case_id)
+                    self.case_to_labels[case_id].add(label_id)
 
         # Debug: show mismatch if no labels found
         if len(self.label_to_cases) == 0:
@@ -114,6 +144,13 @@ class TotalSeg2DDataset(Dataset):
             print(f"  Sample requested labels: {sample_requested_labels}")
 
         print(f"Built mapping for {len(self.label_to_cases)} labels (stats has {len(all_labels_in_stats)} unique labels)")
+
+        # For random coloring mode, precompute color palette
+        if self.random_coloring_nb > 0:
+            self.color_palette = define_colors_by_mean_sep(
+                num_colors=max(256, len(self.label_id_list)),
+                channelsep=7
+            )
 
         # Filter by split if provided
         if split is not None:
@@ -154,6 +191,84 @@ class TotalSeg2DDataset(Dataset):
             ]
 
         print(f"Filtered to {len(self.stats)} cases for split '{split}'")
+
+        # Also filter case_to_labels
+        self.case_to_labels = {k: v for k, v in self.case_to_labels.items() if k in split_case_ids}
+
+    def _find_cases_with_labels(self, label_ids: List[str]) -> List[str]:
+        """Find cases that have ALL specified labels."""
+        label_set = set(label_ids)
+        matching_cases = []
+        for case_id, case_labels in self.case_to_labels.items():
+            if label_set.issubset(case_labels):
+                matching_cases.append(case_id)
+        return matching_cases
+
+    def _sample_random_colors(self, num_labels: int) -> Dict[int, Tuple[int, int, int]]:
+        """Sample random colors for each label index."""
+        # Sample random indices from the color palette
+        color_indices = random.sample(range(len(self.color_palette)), num_labels)
+        return {i: self.color_palette[idx] for i, idx in enumerate(color_indices)}
+
+    def _create_colored_mask(
+        self,
+        case_id: str,
+        label_ids: List[str],
+        axis: str,
+        color_map: Dict[int, Tuple[int, int, int]],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load multiple labels and create a 3-channel RGB colored mask.
+
+        Args:
+            case_id: Case ID
+            label_ids: List of label IDs to load
+            axis: Slice axis
+            color_map: Mapping from label index to RGB color
+
+        Returns:
+            img: [H, W] grayscale image
+            colored_mask: [3, H, W] RGB colored mask (values 0-1)
+        """
+        img = None
+        colored_mask = None
+
+        for label_idx, label_id in enumerate(label_ids):
+            slice_dir = self.root_dir / case_id / label_id
+
+            # Load image (only once, from first label)
+            if img is None:
+                img_path_npy = slice_dir / f"{axis}_slice_img.npy"
+                if img_path_npy.exists():
+                    img = np.load(img_path_npy)
+                else:
+                    img_path = slice_dir / f"{axis}_slice_img.nii.gz"
+                    img = nib.load(str(img_path)).get_fdata().astype(np.float32)
+
+                # Initialize colored mask
+                H, W = img.shape
+                colored_mask = np.zeros((3, H, W), dtype=np.float32)
+
+            # Load label mask
+            label_path_npy = slice_dir / f"{axis}_slice.npy"
+            if label_path_npy.exists():
+                label = np.load(label_path_npy)
+            else:
+                label_path = slice_dir / f"{axis}_slice.nii.gz"
+                label = nib.load(str(label_path)).get_fdata().astype(np.float32)
+
+            # Apply color to this label's mask
+            mask_binary = (label > 0.5).astype(np.float32)
+            r, g, b = color_map[label_idx]
+            if colored_mask is not None:
+                colored_mask[0] += mask_binary * (r / 255.0)
+                colored_mask[1] += mask_binary * (g / 255.0)
+                colored_mask[2] += mask_binary * (b / 255.0)
+
+        # Clip to [0, 1] in case of overlapping labels
+        colored_mask = np.clip(colored_mask, 0, 1)
+
+        return img, colored_mask
 
     def _load_slice(self, case_id: str, label_id: str, axis: str) -> Tuple[np.ndarray, np.ndarray]:
         """Load image and label slice for a specific case/label/axis.
@@ -258,6 +373,15 @@ class TotalSeg2DDataset(Dataset):
             return min(self.max_ds_len, len(self.samples))
         return len(self.samples)
 
+    def _resize_multichannel(self, arr: np.ndarray, size: Tuple[int, int], mode: str = "bilinear") -> np.ndarray:
+        """Resize multi-channel array [C, H, W] to target size."""
+        tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, C, H, W]
+        if mode == "bilinear":
+            resized = torch.nn.functional.interpolate(tensor, size=size, mode="bilinear", align_corners=False)
+        else:
+            resized = torch.nn.functional.interpolate(tensor, size=size, mode="nearest")
+        return resized.squeeze(0).numpy()  # [C, H, W]
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a sample with context examples.
@@ -265,19 +389,25 @@ class TotalSeg2DDataset(Dataset):
         Returns:
             Dictionary with:
             - 'image': [1, H, W] - Target image
-            - 'label': [1, H, W] - Target label
+            - 'label': [C, H, W] - Target label (C=1 for binary, C=3 for random coloring)
             - 'context_in': [k, 1, H, W] - Context images
-            - 'context_out': [k, 1, H, W] - Context labels
+            - 'context_out': [k, C, H, W] - Context labels
             - 'target_case_id': str
             - 'context_case_ids': List[str]
-            - 'label_id': str
+            - 'label_id': str or List[str] (list if random_coloring_nb > 0)
             - 'axis': str
+            - 'color_map': Dict[int, Tuple[int,int,int]] (only if random_coloring_nb > 0)
             If load_dinov3_features=True, also includes:
             - 'target_features': [196, 1024] - Target DINOv3 patch features
             - 'context_features': [k, 196, 1024] - Context DINOv3 patch features
         """
         target_case_id, label_id, axis = self.samples[idx]
 
+        # Random coloring mode: sample multiple labels and find cases with all of them
+        if self.random_coloring_nb > 0:
+            return self._getitem_random_coloring(idx)
+
+        # Standard single-label mode
         # Load target
         target_img, target_label = self._load_slice(target_case_id, label_id, axis)
 
@@ -374,19 +504,145 @@ class TotalSeg2DDataset(Dataset):
 
         return result
 
+    def _getitem_random_coloring(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a sample with random coloring (multiple labels with RGB colors).
+
+        Samples random_coloring_nb labels, finds cases with all labels,
+        assigns random RGB colors, and returns 3-channel colored masks.
+        """
+        # Get base sample info for axis selection
+        _, _, axis = self.samples[idx]
+
+        # Sample N random labels
+        n_labels = min(self.random_coloring_nb, len(self.label_id_list))
+        sampled_labels = random.sample(self.label_id_list, n_labels)
+
+        # Find cases that have ALL sampled labels
+        available_cases = self._find_cases_with_labels(sampled_labels)
+
+        if len(available_cases) < 2:
+            # Fallback: try with fewer labels
+            for n in range(n_labels - 1, 0, -1):
+                sampled_labels = random.sample(self.label_id_list, n)
+                available_cases = self._find_cases_with_labels(sampled_labels)
+                if len(available_cases) >= 2:
+                    break
+
+        if len(available_cases) < 2:
+            raise RuntimeError(f"Not enough cases with labels {sampled_labels}")
+
+        # Sample random colors for each label
+        color_map = self._sample_random_colors(len(sampled_labels))
+
+        # Sample target case
+        target_case_id = random.choice(available_cases)
+
+        # Load target with colored mask
+        target_img, target_label = self._create_colored_mask(
+            target_case_id, sampled_labels, axis, color_map
+        )
+        target_img = self._normalize_image(target_img)
+
+        # Load target features if requested (use first label's features)
+        target_features = None
+        if self.load_dinov3_features:
+            target_features = self._load_features(target_case_id, sampled_labels[0], axis)
+
+        # Sample context cases (excluding target)
+        context_candidates = [c for c in available_cases if c != target_case_id]
+        k = min(self.context_size, len(context_candidates))
+        if self.random_context:
+            context_case_ids = random.sample(context_candidates, k)
+        else:
+            context_case_ids = context_candidates[:k]
+
+        # Load context slices with same color mapping
+        context_imgs = []
+        context_labels = []
+        context_features_list = []
+        valid_context_ids = []
+
+        for ctx_case_id in context_case_ids:
+            try:
+                ctx_img, ctx_label = self._create_colored_mask(
+                    ctx_case_id, sampled_labels, axis, color_map
+                )
+                ctx_img = self._normalize_image(ctx_img)
+
+                # Load context features if requested
+                ctx_features = None
+                if self.load_dinov3_features:
+                    ctx_features = self._load_features(ctx_case_id, sampled_labels[0], axis)
+
+                context_imgs.append(ctx_img)
+                context_labels.append(ctx_label)
+                if ctx_features is not None:
+                    context_features_list.append(ctx_features)
+                valid_context_ids.append(ctx_case_id)
+            except Exception as e:
+                print(f"Warning: Failed to load colored mask for {ctx_case_id}: {e}")
+                continue
+
+        if len(context_imgs) == 0:
+            raise RuntimeError(f"Failed to load any context for labels {sampled_labels}")
+
+        # Resize if needed
+        if self.image_size is not None:
+            target_img = self._resize(target_img, self.image_size, mode="bilinear")
+            target_label = self._resize_multichannel(target_label, self.image_size, mode="nearest")
+            context_imgs = [self._resize(c, self.image_size, mode="bilinear") for c in context_imgs]
+            context_labels = [self._resize_multichannel(c, self.image_size, mode="nearest") for c in context_labels]
+
+        # Convert to tensors
+        target_in = torch.from_numpy(target_img).unsqueeze(0)  # [1, H, W]
+        target_out = torch.from_numpy(target_label)  # [3, H, W]
+        context_in = torch.stack([torch.from_numpy(c).unsqueeze(0) for c in context_imgs])  # [k, 1, H, W]
+        context_out = torch.stack([torch.from_numpy(c) for c in context_labels])  # [k, 3, H, W]
+
+        result = {
+            "image": target_in,
+            "label": target_out,
+            "context_in": context_in,
+            "context_out": context_out,
+            "target_case_id": target_case_id,
+            "context_case_ids": valid_context_ids,
+            "label_id": sampled_labels,  # List of label IDs
+            "axis": axis,
+            "color_map": color_map,  # For visualization/debugging
+        }
+
+        # Add features if loaded
+        if self.load_dinov3_features:
+            if target_features is not None:
+                result["target_features"] = torch.from_numpy(target_features)
+            if context_features_list:
+                result["context_features"] = torch.stack(
+                    [torch.from_numpy(f) for f in context_features_list]
+                )
+
+        return result
+
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Custom collate function for batching."""
+    """Custom collate function for batching.
+
+    Handles both single-label (1-channel) and random coloring (3-channel) modes.
+    """
     result = {
         "image": torch.stack([item["image"] for item in batch]),  # [B, 1, H, W]
-        "label": torch.stack([item["label"] for item in batch]),  # [B, 1, H, W]
+        "label": torch.stack([item["label"] for item in batch]),  # [B, C, H, W] C=1 or 3
         "context_in": torch.stack([item["context_in"] for item in batch]),  # [B, k, 1, H, W]
-        "context_out": torch.stack([item["context_out"] for item in batch]),  # [B, k, 1, H, W]
+        "context_out": torch.stack([item["context_out"] for item in batch]),  # [B, k, C, H, W]
         "target_case_ids": [item["target_case_id"] for item in batch],
         "context_case_ids": [item["context_case_ids"] for item in batch],
-        "label_ids": [item["label_id"] for item in batch],
+        "label_ids": [item["label_id"] for item in batch],  # str or List[str]
         "axes": [item["axis"] for item in batch],
     }
+
+    # Add color_map if present (random coloring mode)
+    if "color_map" in batch[0]:
+        result["color_maps"] = [item["color_map"] for item in batch]
 
     # Add features if present in batch
     if "target_features" in batch[0]:
@@ -414,6 +670,7 @@ def get_dataloader(
     split: Optional[str] = None,
     shuffle: bool = True,
     load_dinov3_features: bool = False,
+    random_coloring_nb: int = 0,
     **dataset_kwargs,
 ) -> DataLoader:
     """
@@ -432,6 +689,9 @@ def get_dataloader(
         split: 'train', 'val', or 'test'
         shuffle: Whether to shuffle
         load_dinov3_features: If True, load pre-computed DINOv3 features
+        random_coloring_nb: Number of labels to sample for random coloring mode.
+            If > 0, returns 3-channel RGB masks with random colors per label.
+            If 0, uses standard single-label binary masks (default).
         **dataset_kwargs: Additional args for TotalSeg2DDataset
 
     Returns:
@@ -447,6 +707,7 @@ def get_dataloader(
         bbox_padding=bbox_padding,
         split=split,
         load_dinov3_features=load_dinov3_features,
+        random_coloring_nb=random_coloring_nb,
         **dataset_kwargs,
     )
 

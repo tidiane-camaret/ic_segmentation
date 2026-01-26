@@ -117,16 +117,17 @@ class PatchAggregator(nn.Module):
         Aggregate patch predictions back to a full mask.
 
         Args:
-            patch_logits: [B, K, 1, ps, ps] - predictions for each patch
+            patch_logits: [B, K, C, ps, ps] - predictions for each patch (C=1 or C=3)
             coords: [B, K, 2] - patch coordinates (top-left corner)
             output_size: (H, W) - output mask size
-            prev_pred: [B, 1, H, W] - previous level prediction (optional)
+            prev_pred: [B, C, H, W] - previous level prediction (optional)
 
         Returns:
-            aggregated: [B, 1, H, W] - aggregated prediction at output_size
+            aggregated: [B, C, H, W] - aggregated prediction at output_size
         """
         B = patch_logits.shape[0]
         K = patch_logits.shape[1]
+        C = patch_logits.shape[2]  # Number of mask channels (1 or 3)
         ps = self.patch_size
         H, W = output_size
         device = patch_logits.device
@@ -134,9 +135,9 @@ class PatchAggregator(nn.Module):
         # Compute per-pixel weights for patches
         weights = self._compute_patch_weights(patch_logits, coords, output_size)
 
-        # Initialize output and count tensors
-        output = torch.zeros(B, 1, H, W, device=device)
-        counts = torch.zeros(B, 1, H, W, device=device)
+        # Initialize output and count tensors with dynamic channels
+        output = torch.zeros(B, C, H, W, device=device)
+        counts = torch.zeros(B, C, H, W, device=device)
 
         # Place patches back with weights
         for b in range(B):
@@ -309,6 +310,7 @@ class LearnedAggregator(PatchAggregator):
         self,
         patch_size: int,
         hidden_dim: int = 32,
+        num_mask_channels: int = 1,
         combine_mode: str = "coverage",
         combine_weight: float = 0.5,
         fill_uncovered: str = "zero",
@@ -318,16 +320,19 @@ class LearnedAggregator(PatchAggregator):
         Args:
             patch_size: Size of patches
             hidden_dim: Hidden dimension for weight predictor
+            num_mask_channels: Number of mask channels (1 for binary, 3 for RGB)
             combine_mode: How to combine with previous prediction
             combine_weight: Weight for current prediction
             fill_uncovered: How to fill uncovered regions (when no prev_pred)
             min_coverage: Minimum coverage threshold
         """
         super().__init__(patch_size, combine_mode, combine_weight, fill_uncovered, min_coverage)
+        self.num_mask_channels = num_mask_channels
 
         # Small CNN to predict weights from patch logits
+        # Input channels match mask channels for flexibility
         self.weight_predictor = nn.Sequential(
-            nn.Conv2d(1, hidden_dim, kernel_size=3, padding=1),
+            nn.Conv2d(num_mask_channels, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -344,10 +349,10 @@ class LearnedAggregator(PatchAggregator):
         """Predict weights using learned CNN."""
         B, K, C, ps_h, ps_w = patch_logits.shape
 
-        # Reshape for CNN: [B*K, 1, ps, ps]
+        # Reshape for CNN: [B*K, C, ps, ps]
         logits_flat = patch_logits.view(B * K, C, ps_h, ps_w)
 
-        # Predict weights
+        # Predict weights (output is single-channel, applied to all mask channels)
         weights_flat = self.weight_predictor(logits_flat)
 
         # Reshape back: [B, K, 1, ps, ps]
@@ -371,19 +376,23 @@ class LearnedCombineAggregator(PatchAggregator):
         self,
         patch_size: int,
         hidden_dim: int = 16,
+        num_mask_channels: int = 1,
     ):
         """
         Args:
             patch_size: Size of patches
             hidden_dim: Hidden dimension for blend weight predictor
+            num_mask_channels: Number of mask channels (1 for binary, 3 for RGB)
         """
         super().__init__(patch_size, combine_mode="weighted")
+        self.num_mask_channels = num_mask_channels
 
         # Network to predict blend weights from both predictions
+        # Input: 2 * num_mask_channels (current + prev concatenated)
         self.blend_predictor = nn.Sequential(
-            nn.Conv2d(2, hidden_dim, kernel_size=3, padding=1),
+            nn.Conv2d(2 * num_mask_channels, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+            nn.Conv2d(hidden_dim, num_mask_channels, kernel_size=1),
             nn.Sigmoid(),  # Output blend weight for current pred in [0, 1]
         )
 
@@ -394,11 +403,11 @@ class LearnedCombineAggregator(PatchAggregator):
         counts: torch.Tensor,
     ) -> torch.Tensor:
         """Learn spatially-varying blend weights."""
-        # Concatenate both predictions
-        combined_input = torch.cat([aggregated, prev_pred], dim=1)  # [B, 2, H, W]
+        # Concatenate both predictions: [B, 2*C, H, W]
+        combined_input = torch.cat([aggregated, prev_pred], dim=1)
 
-        # Predict blend weight for current prediction
-        blend_weight = self.blend_predictor(combined_input)  # [B, 1, H, W]
+        # Predict blend weight for current prediction: [B, C, H, W]
+        blend_weight = self.blend_predictor(combined_input)
 
         # Weighted combination
         return blend_weight * aggregated + (1 - blend_weight) * prev_pred
@@ -425,6 +434,7 @@ def create_aggregator(
             - combine_weight: weight for current pred when combine_mode="average"
             - fill_uncovered: "prev" (NMSW style) or "zero"
             - min_coverage: threshold for coverage detection
+            - num_mask_channels: number of mask channels (1 for binary, 3 for RGB)
 
     Returns:
         PatchAggregator instance
@@ -434,6 +444,7 @@ def create_aggregator(
     combine_weight = kwargs.get('combine_weight', 0.5)
     fill_uncovered = kwargs.get('fill_uncovered', 'zero')
     min_coverage = kwargs.get('min_coverage', 1e-6)
+    num_mask_channels = kwargs.get('num_mask_channels', 1)
 
     if aggregator_type == "gaussian":
         return GaussianAggregator(
@@ -457,6 +468,7 @@ def create_aggregator(
         return LearnedAggregator(
             patch_size=patch_size,
             hidden_dim=kwargs.get('hidden_dim', 32),
+            num_mask_channels=num_mask_channels,
             combine_mode=combine_mode,
             combine_weight=combine_weight,
             fill_uncovered=fill_uncovered,
@@ -466,6 +478,7 @@ def create_aggregator(
         return LearnedCombineAggregator(
             patch_size=patch_size,
             hidden_dim=kwargs.get('hidden_dim', 16),
+            num_mask_channels=num_mask_channels,
         )
     else:  # Default: "average"
         return PatchAggregator(

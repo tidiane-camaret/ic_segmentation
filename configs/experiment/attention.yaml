@@ -4,12 +4,13 @@
 
 train_batch_size: 64 
 val_batch_size: 64
-max_ds_len: 10000 
+#max_ds_len: 10000 
 
 
-train_label_ids: ["liver"]
-val_label_ids: ["liver"]
+train_label_ids: ['colon', 'costal_cartilages', 'duodenum', 'iliopsoas_right', 'inferior_vena_cava', 'kidney_left', 'kidney_right', 'lung_middle_lobe_right', 'pancreas', 'scapula_left', 'small_bowel', 'spleen', 'sternum', 'stomach', 'trachea', 'vertebrae_T10', 'vertebrae_T11', 'vertebrae_T12', 'vertebrae_T3', 'vertebrae_T4', 'vertebrae_T5', 'vertebrae_T9']
+val_label_ids: ['aorta', 'autochthon_left', 'autochthon_right', 'esophagus', 'heart', 'iliopsoas_left', 'liver', 'lung_lower_lobe_left', 'lung_lower_lobe_right', 'lung_upper_lobe_left', 'lung_upper_lobe_right', 'scapula_right', 'spinal_cord', 'vertebrae_L1', 'vertebrae_T7', 'vertebrae_T8']
 context_size: 1
+random_coloring_nb: 10  # 0: single-label binary masks, >0: multi-label RGB masks with N random labels
 
 method: "patch_icl"
 
@@ -25,10 +26,10 @@ model:
 
     loss:
       patch_loss:
-        type: "binarycrossentropy"
+        type: "smoothl1"
         args: null
       aggreg_loss:
-        type: "dice"
+        type: "smoothl1"
         args: null
       weights:
         default:
@@ -36,10 +37,14 @@ model:
           target_aggreg: 1
           context_patch: 1
           context_aggreg: 1
+          context_patch: 0
+          context_aggreg: 0
           feature_patch: 0
           feature_aggreg: 0
           context_feature_patch: 0
           context_feature_aggreg: 0
+#    oracle_levels_train: [true]
+#    oracle_levels_valid: [false]
 
 
 
