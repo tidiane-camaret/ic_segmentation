@@ -214,11 +214,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
                 f"TargetPatch: {total_target_patch / (idx + 1):.4f} | "
                 f"TargetAggreg: {total_target_aggreg / (idx + 1):.4f} | "
                 f"ContextPatch: {total_context_patch / (idx + 1):.4f} | "
-                f"ContextAggreg: {total_context_aggreg / (idx + 1):.4f} | "
-                f"FeatPatch: {total_feature_patch / (idx + 1):.4f} | "
-                f"FeatAggreg: {total_feature_aggreg / (idx + 1):.4f} | "
-                f"CtxFeatPatch: {total_context_feature_patch / (idx + 1):.4f} | "
-                f"CtxFeatAggreg: {total_context_feature_aggreg / (idx + 1):.4f}"
+                f"ContextAggreg: {total_context_aggreg / (idx + 1):.4f}"
             )
 
     n = len(train_loader)
