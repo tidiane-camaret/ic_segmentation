@@ -364,6 +364,8 @@ if self.training:
 | Position embedding scale mismatch | **High** | Bug | DONE (actual_image_size param) |
 | Output size mismatch | **High** | Bug | DONE (target_size in SegmentationHead) |
 | embed_dim mismatch | **High** | Config | DONE (768→1024 for DINOv3 ViT-L) |
+| 1D sequential RoPE ignores spatial layout | **High** | Architecture | DONE (2D RoPE with coords) |
+| Flattened features lose spatial structure | **High** | Architecture | DONE (spatial grid preservation) |
 | 2D-only (project needs 3D) | **High** | Scope | TODO |
 | Single level active in config | **Medium** | Configuration | TODO |
 | Naive aggregation | **Medium** | Architecture | DONE (modular PatchAggregator) |
@@ -395,6 +397,61 @@ if self.training:
 
 ---
 
+## Architecture Improvements (2026-01-26)
+
+### 2D RoPE (Rotary Position Embeddings)
+
+**Location**: `src/models/backbone.py:150-240`
+
+**Problem**: Original 1D RoPE used sequential patch indices (0, 1, 2, ...) regardless of actual spatial location. Two patches at the same (x, y) position but different sequence positions received different positional encodings.
+
+**Solution**: Implemented 2D spatial RoPE:
+```python
+def build_rope_cache_2d(max_pos, dim):
+    # Precomputes sin/cos for spatial positions
+    # Cache shape: [max_pos, dim/4, 2]
+
+def apply_rope_2d(x, coords, rope_cache, image_size):
+    # First half of embedding rotated by x-coordinate
+    # Second half rotated by y-coordinate
+    # Coordinates normalized to [0, max_pos) range
+```
+
+**Usage**: Enabled by default with `use_rope_2d=True` parameter. Falls back to 1D sequential RoPE if `coords=None`.
+
+**Benefits**:
+- Patches at same spatial location get same positional encoding
+- Nearby patches have similar positional encodings (locality preserved)
+- Works with arbitrary patch orderings in sequence
+
+### Spatial Feature Grid Preservation
+
+**Location**: `src/models/backbone.py:49-130` (SegmentationHead), `src/models/backbone.py:477-487` (forward)
+
+**Problem**: After cross-patch attention, features were flattened to `[B, K, nb_features*D]`. The `SegmentationHead` started from 1×1 spatial and upsampled 16×, losing the inherent 7×7 spatial structure of DINO features (49 tokens per patch).
+
+**Solution**: Reshape features to spatial grid before segmentation head:
+```python
+# After attention output: [B, K, 2548]  (49 * 52)
+output = output.view(B, K, NF, D)           # [B, K, 49, 52]
+output = output.permute(0, 1, 3, 2)         # [B, K, 52, 49]
+output = output.view(B, K, D, h, w)         # [B, K, 52, 7, 7]
+mask_pred = self.mask_proj_out(output, target_size=self.patch_size)
+```
+
+**SegmentationHead changes**:
+- New parameter `feature_grid_size` (default 7 for 7×7 = 49 features)
+- Input changed from `[B, K, embed_dim]` to `[B, K, D, h, w]`
+- Dynamic upsampling: calculates blocks needed based on `patch_size / feature_grid_size`
+- Added `target_size` parameter to ensure output matches expected patch size
+
+**Benefits**:
+- Preserves spatial structure from DINO features
+- CNN decoder can leverage local correlations
+- Avoids aggressive upsampling from 1×1
+
+---
+
 ## Priority Action Items
 
 ### Immediate (before next training run)
@@ -416,8 +473,10 @@ if self.training:
 
 ### Medium-term (architecture improvements)
 14. [x] Implement `GumbelSoftmaxSampler` for differentiable patch selection
-15. [ ] Add explicit context cross-attention
-16. [ ] Extend to 3D
+15. [x] Implement 2D RoPE for spatial-aware positional encoding
+16. [x] Preserve spatial feature grid in SegmentationHead (7×7 → patch_size)
+17. [ ] Add explicit context cross-attention
+18. [ ] Extend to 3D
 
 ---
 
@@ -428,3 +487,5 @@ if self.training:
 *Updated: 2026-01-20 - Implemented modular PatchAggregator with gaussian/confidence/learned options*
 *Updated: 2026-01-21 - Fixed embed_dim, position embedding, output size, warmup scheduler, feature passing, vectorized extraction*
 *Updated: 2026-01-21 - Separated oracle_levels into train/valid configs*
+*Updated: 2026-01-26 - Implemented 2D RoPE for spatial-aware positional encoding*
+*Updated: 2026-01-26 - Added spatial feature grid preservation in SegmentationHead*

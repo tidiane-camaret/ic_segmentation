@@ -47,70 +47,74 @@ class MaskEncoder(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    """Decoder head with CNN upsampling."""
+    """Decoder head with CNN upsampling from spatial feature grid."""
 
     def __init__(
         self,
         embed_dim: int = 1024,
         num_classes: int = 1,
         patch_size: int = 16,
+        feature_grid_size: int = 7,
     ):
+        """
+        Args:
+            embed_dim: Input feature dimension
+            num_classes: Number of output classes
+            patch_size: Target output patch size
+            feature_grid_size: Spatial size of input features (e.g., 7 for 7x7 grid)
+        """
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
+        self.feature_grid_size = feature_grid_size
 
-        # Decoder with upsampling (4 x 2x upsamples = 16x total for patch_size=16)
-        self.decoder = nn.Sequential(
-            nn.Conv2d(embed_dim, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        # Calculate required upsampling factor
+        # From feature_grid_size to patch_size
+        upsample_factor = patch_size / feature_grid_size  # e.g., 112/7 = 16
 
-            nn.Conv2d(512, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        # Build decoder with appropriate upsampling
+        # Each block does 2x upsample, so we need log2(upsample_factor) blocks
+        num_upsample_blocks = max(1, int(math.log2(upsample_factor)))
 
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        layers = []
+        in_channels = embed_dim
+        channel_schedule = [512, 256, 128, 64]  # Channel reduction schedule
 
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        for i in range(num_upsample_blocks):
+            out_channels = channel_schedule[min(i, len(channel_schedule) - 1)]
+            layers.extend([
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            ])
+            in_channels = out_channels
 
-            nn.Conv2d(64, num_classes, kernel_size=1),
-        )
+        # Final conv to num_classes
+        layers.append(nn.Conv2d(in_channels, num_classes, kernel_size=1))
+
+        self.decoder = nn.Sequential(*layers)
 
     def forward(
         self,
         patch_features: torch.Tensor,
-        h: int,
-        w: int,
-        num_patches: int = 1,
         target_size: int | None = None,
     ):
         """
         Args:
-            patch_features: [B, total_tokens, embed_dim] where total_tokens = K * tokens_per_patch
-            h, w: spatial grid dimensions of tokens within a single patch
-            num_patches: K, number of patches per example
-            target_size: Target output size (H=W). If None, uses h*16.
+            patch_features: [B, K, D, h, w] - spatial feature grid per patch
+            target_size: Target output size (H=W). If None, uses decoder output size.
 
         Returns:
             [B, K, num_classes, target_size, target_size]
         """
-        B, _, C = patch_features.shape
-        tokens_per_patch = h * w
+        B, K, D, h, w = patch_features.shape
 
-        # Reshape to [B*K, tokens_per_patch, embed_dim] for per-patch decoding
-        patch_features = patch_features.reshape(B * num_patches, tokens_per_patch, C)
+        # Reshape to [B*K, D, h, w] for per-patch decoding
+        x = patch_features.reshape(B * K, D, h, w)
 
-        # Reshape to spatial grid and decode
-        feature_map = patch_features.transpose(1, 2).reshape(B * num_patches, C, h, w)
-        output = self.decoder(feature_map)
+        # Forward through decoder
+        output = self.decoder(x)  # [B*K, num_classes, H_out, W_out]
 
         # Resize to target size if specified and different from output
         _, nc, H, W = output.shape
@@ -121,7 +125,7 @@ class SegmentationHead(nn.Module):
             H, W = target_size, target_size
 
         # Reshape to [B, K, num_classes, H, W]
-        output = output.reshape(B, num_patches, nc, H, W)
+        output = output.reshape(B, K, nc, H, W)
 
         return output
 
@@ -155,6 +159,99 @@ def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
     return torch.stack([out0, out1], dim=-1).view(*x.shape)
 
 
+def build_rope_cache_2d(max_pos: int, dim: int, base: float = 10000.0) -> torch.Tensor:
+    """
+    Precompute 2D RoPE sin/cos cache for spatial positions.
+
+    Splits dim in half: first half for x-position, second half for y-position.
+
+    Args:
+        max_pos: Maximum position value in either dimension
+        dim: Total embedding dimension (must be divisible by 4)
+        base: Base for frequency computation
+
+    Returns:
+        rope_cache: [max_pos, dim/4, 2] - sin/cos for each position
+    """
+    assert dim % 4 == 0, f"dim must be divisible by 4 for 2D RoPE, got {dim}"
+    half_dim = dim // 2  # Each spatial dimension gets half
+
+    # Frequencies for half the dimension (since we split x and y)
+    theta = 1.0 / (base ** (torch.arange(0, half_dim, 2).float() / half_dim))
+    positions = torch.arange(max_pos).float()
+    freqs = torch.einsum("i,j->ij", positions, theta)  # [max_pos, dim/4]
+    return torch.stack([freqs.cos(), freqs.sin()], dim=-1)  # [max_pos, dim/4, 2]
+
+
+def apply_rope_2d(
+    x: torch.Tensor,
+    coords: torch.Tensor,
+    rope_cache: torch.Tensor,
+    image_size: int,
+) -> torch.Tensor:
+    """
+    Apply 2D rotary position embedding based on spatial coordinates.
+
+    Splits embedding in half: first half rotated by x-coord, second half by y-coord.
+
+    Args:
+        x: [B, K, dim] - Input tokens
+        coords: [B, K, 2] - Patch coordinates (y, x) in pixel space
+        rope_cache: [max_pos, dim/4, 2] - Precomputed sin/cos cache
+        image_size: Image size for normalizing coordinates
+
+    Returns:
+        x with 2D positional rotations applied: [B, K, dim]
+    """
+    B, K, D = x.shape
+    device = x.device
+    half_dim = D // 2
+    quarter_dim = D // 4
+
+    # Normalize coordinates to [0, max_pos) range
+    # coords are (y, x) in pixel space, normalize by image_size
+    max_pos = rope_cache.shape[0]
+    coords_normalized = (coords.float() / image_size * (max_pos - 1)).clamp(0, max_pos - 1)
+
+    # Get integer positions for indexing
+    y_pos = coords_normalized[:, :, 0].long()  # [B, K]
+    x_pos = coords_normalized[:, :, 1].long()  # [B, K]
+
+    # Fetch sin/cos for each position
+    rope_cache = rope_cache.to(device)
+
+    # Index into cache: [B, K, dim/4, 2]
+    y_rope = rope_cache[y_pos]  # [B, K, dim/4, 2]
+    x_rope = rope_cache[x_pos]  # [B, K, dim/4, 2]
+
+    # Split input into x-half and y-half
+    x_part = x[:, :, :half_dim]  # [B, K, dim/2] - rotated by x-coord
+    y_part = x[:, :, half_dim:]  # [B, K, dim/2] - rotated by y-coord
+
+    # Reshape for rotation: [B, K, dim/4, 2]
+    x_part = x_part.view(B, K, quarter_dim, 2)
+    y_part = y_part.view(B, K, quarter_dim, 2)
+
+    # Extract cos/sin
+    x_cos, x_sin = x_rope[..., 0], x_rope[..., 1]  # [B, K, dim/4]
+    y_cos, y_sin = y_rope[..., 0], y_rope[..., 1]  # [B, K, dim/4]
+
+    # Apply rotation to x-part using x-coordinates
+    x0, x1 = x_part[..., 0], x_part[..., 1]  # [B, K, dim/4]
+    x_out0 = x0 * x_cos - x1 * x_sin
+    x_out1 = x0 * x_sin + x1 * x_cos
+    x_rotated = torch.stack([x_out0, x_out1], dim=-1).view(B, K, half_dim)
+
+    # Apply rotation to y-part using y-coordinates
+    y0, y1 = y_part[..., 0], y_part[..., 1]  # [B, K, dim/4]
+    y_out0 = y0 * y_cos - y1 * y_sin
+    y_out1 = y0 * y_sin + y1 * y_cos
+    y_rotated = torch.stack([y_out0, y_out1], dim=-1).view(B, K, half_dim)
+
+    # Concatenate back
+    return torch.cat([x_rotated, y_rotated], dim=-1)
+
+
 class CrossPatchAttentionBackbone(nn.Module):
     """
     Treats tgt/ctx patches as val/train examples.
@@ -169,11 +266,15 @@ class CrossPatchAttentionBackbone(nn.Module):
     def __init__(
         self,
         embed_dim: int = 1024,
+        embed_proj_dim: int = 52,
+        nb_features_per_patch: int = 49,
         patch_size: int = 16,
         image_size: int = 224,
         num_classes: int = 1,
         dropout: float = 0.1,
         max_seq_len: int = 1024,
+        use_rope_2d: bool = True,
+        num_registers: int = 4,
     ):
         """
         Args:
@@ -183,37 +284,69 @@ class CrossPatchAttentionBackbone(nn.Module):
             num_classes: Number of segmentation classes
             dropout: Dropout rate
             max_seq_len: Maximum sequence length for RoPE cache
+            use_rope_2d: If True, use 2D RoPE based on spatial coords. If False, use 1D sequential RoPE.
+            num_registers: Number of register tokens (0 to disable). Registers act as global
+                information aggregators and attention sinks, treated as context tokens.
         """
         super().__init__()
         self.embed_dim = embed_dim
+        self.embed_proj_dim = embed_proj_dim
+        self.nb_features_per_patch = nb_features_per_patch
         self.patch_size = patch_size
         self.image_size = image_size
         self.num_classes = num_classes
         self.dropout = dropout
+        self.use_rope_2d = use_rope_2d
+        self.num_registers = num_registers
+
+        self.token_dim = nb_features_per_patch * embed_proj_dim
 
         # Target/context type embeddings
-        self.target_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
-        self.context_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.target_embed = nn.Parameter(torch.randn(1, 1, self.token_dim) * 0.02)
+        self.context_embed = nn.Parameter(torch.randn(1, 1, self.token_dim) * 0.02)
 
         # Learnable mask token for masked inputs (applied in embed_dim space)
-        self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.mask_token = nn.Parameter(torch.randn(1, 1, self.token_dim) * 0.02)
 
-        # Output projection: embed_dim -> 1 (binary mask logit per patch)
-        self.mask_proj_out = nn.Linear(embed_dim, 1)
+        # Register tokens (global tokens that act as attention sinks and info aggregators)
+        # Treated as context tokens: participate in context self-attention,
+        # visible to target cross-attention
+        if num_registers > 0:
+            self.register_tokens = nn.Parameter(
+                torch.randn(1, num_registers, self.token_dim) * 0.02
+            )
+        else:
+            self.register_tokens = None
 
         # RoPE cache (registered as buffer, not parameter)
-        rope_cache = build_rope_cache(max_seq_len, embed_dim)
+        # 2D RoPE requires dim divisible by 4
+        if use_rope_2d:
+            # For 2D RoPE, max_seq_len represents max position in either dimension
+            rope_cache = build_rope_cache_2d(max_seq_len, self.token_dim)
+        else:
+            rope_cache = build_rope_cache(max_seq_len, self.token_dim)
         self.register_buffer("rope_cache", rope_cache, persistent=False)
 
-        # Simple per-patch MLP (no attention)
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.Dropout(dropout),
+        # attention module
+        self.context_target_attn = ContextTargetAttention(
+            embed_dim=self.token_dim,
+            num_heads=14,
+            append_zero_attn=True,
         )
+
+        # Feature grid size (sqrt of nb_features_per_patch)
+        self.feature_grid_size = int(math.sqrt(nb_features_per_patch))
+        assert self.feature_grid_size ** 2 == nb_features_per_patch, \
+            f"nb_features_per_patch must be a perfect square, got {nb_features_per_patch}"
+
+        self.mask_proj_out = SegmentationHead(
+            embed_dim=embed_proj_dim,  # D dimension after projection
+            num_classes=1,
+            patch_size=patch_size,
+            feature_grid_size=self.feature_grid_size,
+        )
+
+        self.embed_proj_in = nn.Linear(embed_dim , embed_proj_dim)
 
     def _compute_token_mask(
         self,
@@ -313,14 +446,25 @@ class CrossPatchAttentionBackbone(nn.Module):
         Returns:
             Dict with mask_patch_logit_preds [B, K, 1] and img_patches
         """
-        B, K = img_patches.shape[:2]
+
+        #print("CrossPatchAttentionBackbone img_patches shape (B, K, T, D):", img_patches.shape)
+        B, K, NF, E = img_patches.shape
         device = img_patches.device
 
+        # Project embedding dimemsion
+        img_patches = img_patches.view(B * K * NF, E)
+        img_patches = self.embed_proj_in(img_patches)
+        img_patches = img_patches.view(B, K, NF , -1)
+
+        """
         # Average pool over tokens within each patch: [B, K, tokens, D] -> [B, K, D]
         if img_patches.dim() == 4:
             img_tokens = img_patches.mean(dim=2)  # [B, K, embed_dim]
         else:
             img_tokens = img_patches  # Already [B, K, embed_dim]
+        """
+        # Flatten features within each patch: [B, K, nb_features, D] -> [B, K, nb_features*D]
+        img_tokens = img_patches.reshape(B, K, NF * img_patches.shape[-1])  # [B, K, nb_features*D]
 
         # Determine context vs target
         if ctx_id_labels is not None:
@@ -337,14 +481,41 @@ class CrossPatchAttentionBackbone(nn.Module):
         )
         combined = img_tokens + type_embed
 
-        # Apply RoPE
-        combined = apply_rope(combined, self.rope_cache)
+        # Apply RoPE (2D if coords available and enabled, else 1D sequential)
+        if self.use_rope_2d and coords is not None:
+            combined = apply_rope_2d(combined, coords, self.rope_cache, self.image_size)
+        else:
+            combined = apply_rope(combined, self.rope_cache)
 
-        # Simple per-patch MLP (no cross-patch attention)
-        output = combined + self.mlp(combined)
+        # Prepend register tokens (treated as context)
+        # Registers don't get RoPE (they have no spatial position)
+        if self.register_tokens is not None:
+            registers = self.register_tokens.expand(B, -1, -1)  # [B, num_reg, token_dim]
+            # Add context embedding to registers
+            registers = registers + self.context_embed.expand(B, self.num_registers, -1)
+            combined = torch.cat([registers, combined], dim=1)  # [B, num_reg + K, token_dim]
+            # Extend is_context mask: registers are context
+            reg_mask = torch.ones(B, self.num_registers, dtype=torch.bool, device=device)
+            is_context = torch.cat([reg_mask, is_context], dim=1)  # [B, num_reg + K]
 
-        # Project to output
-        mask_pred = self.mask_proj_out(output)
+        # Apply cross-patch attention
+        output = self.context_target_attn(combined, is_context)
+
+        # Remove register outputs (keep only patch outputs)
+        if self.register_tokens is not None:
+            output = output[:, self.num_registers:]  # [B, K, token_dim]
+
+        # reshape [B, K, nb_features*D] -> [B, K, nb_features, D]
+        D = self.embed_proj_dim
+        output = output.view(B, K, NF, D)
+
+        # Reshape to spatial dims for segmentation head: [B, K, NF, D] -> [B, K, D, h, w]
+        h = w = self.feature_grid_size  # e.g., 7 for 49 features
+        output = output.permute(0, 1, 3, 2)  # [B, K, D, NF]
+        output = output.view(B, K, D, h, w)  # [B, K, D, h, w]
+
+        # Project to output with explicit target size to match patch_size
+        mask_pred = self.mask_proj_out(output, target_size=self.patch_size)
 
         return {
             'mask_patch_logit_preds': mask_pred,

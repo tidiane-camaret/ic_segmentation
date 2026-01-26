@@ -396,6 +396,7 @@ class PatchICL_Level(nn.Module):
         if self.sampler.augmenter is not None and aug_params:
             patch_logits_for_agg = self.sampler.augmenter.inverse(patch_logits, aug_params)
 
+        #print("PatchICL_Level forward: patch_logits_for_agg shape:", patch_logits_for_agg.shape)
         # Aggregate to full prediction
         pred = self.aggregate(patch_logits_for_agg, coords, (self.resolution, self.resolution))
 

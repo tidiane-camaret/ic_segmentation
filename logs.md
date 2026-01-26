@@ -105,3 +105,49 @@ Aggregate → Final prediction [128³]
 - `src/models/patch_icl.py`: Separate train/valid oracle, vectorized extraction
 
 **Training now runs successfully.**
+
+## 2026-01-26: CrossPatchAttentionBackbone Improvements
+
+### 2D RoPE (Rotary Position Embeddings)
+
+**Problem:** Original RoPE used sequential patch indices (0, 1, 2, ...) regardless of actual spatial location. Patches at the same (x, y) position but different sequence positions got different embeddings.
+
+**Solution:** Implemented 2D RoPE that uses actual patch coordinates:
+- `build_rope_cache_2d(max_pos, dim)`: Precomputes sin/cos for spatial positions
+- `apply_rope_2d(x, coords, rope_cache, image_size)`: Applies 2D rotations based on coordinates
+  - First half of embedding rotated by x-coordinate
+  - Second half rotated by y-coordinate
+  - Coordinates normalized to [0, max_pos) range
+
+**Usage:** Enabled by default (`use_rope_2d=True`). Falls back to 1D RoPE if `coords=None`.
+
+```python
+# In forward():
+if self.use_rope_2d and coords is not None:
+    combined = apply_rope_2d(combined, coords, self.rope_cache, self.image_size)
+else:
+    combined = apply_rope(combined, self.rope_cache)
+```
+
+### Spatial Feature Grid for Segmentation Head
+
+**Problem:** After cross-patch attention, features were flattened `[B, K, nb_features*D]`. The `SegmentationHead` started from 1×1 spatial and upsampled, losing the inherent 7×7 spatial structure of DINO features.
+
+**Solution:** Reshape features to spatial grid before segmentation:
+```
+Attention output: [B, K, 2548]         # nb_features * D = 49 * 52
+Reshaped:         [B, K, 49, 52]       # Separate spatial and channel dims
+Spatial:          [B, K, 52, 7, 7]     # Permute to [B, K, D, h, w]
+```
+
+**SegmentationHead changes:**
+- New parameter `feature_grid_size` (default 7 for 7×7 = 49 features)
+- Input changed from `[B, K, embed_dim]` to `[B, K, D, h, w]`
+- Dynamic upsampling: calculates blocks needed for `patch_size / feature_grid_size`
+- Preserves spatial structure throughout decoding
+
+**Files modified:**
+- `src/models/backbone.py`:
+  - Added `build_rope_cache_2d()`, `apply_rope_2d()`
+  - `CrossPatchAttentionBackbone`: Added `use_rope_2d` param, `feature_grid_size` computation
+  - `SegmentationHead`: Accepts spatial input `[B, K, D, h, w]`
