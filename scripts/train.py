@@ -6,7 +6,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import torch
 from tqdm import tqdm
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for src imports
 from src.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate
 
@@ -264,11 +264,8 @@ def main(cfg: DictConfig) -> None:
             f"TargetPatch: {train_losses.get('target_patch_loss', 0):.4f} | "
             f"TargetAggreg: {train_losses.get('target_aggreg_loss', 0):.4f} | "
             f"ContextPatch: {train_losses.get('context_patch_loss', 0):.4f} | "
-            f"ContextAggreg: {train_losses.get('context_aggreg_loss', 0):.4f} | "
-            f"FeatPatch: {train_losses.get('target_feature_patch_loss', 0):.4f} | "
-            f"FeatAggreg: {train_losses.get('target_feature_aggreg_loss', 0):.4f} | "
-            f"CtxFeatPatch: {train_losses.get('context_feature_patch_loss', 0):.4f} | "
-            f"CtxFeatAggreg: {train_losses.get('context_feature_aggreg_loss', 0):.4f}"
+            f"ContextAggreg: {train_losses.get('context_aggreg_loss', 0):.4f} "
+
         )
 
         if cfg.logging.use_wandb:

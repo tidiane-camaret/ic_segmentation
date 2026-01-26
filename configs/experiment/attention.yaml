@@ -35,8 +35,6 @@ model:
         default:
           target_patch: 1
           target_aggreg: 1
-          context_patch: 1
-          context_aggreg: 1
           context_patch: 0
           context_aggreg: 0
           feature_patch: 0
@@ -51,4 +49,4 @@ model:
 logging:
   use_wandb: true
   wandb_project: "patch_icl_train"
-  save_imgs_masks: true
+  save_imgs_masks: false
