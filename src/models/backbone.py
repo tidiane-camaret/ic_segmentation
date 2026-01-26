@@ -266,7 +266,7 @@ class CrossPatchAttentionBackbone(nn.Module):
     def __init__(
         self,
         embed_dim: int = 1024,
-        embed_proj_dim: int = 52,
+        embed_proj_dim: int = 208,
         nb_features_per_patch: int = 49,
         patch_size: int = 16,
         image_size: int = 224,

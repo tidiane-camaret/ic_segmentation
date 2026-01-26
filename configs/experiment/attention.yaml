@@ -21,6 +21,7 @@ model:
     backbone:
       type: "crosspatch_attention"
       embed_dim: 1024
+      embed_proj_dim: 208
       patch_size: 16
       image_size: 224
 
