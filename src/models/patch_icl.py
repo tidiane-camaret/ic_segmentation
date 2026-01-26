@@ -165,9 +165,10 @@ class PatchICL_Level(nn.Module):
         image: torch.Tensor,
         labels: torch.Tensor,
         weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """Select K patches based on weight map."""
-        return self.sampler(image, labels, weights)
+        patch_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
+        """Select K patches based on weight map, optionally augmenting features too."""
+        return self.sampler(image, labels, weights, patch_features)
 
     def aggregate(
         self,
@@ -184,38 +185,50 @@ class PatchICL_Level(nn.Module):
         context_in: torch.Tensor,
         context_out: torch.Tensor,
         context_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select K patches from each context image."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[dict]]]:
+        """Select K patches from each context image.
+
+        Returns:
+            context_patches: [B, K*k, C, ps, ps]
+            context_labels: [B, K*k, C_mask, ps, ps]
+            context_coords: [B, K*k, 2]
+            all_aug_params: list[list[dict]] - aug_params for each (batch, context) pair
+        """
         B, k = context_in.shape[:2]
 
         all_ctx_patches = []
         all_ctx_labels = []
         all_ctx_coords = []
+        all_aug_params = []  # [B][k] list of aug_params dicts
 
         for b in range(B):
             batch_patches = []
             batch_labels = []
             batch_coords = []
+            batch_aug_params = []
 
             for ctx_idx in range(k):
                 ctx_img = context_in[b, ctx_idx].unsqueeze(0)
                 ctx_mask = context_out[b, ctx_idx].unsqueeze(0)
                 ctx_weight = context_weights[b, ctx_idx].unsqueeze(0)
 
-                patches, labels, coords, _ = self.select_patches(ctx_img, ctx_mask, ctx_weight)
+                patches, labels, coords, _, aug_params = self.select_patches(ctx_img, ctx_mask, ctx_weight)
 
                 batch_patches.append(patches.squeeze(0))
                 batch_labels.append(labels.squeeze(0))
                 batch_coords.append(coords.squeeze(0))
+                batch_aug_params.append(aug_params)
 
             all_ctx_patches.append(torch.cat(batch_patches, dim=0))
             all_ctx_labels.append(torch.cat(batch_labels, dim=0))
             all_ctx_coords.append(torch.cat(batch_coords, dim=0))
+            all_aug_params.append(batch_aug_params)
 
         return (
             torch.stack(all_ctx_patches),
             torch.stack(all_ctx_labels),
             torch.stack(all_ctx_coords),
+            all_aug_params,
         )
 
     def _prepare_backbone_inputs(
@@ -322,14 +335,16 @@ class PatchICL_Level(nn.Module):
         if labels_ds is None:
             labels_ds = torch.zeros(B, self.num_mask_channels, self.resolution, self.resolution, device=device)
 
-        # Select target patches
-        patches, patch_labels, coords, aug_params = self.select_patches(image_ds, labels_ds, weights)
+        # Select target patches (without features for now - we'll extract and augment features after)
+        patches, patch_labels, coords, _, aug_params = self.select_patches(
+            image_ds, labels_ds, weights, None
+        )
         K = patches.shape[1]
 
         # Scale coordinates for backbone
         coords_scaled = coords.float() * original_coords_scale
 
-        # Extract target patch features from pre-computed features
+        # Extract target patch features from pre-computed features at sampled coords
         target_patch_features = None
         if target_features is not None:
             target_patch_features = extract_patch_features(
@@ -338,6 +353,11 @@ class PatchICL_Level(nn.Module):
                 patch_size=self.patch_size,
                 level_resolution=self.resolution,
             )
+            # Apply the SAME augmentation to features that was applied to patches
+            if self.sampler.augmenter is not None and aug_params:
+                target_patch_features = self.sampler.augmenter.augment_features_only(
+                    target_patch_features, aug_params
+                )
 
         # Process context if provided
         context_patches = None
@@ -361,7 +381,7 @@ class PatchICL_Level(nn.Module):
             context_weights = self._mask_to_weights(context_out_ds.view(B * k, *context_out_ds.shape[2:])).view(B, k, 1, self.resolution, self.resolution)
 
             # Select patches from context (use single-channel weights for sampling)
-            context_patches, context_patch_labels, context_coords = self._select_context_patches(
+            context_patches, context_patch_labels, context_coords, context_aug_params = self._select_context_patches(
                 context_in_ds, context_out_ds, context_weights
             )
             K_ctx = context_patches.shape[1]
@@ -369,7 +389,7 @@ class PatchICL_Level(nn.Module):
             # Scale context coordinates
             context_coords_scaled = context_coords.float() * original_coords_scale
 
-            # Extract context patch features
+            # Extract context patch features and apply the same augmentation
             context_patch_features = None
             if context_features is not None:
                 K_per_ctx = K_ctx // k
@@ -383,6 +403,24 @@ class PatchICL_Level(nn.Module):
                         patch_size=self.patch_size,
                         level_resolution=self.resolution,
                     )
+                    # Apply the SAME augmentation to context features that was applied to context patches
+                    if self.sampler.augmenter is not None:
+                        # context_aug_params is [B][k] list, we need to handle per-batch, per-context
+                        # For simplicity, apply augmentation per-batch
+                        for b in range(B):
+                            ctx_aug = context_aug_params[b][ctx_idx]
+                            if ctx_aug:
+                                # Create single-sample aug_params tensors
+                                single_aug = {}
+                                for key, val in ctx_aug.items():
+                                    if val is not None:
+                                        single_aug[key] = val  # Already [1, K_per_ctx] shape
+                                    else:
+                                        single_aug[key] = None
+                                if any(v is not None for v in single_aug.values()):
+                                    extracted[b:b+1] = self.sampler.augmenter.augment_features_only(
+                                        extracted[b:b+1], single_aug
+                                    )
                     ctx_features_list.append(extracted)
                 context_patch_features = torch.cat(ctx_features_list, dim=1)
 
@@ -403,7 +441,7 @@ class PatchICL_Level(nn.Module):
             patch_logits = all_logits[:, :K]
             context_patch_logits = all_logits[:, K:]
 
-            # Aggregate context predictions
+            # Aggregate context predictions (apply inverse augmentation first)
             K_per_ctx = K_ctx // k
             context_preds = []
             for ctx_idx in range(k):
@@ -411,6 +449,16 @@ class PatchICL_Level(nn.Module):
                 end_idx = (ctx_idx + 1) * K_per_ctx
                 ctx_logits = context_patch_logits[:, start_idx:end_idx]
                 ctx_coords_slice = context_coords[:, start_idx:end_idx]
+
+                # Apply inverse augmentation to context logits before aggregation
+                if self.sampler.augmenter is not None:
+                    for b in range(B):
+                        ctx_aug = context_aug_params[b][ctx_idx]
+                        if ctx_aug and any(v is not None for v in ctx_aug.values()):
+                            ctx_logits[b:b+1] = self.sampler.augmenter.inverse(
+                                ctx_logits[b:b+1], ctx_aug
+                            )
+
                 ctx_pred = self.aggregate(ctx_logits, ctx_coords_slice, (self.resolution, self.resolution))
                 context_preds.append(ctx_pred)
             context_pred = torch.stack(context_preds, dim=1)

@@ -84,8 +84,8 @@ model:
       # Sliding window options (only used when type: "sliding_window")
       sliding_window_stride: null  # If null, uses patch_size (no overlap)
       augmentation:
-        enabled: false
-        rotation: "none"
+        enabled: true
+        rotation: "90"
         rotation_range: 0.5
         flip_horizontal: true
         flip_vertical: true

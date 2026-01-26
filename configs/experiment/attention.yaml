@@ -18,6 +18,12 @@ model:
   patch_icl:
     sampler:
       type: "sliding_window"
+      augmentation:
+        enabled: true
+        rotation: "con"
+        rotation_range: 0.5
+        flip_horizontal: true
+        flip_vertical: true
     backbone:
       type: "crosspatch_attention"
       embed_dim: 1024
@@ -50,4 +56,4 @@ model:
 logging:
   use_wandb: true
   wandb_project: "patch_icl_train"
-  save_imgs_masks: false
+  save_imgs_masks: true

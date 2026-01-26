@@ -71,6 +71,43 @@ class PatchAugmenter(nn.Module):
 
         return result
 
+    def _rotate_features_90(
+        self,
+        features: torch.Tensor,
+        k: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Rotate feature patches by k * 90 degrees.
+
+        Features are stored as [B, K, tokens, D] where tokens form a spatial grid.
+        We reshape to spatial form, rotate, and reshape back.
+
+        Args:
+            features: [B, K, tokens, D] where tokens = h * w (e.g., 7x7=49)
+            k: [B, K] - rotation count (0, 1, 2, or 3)
+
+        Returns:
+            rotated: [B, K, tokens, D]
+        """
+        B, K, T, D = features.shape
+        h = w = int(T ** 0.5)
+        assert h * w == T, f"tokens must form a square grid, got {T}"
+
+        # Reshape to spatial: [B, K, h, w, D] -> [B, K, D, h, w]
+        spatial = features.view(B, K, h, w, D).permute(0, 1, 4, 2, 3)
+
+        # Apply rotation
+        result = spatial.clone()
+        for b in range(B):
+            for i in range(K):
+                ki = k[b, i].item()
+                if ki > 0:
+                    result[b, i] = torch.rot90(spatial[b, i], int(ki), dims=(1, 2))
+
+        # Reshape back: [B, K, D, h, w] -> [B, K, h, w, D] -> [B, K, tokens, D]
+        result = result.permute(0, 1, 3, 4, 2).reshape(B, K, T, D)
+        return result
+
     def _rotate_continuous(
         self,
         patches: torch.Tensor,
@@ -114,6 +151,56 @@ class PatchAugmenter(nn.Module):
 
         return rotated_flat.view(B, K, C, H, W)
 
+    def _rotate_features_continuous(
+        self,
+        features: torch.Tensor,
+        angles: torch.Tensor,
+        mode: str = "bilinear",
+    ) -> torch.Tensor:
+        """
+        Rotate feature patches by arbitrary angles using affine grid.
+
+        Features are stored as [B, K, tokens, D] where tokens form a spatial grid.
+        We reshape to spatial form, rotate, and reshape back.
+
+        Args:
+            features: [B, K, tokens, D] where tokens = h * w (e.g., 7x7=49)
+            angles: [B, K] - rotation angles in radians
+            mode: Interpolation mode
+
+        Returns:
+            rotated: [B, K, tokens, D]
+        """
+        B, K, T, D = features.shape
+        h = w = int(T ** 0.5)
+        assert h * w == T, f"tokens must form a square grid, got {T}"
+        device = features.device
+
+        # Reshape to spatial: [B, K, h, w, D] -> [B*K, D, h, w]
+        spatial = features.view(B, K, h, w, D).permute(0, 1, 4, 2, 3)
+        spatial_flat = spatial.view(B * K, D, h, w)
+        angles_flat = angles.view(B * K)
+
+        # Build rotation matrices
+        cos_a = torch.cos(angles_flat)
+        sin_a = torch.sin(angles_flat)
+
+        theta = torch.zeros(B * K, 2, 3, device=device)
+        theta[:, 0, 0] = cos_a
+        theta[:, 0, 1] = -sin_a
+        theta[:, 1, 0] = sin_a
+        theta[:, 1, 1] = cos_a
+
+        # Generate grid and sample
+        grid = F.affine_grid(theta, spatial_flat.shape, align_corners=False)
+        rotated_flat = F.grid_sample(
+            spatial_flat, grid, mode=mode, padding_mode="zeros", align_corners=False
+        )
+
+        # Reshape back: [B*K, D, h, w] -> [B, K, D, h, w] -> [B, K, h, w, D] -> [B, K, T, D]
+        rotated = rotated_flat.view(B, K, D, h, w).permute(0, 1, 3, 4, 2).reshape(B, K, T, D)
+        return rotated
+
     def _flip(
         self,
         patches: torch.Tensor,
@@ -145,21 +232,99 @@ class PatchAugmenter(nn.Module):
 
         return result
 
+    def _flip_features(
+        self,
+        features: torch.Tensor,
+        flip_h: torch.Tensor,
+        flip_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Flip feature patches horizontally and/or vertically.
+
+        Args:
+            features: [B, K, tokens, D] where tokens = h * w
+            flip_h: [B, K] - boolean mask for horizontal flip
+            flip_v: [B, K] - boolean mask for vertical flip
+
+        Returns:
+            flipped: [B, K, tokens, D]
+        """
+        B, K, T, D = features.shape
+        h = w = int(T ** 0.5)
+        assert h * w == T, f"tokens must form a square grid, got {T}"
+
+        # Reshape to spatial: [B, K, h, w, D]
+        spatial = features.view(B, K, h, w, D)
+        result = spatial.clone()
+
+        for b in range(B):
+            for i in range(K):
+                f = result[b, i]  # [h, w, D]
+                if flip_h[b, i]:
+                    f = torch.flip(f, dims=[1])  # Flip w dimension
+                if flip_v[b, i]:
+                    f = torch.flip(f, dims=[0])  # Flip h dimension
+                result[b, i] = f
+
+        return result.reshape(B, K, T, D)
+
+    def _scale_features(
+        self,
+        features: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Scale feature patches using grid_sample.
+
+        Args:
+            features: [B, K, tokens, D] where tokens = h * w
+            scales: [B, K] - scale factors
+
+        Returns:
+            scaled: [B, K, tokens, D]
+        """
+        B, K, T, D = features.shape
+        h = w = int(T ** 0.5)
+        assert h * w == T, f"tokens must form a square grid, got {T}"
+        device = features.device
+
+        # Reshape to spatial: [B*K, D, h, w]
+        spatial = features.view(B, K, h, w, D).permute(0, 1, 4, 2, 3)
+        spatial_flat = spatial.view(B * K, D, h, w)
+        scales_flat = scales.view(B * K)
+
+        # Build scale matrices
+        theta = torch.zeros(B * K, 2, 3, device=device)
+        theta[:, 0, 0] = scales_flat
+        theta[:, 1, 1] = scales_flat
+
+        grid = F.affine_grid(theta, spatial_flat.shape, align_corners=False)
+        scaled_flat = F.grid_sample(
+            spatial_flat, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        )
+
+        # Reshape back: [B*K, D, h, w] -> [B, K, D, h, w] -> [B, K, h, w, D] -> [B, K, T, D]
+        scaled = scaled_flat.view(B, K, D, h, w).permute(0, 1, 3, 4, 2).reshape(B, K, T, D)
+        return scaled
+
     def forward(
         self,
         patches: torch.Tensor,
         patch_labels: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        patch_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
         """
-        Apply augmentation to patches and labels.
+        Apply augmentation to patches, labels, and optionally features.
 
         Args:
             patches: [B, K, C, H, W] - image patches
             patch_labels: [B, K, C_mask, H, W] - label patches (C_mask=1 for binary, C_mask=3 for RGB)
+            patch_features: [B, K, tokens, D] - feature patches (optional), tokens form spatial grid
 
         Returns:
             aug_patches: [B, K, C, H, W]
             aug_labels: [B, K, C_mask, H, W]
+            aug_features: [B, K, tokens, D] or None
             aug_params: dict with augmentation parameters for inverse transform
         """
         B, K = patches.shape[:2]
@@ -175,10 +340,11 @@ class PatchAugmenter(nn.Module):
         }
 
         if not self.training:
-            return patches, patch_labels, aug_params
+            return patches, patch_labels, patch_features, aug_params
 
         aug_patches = patches
         aug_labels = patch_labels
+        aug_features = patch_features
 
         # Rotation
         if self.rotation == "90":
@@ -186,6 +352,8 @@ class PatchAugmenter(nn.Module):
             aug_params['rotation_k'] = k
             aug_patches = self._rotate_90(aug_patches, k)
             aug_labels = self._rotate_90(aug_labels, k)
+            if aug_features is not None:
+                aug_features = self._rotate_features_90(aug_features, k)
 
         elif self.rotation == "continuous":
             angles = torch.empty(B, K, device=device).uniform_(
@@ -194,6 +362,8 @@ class PatchAugmenter(nn.Module):
             aug_params['rotation_angles'] = angles
             aug_patches = self._rotate_continuous(aug_patches, angles, mode="bilinear")
             aug_labels = self._rotate_continuous(aug_labels, angles, mode="nearest")
+            if aug_features is not None:
+                aug_features = self._rotate_features_continuous(aug_features, angles, mode="bilinear")
 
         # Flipping
         if self.flip_horizontal or self.flip_vertical:
@@ -209,6 +379,8 @@ class PatchAugmenter(nn.Module):
             aug_params['flip_v'] = flip_v
             aug_patches = self._flip(aug_patches, flip_h, flip_v)
             aug_labels = self._flip(aug_labels, flip_h, flip_v)
+            if aug_features is not None:
+                aug_features = self._flip_features(aug_features, flip_h, flip_v)
 
         # Scaling (uses grid_sample)
         if self.scale_range is not None:
@@ -240,7 +412,57 @@ class PatchAugmenter(nn.Module):
                 labels_flat, grid_labels, mode="nearest", padding_mode="zeros", align_corners=False
             ).view(B, K, C_mask, H, W)
 
-        return aug_patches, aug_labels, aug_params
+            if aug_features is not None:
+                aug_features = self._scale_features(aug_features, scales)
+
+        return aug_patches, aug_labels, aug_features, aug_params
+
+    def augment_features_only(
+        self,
+        features: torch.Tensor,
+        aug_params: dict,
+    ) -> torch.Tensor:
+        """
+        Apply augmentation to features using pre-determined aug_params.
+
+        This is used when features are extracted after patches have already been
+        augmented, and we need to apply the same transformation to features.
+
+        Args:
+            features: [B, K, tokens, D] - feature patches
+            aug_params: dict with augmentation parameters from a previous forward() call
+
+        Returns:
+            aug_features: [B, K, tokens, D] - augmented features
+        """
+        if all(v is None for v in aug_params.values()):
+            return features
+
+        aug_features = features
+
+        # Apply rotation
+        if aug_params.get('rotation_k') is not None:
+            aug_features = self._rotate_features_90(aug_features, aug_params['rotation_k'])
+        elif aug_params.get('rotation_angles') is not None:
+            aug_features = self._rotate_features_continuous(
+                aug_features, aug_params['rotation_angles'], mode="bilinear"
+            )
+
+        # Apply flipping
+        if aug_params.get('flip_h') is not None or aug_params.get('flip_v') is not None:
+            flip_h = aug_params.get('flip_h')
+            flip_v = aug_params.get('flip_v')
+            if flip_h is None:
+                flip_h = torch.zeros_like(flip_v)
+            if flip_v is None:
+                flip_v = torch.zeros_like(flip_h)
+            aug_features = self._flip_features(aug_features, flip_h, flip_v)
+
+        # Apply scaling
+        if aug_params.get('scales') is not None:
+            aug_features = self._scale_features(aug_features, aug_params['scales'])
+
+        return aug_features
 
     def inverse(
         self,
@@ -507,7 +729,8 @@ class PatchSampler(nn.Module):
         image: torch.Tensor,
         labels: torch.Tensor,
         weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        patch_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
         """
         Sample K patches from image based on weight map.
 
@@ -515,11 +738,13 @@ class PatchSampler(nn.Module):
             image: [B, C, H, W] - source image
             labels: [B, C_mask, H, W] - ground truth mask (C_mask=1 for binary, C_mask=3 for RGB)
             weights: [B, 1, H, W] - weight map for sampling (always single-channel)
+            patch_features: [B, K, tokens, D] - pre-extracted features for patches (optional)
 
         Returns:
             patches: [B, K, C, ps, ps]
             patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
+            aug_features: [B, K, tokens, D] or None - augmented features
             aug_params: dict with augmentation parameters (for inverse transform)
         """
         _, _, H, W = image.shape
@@ -550,10 +775,13 @@ class PatchSampler(nn.Module):
 
         # Apply augmentation if enabled
         aug_params = {}
+        aug_features = patch_features
         if self.augmenter is not None:
-            patches, patch_labels, aug_params = self.augmenter(patches, patch_labels)
+            patches, patch_labels, aug_features, aug_params = self.augmenter(
+                patches, patch_labels, patch_features
+            )
 
-        return patches, patch_labels, coords, aug_params
+        return patches, patch_labels, coords, aug_features, aug_params
 
 
 class UniformSampler(PatchSampler):
@@ -629,7 +857,8 @@ class SlidingWindowSampler(PatchSampler):
         image: torch.Tensor,
         labels: torch.Tensor,
         weights: torch.Tensor,  # noqa: ARG002 - ignored for sliding window
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        patch_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
         """
         Extract all patches in a sliding window pattern.
 
@@ -637,11 +866,13 @@ class SlidingWindowSampler(PatchSampler):
             image: [B, C, H, W] - source image
             labels: [B, C_mask, H, W] - ground truth mask (C_mask=1 for binary, C_mask=3 for RGB)
             weights: [B, 1, H, W] - ignored (kept for API compatibility)
+            patch_features: [B, K, tokens, D] - pre-extracted features for patches (optional)
 
         Returns:
             patches: [B, K, C, ps, ps] where K = grid_h * grid_w
             patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
+            aug_features: [B, K, tokens, D] or None - augmented features
             aug_params: dict with augmentation parameters
         """
         B, C, H, W = image.shape
@@ -673,10 +904,13 @@ class SlidingWindowSampler(PatchSampler):
 
         # Apply augmentation if enabled
         aug_params = {}
+        aug_features = patch_features
         if self.augmenter is not None:
-            patches, patch_labels, aug_params = self.augmenter(patches, patch_labels)
+            patches, patch_labels, aug_features, aug_params = self.augmenter(
+                patches, patch_labels, patch_features
+            )
 
-        return patches, patch_labels, coords, aug_params
+        return patches, patch_labels, coords, aug_features, aug_params
 
 
 class GumbelSoftmaxSampler(PatchSampler):
@@ -883,7 +1117,8 @@ class GumbelSoftmaxSampler(PatchSampler):
         image: torch.Tensor,
         labels: torch.Tensor,
         weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        patch_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
         """
         Sample K patches using differentiable Gumbel-Softmax.
 
@@ -891,11 +1126,13 @@ class GumbelSoftmaxSampler(PatchSampler):
             image: [B, C, H, W] - source image
             labels: [B, C_mask, H, W] - ground truth mask (C_mask=1 for binary, C_mask=3 for RGB)
             weights: [B, 1, H, W] - weight map for sampling (always single-channel)
+            patch_features: [B, K, tokens, D] - pre-extracted features for patches (optional)
 
         Returns:
             patches: [B, K, C, ps, ps]
             patch_labels: [B, K, C_mask, ps, ps]
             coords: [B, K, 2] - (h, w) coordinates
+            aug_features: [B, K, tokens, D] or None - augmented features
             aug_params: dict with augmentation parameters (for inverse transform)
         """
         _, _, H, W = image.shape
@@ -920,7 +1157,10 @@ class GumbelSoftmaxSampler(PatchSampler):
 
         # Apply augmentation if enabled
         aug_params = {}
+        aug_features = patch_features
         if self.augmenter is not None:
-            patches, patch_labels, aug_params = self.augmenter(patches, patch_labels)
+            patches, patch_labels, aug_features, aug_params = self.augmenter(
+                patches, patch_labels, patch_features
+            )
 
-        return patches, patch_labels, coords, aug_params
+        return patches, patch_labels, coords, aug_features, aug_params

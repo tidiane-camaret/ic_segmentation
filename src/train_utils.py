@@ -243,7 +243,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
         "context_feature_aggreg_loss": total_context_feature_aggreg / n,
     }
 
-def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=4,
+def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=10,
                      context_in=None, context_out=None):
     """Save images, masks, and predictions to NIfTI files organized by case ID."""
     save_dir = Path(save_dir)

@@ -1,5 +1,52 @@
 # Research Logs
 
+## 2026-01-26: Fixed Patch Rotation with Precomputed Features
+
+**Problem:** When using precomputed DINO features with patch augmentation (rotation/flip), there was a mismatch:
+- Image patches were extracted and rotated
+- Patch labels were rotated to match
+- But feature patches were extracted from precomputed maps at *original* positions (not rotated)
+- This caused features to not match the rotated visual content
+
+**Solution:** Apply the same augmentation to extracted features:
+1. Sample patch coordinates
+2. Extract image patches and labels at coords (with augmentation → get aug_params)
+3. Extract features at the same coords
+4. Apply the *same* augmentation (from aug_params) to features
+5. Process rotated features in backbone
+6. Inverse-rotate predictions before aggregation
+
+**Files modified:**
+- `src/models/sampling.py`:
+  - Added `_rotate_features_90()`, `_rotate_features_continuous()` for feature tensor rotation
+  - Added `_flip_features()`, `_scale_features()` for other augmentations
+  - Added `augment_features_only()` method to apply pre-determined aug_params to features
+  - Updated sampler forward methods to return augmented features
+- `src/models/patch_icl.py`:
+  - Updated `PatchICL_Level.forward()` to extract features after sampling, then augment them
+  - Updated `_select_context_patches()` to return aug_params for each context
+  - Added inverse augmentation to context patch logits before aggregation
+
+**Key insight:** Features are `[B, K, tokens, D]` where tokens=h×w (e.g., 7×7=49). Reshape to spatial `[B, K, D, h, w]`, apply same rotation as patches, reshape back.
+
+**Known limitation - Continuous rotation corner artifacts:**
+With continuous rotation (arbitrary angles), corners of the rotated feature patch sample from positions *outside* the extracted region, getting zeros (padding). This is because we only have features for the patch region itself, not neighboring regions.
+
+```
+Original features (7x7):     After rotation (e.g., 30°):
+┌─────────┐                  ┌─────────┐
+│ f f f f │                  │ 0 f f 0 │  ← corners are ZEROS
+│ f f f f │   rotate →       │ f f f f │     (no features to interpolate)
+│ f f f f │                  │ f f f f │
+│ f f f f │                  │ 0 f f 0 │
+└─────────┘                  └─────────┘
+```
+
+**Recommended workarounds:**
+1. **Use 90° rotation only** (`rotation: "90"`) - no interpolation needed, no artifacts
+2. **Small rotation angles** - for `rotation_range ≈ ±0.3 rad` (±17°), corner artifacts are minimal
+3. **Extract with margin** (future work) - extract larger feature region, rotate, then crop
+
 ## 2026-01-11: Improved Context Sampling with PatchWork Method
 
 **Implemented label-balanced context patch sampling:**

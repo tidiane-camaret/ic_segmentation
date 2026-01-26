@@ -359,6 +359,7 @@ if self.training:
 | Issue | Severity | Category | Status |
 |-------|----------|----------|--------|
 | Oracle dependency at first level | **Critical** | Train/test gap | DONE (separate train/valid oracle configs) |
+| Patch augmentation breaks with precomputed features | **Critical** | Bug | DONE (augment features too) |
 | Non-differentiable patch selection | **High** | Architecture | DONE (GumbelSoftmaxSampler implemented) |
 | Validation uses GT labels | **High** | Evaluation | DONE (oracle_levels_valid) |
 | Position embedding scale mismatch | **High** | Bug | DONE (actual_image_size param) |
@@ -372,6 +373,7 @@ if self.training:
 | Loss design issues | **Medium** | Optimization | TODO |
 | Context integration is implicit | **Medium** | Architecture | TODO |
 | Slow feature extraction | **Medium** | Performance | DONE (vectorized) |
+| Continuous rotation corner artifacts | **Medium** | Limitation | KNOWN (use 90° rotation) |
 | Zero-padding for missing patches | **Low** | Efficiency | TODO |
 | Exploration noise train/test gap | **Low** | Train/test gap | TODO |
 | Coordinate handling edge cases | **Low** | Robustness | DONE (actual_image_size) |
@@ -452,6 +454,60 @@ mask_pred = self.mask_proj_out(output, target_size=self.patch_size)
 
 ---
 
+### 13. Patch Augmentation with Precomputed Features - RESOLVED
+
+**Location**: `src/models/patch_icl.py:326-360`, `src/models/sampling.py:PatchAugmenter`
+
+**Problem**: When using precomputed DINO features with patch augmentation (rotation/flip/scale), there was a critical mismatch:
+```python
+# Old flow (BROKEN):
+patches, labels, coords, aug_params = sampler(...)  # Patches rotated
+features = extract_patch_features(coords)  # Features at ORIGINAL positions!
+# → Features don't match rotated visual content
+```
+
+**Impact**: Model received features representing unrotated content but labels expecting rotated predictions.
+
+**Solution**: Apply the same augmentation to extracted features:
+```python
+# New flow (FIXED):
+patches, labels, coords, _, aug_params = sampler(...)  # Patches rotated
+features = extract_patch_features(coords)  # Extract at original coords
+features = augmenter.augment_features_only(features, aug_params)  # Apply SAME rotation
+# → Features now match rotated visual content
+```
+
+**Implementation** (`src/models/sampling.py`):
+- Added `_rotate_features_90()`, `_rotate_features_continuous()` - rotate feature tensors
+- Added `_flip_features()`, `_scale_features()` - other augmentations
+- Added `augment_features_only(features, aug_params)` - apply pre-determined augmentation
+
+**Key insight**: Features are `[B, K, tokens, D]` where `tokens = h × w` (e.g., 7×7=49). Reshape to spatial `[B, K, D, h, w]`, apply rotation, reshape back.
+
+**Known limitation - Continuous rotation:**
+With continuous (arbitrary angle) rotation, corners sample from outside the feature patch and get zeros:
+```
+Original (7x7):        After 30° rotation:
+┌─────────┐            ┌─────────┐
+│ f f f f │            │ 0 f f 0 │  ← corners are zeros
+│ f f f f │  rotate →  │ f f f f │
+│ f f f f │            │ 0 f f 0 │
+└─────────┘            └─────────┘
+```
+
+**Workarounds**:
+1. Use 90° rotation only (`rotation: "90"`) - no interpolation, no artifacts
+2. Use small angles (`rotation_range ≈ ±0.3 rad`) - minimal corner artifacts
+3. Future: Extract with margin, rotate, crop
+
+**TODO**:
+- [x] Apply same augmentation to features as to patches
+- [x] Apply inverse augmentation to context predictions before aggregation
+- [ ] Implement margin-based extraction for continuous rotation
+- [ ] Add config option to auto-disable continuous rotation with precomputed features
+
+---
+
 ## Priority Action Items
 
 ### Immediate (before next training run)
@@ -475,8 +531,10 @@ mask_pred = self.mask_proj_out(output, target_size=self.patch_size)
 14. [x] Implement `GumbelSoftmaxSampler` for differentiable patch selection
 15. [x] Implement 2D RoPE for spatial-aware positional encoding
 16. [x] Preserve spatial feature grid in SegmentationHead (7×7 → patch_size)
-17. [ ] Add explicit context cross-attention
-18. [ ] Extend to 3D
+17. [x] Fix patch augmentation with precomputed features (apply same aug to features)
+18. [ ] Add explicit context cross-attention
+19. [ ] Extend to 3D
+20. [ ] Implement margin-based feature extraction for continuous rotation
 
 ---
 
@@ -489,3 +547,4 @@ mask_pred = self.mask_proj_out(output, target_size=self.patch_size)
 *Updated: 2026-01-21 - Separated oracle_levels into train/valid configs*
 *Updated: 2026-01-26 - Implemented 2D RoPE for spatial-aware positional encoding*
 *Updated: 2026-01-26 - Added spatial feature grid preservation in SegmentationHead*
+*Updated: 2026-01-26 - Fixed patch augmentation with precomputed features (features now augmented with same params as patches)*
