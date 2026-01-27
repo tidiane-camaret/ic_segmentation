@@ -194,11 +194,6 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
         total_local += losses["local_loss"].item()
         total_agg += losses["agg_loss"].item()
 
-        # Free memory
-        del outputs, losses
-        if idx % 10 == 0:
-            torch.cuda.empty_cache()
-
         # Track detailed losses (use .item() to get scalar, handle tensor(0.0) case)
         total_target_patch += losses.get("target_patch_loss", torch.tensor(0.0)).item()
         total_target_aggreg += losses.get("target_aggreg_loss", torch.tensor(0.0)).item()
@@ -210,6 +205,11 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
         total_feature_aggreg += losses.get("target_feature_aggreg_loss", torch.tensor(0.0)).item()
         total_context_feature_patch += losses.get("context_feature_patch_loss", torch.tensor(0.0)).item()
         total_context_feature_aggreg += losses.get("context_feature_aggreg_loss", torch.tensor(0.0)).item()
+
+        # Free memory
+        del outputs, losses
+        if idx % 10 == 0:
+            torch.cuda.empty_cache()
 
         if print_every and idx % print_every == 0 and is_main:
             ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
