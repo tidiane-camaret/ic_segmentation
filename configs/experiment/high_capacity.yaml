@@ -1,0 +1,88 @@
+# @package _global_
+# High-capacity single-level config optimized for ~49GB VRAM
+# ~22GB VRAM, 28M params (14x original), 44% GPU utilization
+
+train_batch_size: 64
+val_batch_size: 64
+max_ds_len: 100000
+context_size: 1
+random_coloring_nb: 0  # Binary segmentation (clearer gradients)
+method: "patch_icl"
+
+training:
+  seed: 42
+  num_epochs: 200
+  print_every: 50
+  grad_accumulate_steps: 1
+  num_workers: 8
+  log_every: 10
+
+optimizer:
+  optimizer_type: "adamw"
+  optimizer_args:
+    lr: 0.0003  # Scaled for larger batch
+    weight_decay: 0.01
+
+warmup_scheduler:
+  enabled: true
+  warmup_epochs: 10
+
+model:
+  patch_icl:
+    levels:
+      - resolution: 32
+        patch_size: 16
+        num_patches: 32  # 6x more patches - dense coverage
+        sampling_temperature: 0.3
+
+    oracle_levels_train: [true]
+    oracle_levels_valid: [false]
+
+    sampler:
+      type: "weighted"
+      gumbel_tau: 1.0
+      gumbel_tau_min: 0.1
+      gumbel_hard: true
+      stride_divisor: 4
+      augmentation:
+        enabled: true
+        rotation: "90"
+        flip_horizontal: true
+        flip_vertical: true
+
+    aggregator:
+      type: "gaussian"
+      combine_mode: "coverage"
+      sigma_ratio: 0.125
+      min_coverage: 0.000001
+
+    backbone:
+      type: "simple"
+      encoder:
+        embed_dim: 1024
+        embed_proj_dim: 512  # 4x larger (128 -> 512)
+      cross_attention:
+        num_heads: 8
+        num_layers: 4  # Deeper reasoning (adds ~10M params, minimal VRAM)
+        num_registers: 8
+        target_self_attention: true
+        dropout: 0.1
+
+    loss:
+      patch_loss:
+        type: "diceCE"
+        args: null
+      aggreg_loss:
+        type: "diceCE"
+        args: null
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 0.5  # Enable context supervision
+          context_aggreg: 0.5
+
+logging:
+  use_wandb: true
+  wandb_project: "patch_icl_train"
+  save_imgs_masks: true

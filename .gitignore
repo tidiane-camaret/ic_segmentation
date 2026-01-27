@@ -16,3 +16,4 @@ RESULTS_DIR/
 results/runs/
 *.nii.gz
 results/checkpoints/
+.claude/.nfs0000000000fa1d5100001236

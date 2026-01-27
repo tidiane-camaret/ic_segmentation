@@ -3,10 +3,11 @@ import sys
 from pathlib import Path
 
 import hydra
+import torch
 from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
-import torch
 from tqdm import tqdm
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for src imports
 from src.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate
@@ -249,7 +250,9 @@ def main(cfg: DictConfig) -> None:
         train_losses = train_epoch(
             model, train_loader, optimizer,
             device, epoch, print_every, grad_accumulate_steps,
-            accelerator=accelerator
+            accelerator=accelerator,
+            use_wandb=cfg.logging.use_wandb,
+            log_every=cfg.training.get("log_every", 10),
         )
 
         # Validation with optional saving

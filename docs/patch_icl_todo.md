@@ -367,10 +367,12 @@ if self.training:
 | embed_dim mismatch | **High** | Config | DONE (768→1024 for DINOv3 ViT-L) |
 | 1D sequential RoPE ignores spatial layout | **High** | Architecture | DONE (2D RoPE with coords) |
 | Flattened features lose spatial structure | **High** | Architecture | DONE (spatial grid preservation) |
+| Complex backbone (2500+ lines) | **High** | Code quality | DONE (SimpleBackbone: 630 lines) |
+| Low GPU utilization (8%) | **High** | Performance | DONE (high_capacity.yaml: 43%) |
 | 2D-only (project needs 3D) | **High** | Scope | TODO |
 | Single level active in config | **Medium** | Configuration | TODO |
 | Naive aggregation | **Medium** | Architecture | DONE (modular PatchAggregator) |
-| Loss design issues | **Medium** | Optimization | TODO |
+| Loss design issues | **Medium** | Optimization | PARTIAL (diceCE in high_capacity) |
 | Context integration is implicit | **Medium** | Architecture | TODO |
 | Slow feature extraction | **Medium** | Performance | DONE (vectorized) |
 | Continuous rotation corner artifacts | **Medium** | Limitation | KNOWN (use 90° rotation) |
@@ -532,9 +534,68 @@ Original (7x7):        After 30° rotation:
 15. [x] Implement 2D RoPE for spatial-aware positional encoding
 16. [x] Preserve spatial feature grid in SegmentationHead (7×7 → patch_size)
 17. [x] Fix patch augmentation with precomputed features (apply same aug to features)
-18. [ ] Add explicit context cross-attention
-19. [ ] Extend to 3D
-20. [ ] Implement margin-based feature extraction for continuous rotation
+18. [x] Simplify backbone architecture (DONE - SimpleBackbone: 630 lines, 5 classes)
+19. [x] Multi-layer attention support (DONE - `num_layers` parameter)
+20. [x] High-capacity training config (DONE - `experiment=high_capacity`)
+21. [ ] Add explicit context cross-attention
+22. [ ] Extend to 3D
+23. [ ] Implement margin-based feature extraction for continuous rotation
+
+---
+
+---
+
+## 2027-01-27: SimpleBackbone + High-Capacity Config
+
+### SimpleBackbone (`src/models/simple_backbone.py`)
+
+Replaced complex backbone.py (2,539 lines, 24 classes) with focused implementation (630 lines, 5 classes).
+
+**Classes:**
+- `SimpleCNNEncoder`: DINO features → CNN with skip connections → pooled representation
+- `AttentionBlock`: Single attention + MLP layer (stackable)
+- `CrossPatchAttention`: Multi-layer attention with type embeddings, 2D RoPE, registers
+- `SimpleCNNDecoder`: U-Net style decoder with skip fusion
+- `SimpleBackbone`: Composes encoder → attention → decoder
+
+**Key features:**
+- Multi-layer attention support (`num_layers` parameter)
+- Masked attention pattern: context↔context, target→context (+ optional target↔target)
+- Register tokens for global context aggregation
+- Bilinear upsampling supports any `patch_size`
+
+**Config:**
+```yaml
+backbone:
+  type: "simple"
+  encoder:
+    embed_dim: 1024
+    embed_proj_dim: 512
+  cross_attention:
+    num_heads: 8
+    num_layers: 4      # NEW: stackable attention layers
+    num_registers: 8
+    target_self_attention: true
+    dropout: 0.1
+```
+
+### High-Capacity Training Config (`configs/experiment/high_capacity.yaml`)
+
+Optimized for better dice and GPU utilization on 49GB VRAM.
+
+**Key changes:**
+| Parameter | Before | After |
+|-----------|--------|-------|
+| batch_size | 50-64 | 192 |
+| num_patches | 16 | 96 |
+| embed_proj_dim | 128 | 512 |
+| num_layers | 1 | 4 |
+| loss | smoothL1 | diceCE |
+| context_loss_weight | 0 | 0.5 |
+| VRAM usage | 3.8GB (8%) | 21GB (43%) |
+| Parameters | ~2M | 37.7M |
+
+**Run:** `python scripts/train.py experiment=high_capacity`
 
 ---
 
@@ -548,3 +609,4 @@ Original (7x7):        After 30° rotation:
 *Updated: 2026-01-26 - Implemented 2D RoPE for spatial-aware positional encoding*
 *Updated: 2026-01-26 - Added spatial feature grid preservation in SegmentationHead*
 *Updated: 2026-01-26 - Fixed patch augmentation with precomputed features (features now augmented with same params as patches)*
+*Updated: 2027-01-27 - Created SimpleBackbone (630 lines replacing 2539), multi-layer attention, high-capacity training config*

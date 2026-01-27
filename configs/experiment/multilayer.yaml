@@ -1,0 +1,88 @@
+# @package _global_
+# Multi-layer cross-patch attention backbone experiment
+# 
+# Key improvements over single-layer perceiver:
+# - Multiple stacked cross-patch attention layers (deeper reasoning)
+# - Bidirectional attention: targets can coordinate with each other
+# - Attention pooling instead of mean pooling (preserves information)
+# - Gated fusion for residual connections
+# - Skip connections for latents across layers
+# - Flash Attention compatible for efficiency
+
+train_batch_size: 32  # Reduced due to higher memory usage
+val_batch_size: 64
+max_ds_len: null
+
+train_label_ids: ['colon', 'costal_cartilages', 'duodenum', 'iliopsoas_right', 'inferior_vena_cava', 'kidney_left', 'kidney_right', 'lung_middle_lobe_right', 'pancreas', 'scapula_left', 'small_bowel', 'spleen', 'sternum', 'stomach', 'trachea', 'vertebrae_T10', 'vertebrae_T11', 'vertebrae_T12', 'vertebrae_T3', 'vertebrae_T4', 'vertebrae_T5', 'vertebrae_T9']
+val_label_ids: ['aorta', 'autochthon_left', 'autochthon_right', 'esophagus', 'heart', 'iliopsoas_left', 'liver', 'lung_lower_lobe_left', 'lung_lower_lobe_right', 'lung_upper_lobe_left', 'lung_upper_lobe_right', 'scapula_right', 'spinal_cord', 'vertebrae_L1', 'vertebrae_T7', 'vertebrae_T8']
+context_size: 1
+random_coloring_nb: 0
+
+method: "patch_icl"
+
+logging:
+  wandb_project: "patch_icl_multilayer"
+
+model:
+  patch_icl:
+    levels:
+      - resolution: 32
+        patch_size: 16
+        num_patches: 16
+        sampling_temperature: 0.3
+
+    oracle_levels_train: [true]
+    oracle_levels_valid: [true]
+
+    sampler:
+      type: "gumbel"
+      exploration_noise: 0.5
+      stride_divisor: 4
+      gumbel_tau: 1.0
+      gumbel_tau_min: 0.1
+      gumbel_hard: true
+      augmentation:
+        enabled: true
+        rotation: "90"
+        flip_horizontal: true
+        flip_vertical: true
+
+    backbone:
+      # Use the new multi-layer cross-patch attention backbone
+      type: "multilayer"
+      share_backbone: false
+      image_size: 224
+      
+      # Input/output dimensions
+      embed_dim: 1024           # DINO ViT-L feature dimension
+      embed_proj_dim: 128       # Working dimension after projection
+      decoder_hidden_dim: 64    # PixelShuffle decoder hidden dim
+      
+      # Attention configuration
+      num_heads: 8
+      num_latents_per_patch: 4  # Latent tokens per patch for attention pooling
+      num_registers: 4          # Global context registers
+      use_rope_2d: true         # 2D rotary position embeddings
+      
+      # Multi-layer specific options
+      num_layers: 3             # Stack 3 cross-patch attention layers
+      dropout: 0.1              # Attention and MLP dropout
+      use_spatial_attn: true    # Per-patch spatial self-attention in each layer
+
+    masking:
+      target_mask_ratio: 1
+      context_mask_ratio: 0
+
+    loss:
+      patch_loss:
+        type: "binarycrossentropy"
+        args: null
+      aggreg_loss:
+        type: "dice"
+        args: null
+      weights:
+        default:
+          target_patch: 0.5
+          target_aggreg: 0.5
+          context_patch: 0.5
+          context_aggreg: 0.5

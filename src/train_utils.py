@@ -71,10 +71,22 @@ def build_dataloaders(config: Dict, DatasetClass, collate_fn) -> tuple:
     return train_loader, val_loader
 
 
-def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad_accumulate_steps=1, accelerator=None):
-    """Run one training epoch. Model must have loss functions set via set_loss_functions()."""
+def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad_accumulate_steps=1, accelerator=None, use_wandb=False, log_every=10):
+    """Run one training epoch. Model must have loss functions set via set_loss_functions().
+    
+    Args:
+        use_wandb: If True, log batch metrics to wandb
+        log_every: Log to wandb every N batches (default: 10)
+    """
     model.train()
     is_main = accelerator is None or accelerator.is_main_process
+    
+    # Import wandb if needed
+    if use_wandb and is_main:
+        try:
+            import wandb
+        except ImportError:
+            use_wandb = False
     # Get unwrapped model for accessing custom methods (compute_loss, etc.)
     unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
     total_loss = 0.0
@@ -228,6 +240,26 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
                 f"ContextAggreg: {total_context_aggreg / (idx + 1):.4f}"
             )
 
+        # Log to wandb during training
+        if use_wandb and is_main and idx % log_every == 0:
+            global_step = epoch * len(train_loader) + idx
+            ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
+            wandb.log({
+                "train_batch/loss": total_loss / (idx + 1),
+                "train_batch/local_dice": total_local_dice / (idx + 1),
+                "train_batch/final_dice": total_final_dice / (idx + 1),
+                "train_batch/context_dice": ctx_dice_avg,
+                "train_batch/target_patch_loss": total_target_patch / (idx + 1),
+                "train_batch/target_aggreg_loss": total_target_aggreg / (idx + 1),
+                "train_batch/context_patch_loss": total_context_patch / (idx + 1),
+                "train_batch/context_aggreg_loss": total_context_aggreg / (idx + 1),
+                "train_batch/feature_patch_loss": total_feature_patch / (idx + 1),
+                "train_batch/feature_aggreg_loss": total_feature_aggreg / (idx + 1),
+                "train_batch/epoch": epoch,
+                "train_batch/batch": idx,
+                "global_step": global_step,
+            }, step=global_step)
+
     n = len(train_loader)
     ctx_dice_final = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
     return {
@@ -255,14 +287,15 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
     }
 
 def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=10,
-                     context_in=None, context_out=None):
+                     context_in=None, context_out=None, batch_idx=0):
     """Save images, masks, and predictions to NIfTI files organized by case ID."""
     save_dir = Path(save_dir)
     B = min(images.shape[0], max_samples)
 
     for i in range(B):
-        case_id = case_ids[i] if case_ids else f"s{i:04d}"
-        case_dir = save_dir / case_id
+        case_id = case_ids[i] if case_ids else f"case{i:04d}"
+        # Include batch_idx and sample index to avoid overwrites when same case_id appears multiple times
+        case_dir = save_dir / f"{case_id}_b{batch_idx:02d}_s{i:02d}"
         case_dir.mkdir(parents=True, exist_ok=True)
 
         # Input image
@@ -526,7 +559,7 @@ def validate(
         if save_dir is not None and batch_idx < max_save_batches and is_main:
             case_ids = batch.get("case_id", None)
             save_predictions(save_dir, case_ids, images, labels, outputs,
-                           context_in=context_in, context_out=context_out)
+                           context_in=context_in, context_out=context_out, batch_idx=batch_idx)
 
     if save_dir is not None and is_main:
         print(f"  Saved validation outputs to {save_dir}")

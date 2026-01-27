@@ -1,5 +1,86 @@
 # Research Logs
 
+## 2027-01-27: SimpleBackbone + High-Capacity Training Config
+
+### SimpleBackbone Implementation
+
+Created `src/models/simple_backbone.py` - a clean, focused replacement for the complex backbone.py (2,539 lines → 630 lines).
+
+**Architecture:**
+```
+SimpleCNNEncoder → CrossPatchAttention → SimpleCNNDecoder
+[B,K,49,1024]        [B,K,D]              [B,K,D] + skips
+     │                  │                      │
+     ▼                  ▼                      ▼
+Linear(1024→D)      + type_embed          TransConv + skips
+Reshape [B*K,D,7,7] + 2D RoPE             Bilinear upsample
+Conv layers         + registers            → [B,K,C,ps,ps]
+Pool [B,K,D]        Multi-layer attention
+```
+
+**Key features:**
+- **SimpleCNNEncoder**: Projects DINO features, 3-level CNN with skip connections (7×7 → 4×4 → 2×2 → pool)
+- **CrossPatchAttention**: Multi-layer attention with:
+  - Type embeddings (context vs target)
+  - 2D RoPE for spatial position encoding
+  - Register tokens for global context
+  - Configurable target self-attention
+  - Masked attention pattern (context↔context, target→context)
+- **SimpleCNNDecoder**: U-Net style with skip fusion, bilinear upsampling to any patch_size
+
+**Config example:**
+```yaml
+backbone:
+  type: "simple"
+  encoder:
+    embed_dim: 1024        # DINO input dim
+    embed_proj_dim: 512    # Working dimension
+  cross_attention:
+    num_heads: 8
+    num_layers: 4          # Stackable attention layers
+    num_registers: 8
+    target_self_attention: true
+    dropout: 0.1
+```
+
+### High-Capacity Training Config
+
+Created `configs/experiment/high_capacity.yaml` to improve training dice and GPU utilization.
+
+**Analysis of original config issues:**
+- Only 3.8GB / 49GB VRAM used (8%)
+- 16 patches at resolution 32 = poor coverage
+- embed_dim=128 = underpowered model
+- smoothL1 loss = wrong for segmentation
+- Context supervision disabled
+
+**New high-capacity config:**
+| Setting | Before | After | Impact |
+|---------|--------|-------|--------|
+| Parameters | ~2M | 37.7M | 19x capacity |
+| VRAM | 3.8GB (8%) | 21GB (43%) | 5.5x utilization |
+| Batch size | 50-64 | 192 | Better gradients |
+| Patches | 16 | 96 | 6x coverage |
+| Embed dim | 128 | 512 | 4x richer features |
+| Attention layers | 1 | 4 | Deeper reasoning |
+| Loss | smoothL1 | diceCE | Proper segmentation |
+| Context loss | 0 | 0.5 | Extra supervision |
+
+**VRAM scaling tests:**
+```
+num_layers=1: 21.7GB (44%), 28.2M params
+num_layers=2: 19.7GB (40%), 31.4M params
+num_layers=4: 20.5GB (42%), 37.7M params
+```
+More layers add ~3M params each but minimal VRAM (attention mask shared).
+
+**Files created/modified:**
+- `src/models/simple_backbone.py` (NEW): SimpleBackbone with 4 classes
+- `src/models/patch_icl.py`: Added SimpleBackbone import and factory case
+- `configs/experiment/high_capacity.yaml` (NEW): Optimized training config
+
+**Run:** `python scripts/train.py experiment=high_capacity`
+
 ## 2026-01-26: Fixed Patch Rotation with Precomputed Features
 
 **Problem:** When using precomputed DINO features with patch augmentation (rotation/flip), there was a mismatch:

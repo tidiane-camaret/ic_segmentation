@@ -10,7 +10,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.aggregate import PatchAggregator, create_aggregator
-from src.models.backbone import CrossPatchAttentionBackbone
+from src.models.backbone import (
+    CNNCrossPatchBackbone,
+    CrossPatchAttentionBackbone,
+    MultiLayerCrossPatchBackbone,
+    build_modular_backbone,
+)
+from src.models.simple_backbone import SimpleBackbone
 from src.models.sampling import (
     ContinuousSampler,
     DeterministicTopKSampler,
@@ -591,13 +597,93 @@ class PatchICL(nn.Module):
 
         # Create backbone
         backbone_cfg = config.get('backbone', {})
-        backbone = CrossPatchAttentionBackbone(
-            embed_dim=backbone_cfg.get('embed_dim', 1024),
-            embed_proj_dim=backbone_cfg.get('embed_proj_dim', 208),
-            patch_size=levels_cfg[0]['patch_size'],
-            image_size=backbone_cfg.get('image_size', 224),
-            num_classes=self.num_mask_channels,
-        )
+
+        # Parse nested config sections
+        enc_cfg = backbone_cfg.get('encoder', {})
+        attn_cfg = backbone_cfg.get('cross_attention', {})
+        dec_cfg = backbone_cfg.get('decoder', {})
+
+        # Check if using new modular config (encoder_type + decoder_type)
+        encoder_type = backbone_cfg.get('encoder_type')
+        decoder_type = backbone_cfg.get('decoder_type')
+
+        if encoder_type is not None and decoder_type is not None:
+            # New modular architecture: separate encoder/decoder selection
+            backbone = build_modular_backbone(
+                encoder_type=encoder_type,
+                decoder_type=decoder_type,
+                embed_dim=enc_cfg.get('embed_dim', 1024),
+                embed_proj_dim=enc_cfg.get('embed_proj_dim', 128),
+                bottleneck_dim=attn_cfg.get('bottleneck_dim', 128),
+                num_classes=self.num_mask_channels,
+                patch_size=levels_cfg[0]['patch_size'],
+                image_size=enc_cfg.get('image_size', 224),
+                num_heads=attn_cfg.get('num_heads', 8),
+                num_registers=attn_cfg.get('num_registers', 4),
+                num_latents=enc_cfg.get('num_latents', 4),
+                decoder_hidden_dim=dec_cfg.get('hidden_dim', 64),
+                use_rope_2d=attn_cfg.get('use_rope_2d', True),
+            )
+        else:
+            # Legacy config: 'type' selects coupled encoder+decoder
+            backbone_type = backbone_cfg.get('type', 'perceiver').lower()
+
+            backbone_kwargs = dict(
+                embed_dim=enc_cfg.get('embed_dim', backbone_cfg.get('embed_dim', 1024)),
+                embed_proj_dim=enc_cfg.get('embed_proj_dim', backbone_cfg.get('embed_proj_dim', 128)),
+                bottleneck_dim=attn_cfg.get('bottleneck_dim', backbone_cfg.get('bottleneck_dim', 128)),
+                num_heads=attn_cfg.get('num_heads', backbone_cfg.get('num_heads', 8)),
+                num_registers=attn_cfg.get('num_registers', backbone_cfg.get('num_registers', 4)),
+                use_rope_2d=attn_cfg.get('use_rope_2d', backbone_cfg.get('use_rope_2d', True)),
+                decoder_hidden_dim=dec_cfg.get('hidden_dim', backbone_cfg.get('decoder_hidden_dim', 64)),
+                patch_size=levels_cfg[0]['patch_size'],
+                image_size=enc_cfg.get('image_size', backbone_cfg.get('image_size', 224)),
+                num_classes=self.num_mask_channels,
+            )
+
+            if backbone_type == 'cnn':
+                backbone = CNNCrossPatchBackbone(**backbone_kwargs)
+            elif backbone_type == 'simple':
+                # Simplified backbone: CNN encoder + modular attention + CNN decoder
+                backbone = SimpleBackbone(
+                    embed_dim=backbone_kwargs['embed_proj_dim'],
+                    num_heads=backbone_kwargs['num_heads'],
+                    num_layers=attn_cfg.get(
+                        'num_layers', backbone_cfg.get('num_layers', 1)
+                    ),
+                    num_registers=backbone_kwargs['num_registers'],
+                    num_classes=backbone_kwargs['num_classes'],
+                    patch_size=backbone_kwargs['patch_size'],
+                    image_size=backbone_kwargs['image_size'],
+                    input_dim=backbone_kwargs['embed_dim'],
+                    target_self_attention=attn_cfg.get(
+                        'target_self_attention', backbone_cfg.get('target_self_attention', False)
+                    ),
+                    dropout=attn_cfg.get('dropout', backbone_cfg.get('dropout', 0.0)),
+                )
+            elif backbone_type == 'multilayer':
+                # New multi-layer cross-patch attention backbone
+                backbone_kwargs['num_latents_per_patch'] = enc_cfg.get(
+                    'num_latents_per_patch', backbone_cfg.get('num_latents_per_patch', 4)
+                )
+                backbone_kwargs['num_layers'] = attn_cfg.get(
+                    'num_layers', backbone_cfg.get('num_layers', 3)
+                )
+                backbone_kwargs['dropout'] = attn_cfg.get(
+                    'dropout', backbone_cfg.get('dropout', 0.1)
+                )
+                backbone_kwargs['use_spatial_attn'] = attn_cfg.get(
+                    'use_spatial_attn', backbone_cfg.get('use_spatial_attn', True)
+                )
+                backbone_kwargs.pop('bottleneck_dim', None)
+                backbone = MultiLayerCrossPatchBackbone(**backbone_kwargs)
+            else:
+                # Default: single-layer perceiver-style backbone
+                backbone_kwargs['num_latents_per_patch'] = enc_cfg.get(
+                    'num_latents_per_patch', backbone_cfg.get('num_latents_per_patch', 4)
+                )
+                backbone_kwargs.pop('bottleneck_dim', None)
+                backbone = CrossPatchAttentionBackbone(**backbone_kwargs)
 
         # Create levels
         self.levels = nn.ModuleList()

@@ -54,7 +54,7 @@ training:
   print_every: 50
   grad_accumulate_steps: 1
   num_workers: 8
-
+  log_every: 10  
 # Logging
 logging:
   use_wandb: true
@@ -101,14 +101,27 @@ model:
       hidden_dim: 32
 
     backbone:
-      type: "precomputed"
+      # Backbone type: "perceiver" (single-layer), "multilayer" (multi-layer), "cnn"
+      type: "perceiver"
       share_backbone: false
       image_size: 224
       embed_dim: 1024
+      embed_proj_dim: 128
       num_heads: 8
-      num_layers: 4
       pretrained_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
       use_mask_conditioning: true
+      
+      # Perceiver/MultiLayer options
+      num_latents_per_patch: 4
+      num_registers: 4
+      use_rope_2d: true
+      decoder_hidden_dim: 64
+      
+      # MultiLayer-specific options (only used when type: "multilayer")
+      # Multi-layer enables: deeper reasoning, target-target attention, attention pooling
+      num_layers: 3           # Number of cross-patch attention layers
+      dropout: 0.1
+      use_spatial_attn: true  # Per-patch spatial self-attention in each layer
 
     masking:
       target_mask_ratio: 1
