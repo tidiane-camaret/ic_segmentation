@@ -19,12 +19,12 @@ model:
     levels:
       - resolution: 32
         patch_size: 16
-        num_patches: 32
+        num_patches: 16
         sampling_temperature: 0.3
     sampler:
       type: "weighted"
       augmentation:
-        enabled: true
+        enabled: false
         rotation: "90"
         rotation_range: 0.5
         flip_horizontal: true
@@ -32,7 +32,7 @@ model:
     backbone:
       type: "crosspatch_attention"
       embed_dim: 1024
-      embed_proj_dim: 208
+      embed_proj_dim: 52
       patch_size: 16
       image_size: 224
 

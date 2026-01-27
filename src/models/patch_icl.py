@@ -592,6 +592,7 @@ class PatchICL(nn.Module):
         backbone_cfg = config.get('backbone', {})
         backbone = CrossPatchAttentionBackbone(
             embed_dim=backbone_cfg.get('embed_dim', 1024),
+            embed_proj_dim=backbone_cfg.get('embed_proj_dim', 208),
             patch_size=levels_cfg[0]['patch_size'],
             image_size=backbone_cfg.get('image_size', 224),
             num_classes=self.num_mask_channels,
