@@ -19,7 +19,9 @@ def main(cfg: DictConfig) -> None:
     # print(OmegaConf.to_yaml(cfg))
 
     # Initialize accelerator for multi-GPU support
-    accelerator = Accelerator()
+    from accelerate import DistributedDataParallelKwargs
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
 
     # Set seed
