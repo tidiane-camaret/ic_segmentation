@@ -75,6 +75,8 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
     """Run one training epoch. Model must have loss functions set via set_loss_functions()."""
     model.train()
     is_main = accelerator is None or accelerator.is_main_process
+    # Get unwrapped model for accessing custom methods (compute_loss, etc.)
+    unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
     total_loss = 0.0
     total_aggreg = 0.0
     total_local = 0.0
@@ -133,7 +135,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
             context_features=context_features,
             mode="train",
         )
-        losses = model.compute_loss(outputs, labels)
+        losses = unwrapped_model.compute_loss(outputs, labels)
         loss = losses["total_loss"]
 
         # Compute Dice scores
@@ -417,6 +419,8 @@ def validate(
     Uses model.aggreg_criterion for loss computation."""
     model.eval()
     is_main = accelerator is None or accelerator.is_main_process
+    # Get unwrapped model for accessing custom attributes (aggreg_criterion, etc.)
+    unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
     total_loss = 0.0
     total_local_dice = 0.0
     total_final_dice = 0.0
@@ -461,7 +465,7 @@ def validate(
         )
         predictions = outputs["final_logit"]
 
-        loss = model.aggreg_criterion(predictions, labels.float())
+        loss = unwrapped_model.aggreg_criterion(predictions, labels.float())
         total_loss += loss.item()
 
         # Local dice: extract GT patches using coordinates from model

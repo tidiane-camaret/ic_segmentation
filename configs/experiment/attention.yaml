@@ -22,7 +22,7 @@ model:
         num_patches: 16
         sampling_temperature: 0.3
     sampler:
-      type: "weighted"
+      type: "continuous"
       augmentation:
         enabled: false
         rotation: "90"

@@ -1164,3 +1164,106 @@ class GumbelSoftmaxSampler(PatchSampler):
             )
 
         return patches, patch_labels, coords, aug_features, aug_params
+
+
+class ContinuousSampler(nn.Module):
+    """
+    Samples patches at any pixel coordinate (not restricted to a grid).
+
+    Directly samples K coordinates from the weight map via multinomial,
+    then extracts patches at those positions. More efficient than grid-based
+    samplers when you need truly continuous positioning.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        num_patches: int,
+        temperature: float = 1.0,
+        augmenter: PatchAugmenter | None = None,
+    ):
+        """
+        Args:
+            patch_size: Size of sampled patches (ps x ps)
+            num_patches: Number of patches to sample (K)
+            temperature: Softmax temperature for sampling (lower = sharper)
+            augmenter: Optional PatchAugmenter for rotation/flip augmentation
+        """
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        self.temperature = temperature
+        self.augmenter = augmenter
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        labels: torch.Tensor,
+        weights: torch.Tensor,
+        patch_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
+        """
+        Sample K patches at any pixel coordinate.
+
+        Args:
+            image: [B, C, H, W] - source image
+            labels: [B, C_mask, H, W] - ground truth mask
+            weights: [B, 1, H, W] - weight map for sampling
+            patch_features: [B, K, tokens, D] - pre-extracted features (optional)
+
+        Returns:
+            patches: [B, K, C, ps, ps]
+            patch_labels: [B, K, C_mask, ps, ps]
+            coords: [B, K, 2] - (h, w) coordinates
+            aug_features: [B, K, tokens, D] or None
+            aug_params: dict with augmentation parameters
+        """
+        B, C, H, W = image.shape
+        C_mask = labels.shape[1]
+        ps = self.patch_size
+        K = self.num_patches
+        device = image.device
+
+        # Valid sampling region (ensure patch fits)
+        valid_h = H - ps
+        valid_w = W - ps
+
+        if valid_h <= 0 or valid_w <= 0:
+            raise ValueError(f"Image size ({H}, {W}) too small for patch size {ps}")
+
+        # Crop weights to valid region and flatten
+        valid_weights = weights[:, :, :valid_h, :valid_w]  # [B, 1, valid_h, valid_w]
+        flat_weights = valid_weights.reshape(B, -1)  # [B, valid_h * valid_w]
+
+        # Normalize to probabilities with temperature
+        flat_weights = flat_weights / self.temperature
+        probs = F.softmax(flat_weights, dim=1)
+
+        # Sample K indices without replacement
+        indices = torch.multinomial(probs, K, replacement=False)  # [B, K]
+
+        # Convert flat indices to (h, w) coordinates
+        h_coords = indices // valid_w
+        w_coords = indices % valid_w
+        coords = torch.stack([h_coords, w_coords], dim=2)  # [B, K, 2]
+
+        # Extract patches at sampled coordinates
+        patches = torch.zeros(B, K, C, ps, ps, device=device)
+        patch_labels = torch.zeros(B, K, C_mask, ps, ps, device=device)
+
+        for b in range(B):
+            for k in range(K):
+                h = h_coords[b, k].item()
+                w = w_coords[b, k].item()
+                patches[b, k] = image[b, :, h:h+ps, w:w+ps]
+                patch_labels[b, k] = labels[b, :, h:h+ps, w:w+ps]
+
+        # Apply augmentation if enabled
+        aug_params = {}
+        aug_features = patch_features
+        if self.augmenter is not None:
+            patches, patch_labels, aug_features, aug_params = self.augmenter(
+                patches, patch_labels, patch_features
+            )
+
+        return patches, patch_labels, coords, aug_features, aug_params

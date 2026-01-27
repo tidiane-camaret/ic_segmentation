@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from src.models.aggregate import PatchAggregator, create_aggregator
 from src.models.backbone import CrossPatchAttentionBackbone
 from src.models.sampling import (
+    ContinuousSampler,
     DeterministicTopKSampler,
     GumbelSoftmaxSampler,
     PatchAugmenter,
@@ -666,6 +667,13 @@ class PatchICL(nn.Module):
             return SlidingWindowSampler(
                 patch_size=patch_size,
                 stride=self.sliding_window_stride,
+                augmenter=self.augmenter,
+            )
+        elif self.sampler_type == 'continuous':
+            return ContinuousSampler(
+                patch_size=patch_size,
+                num_patches=num_patches,
+                temperature=temperature,
                 augmenter=self.augmenter,
             )
         else:
