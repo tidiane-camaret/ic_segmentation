@@ -47,8 +47,8 @@ model:
       augmentation:
         enabled: true
         rotation: "90"
-        flip_horizontal: true
-        flip_vertical: true
+        flip_horizontal: false
+        flip_vertical: false
 
     aggregator:
       type: "gaussian"
@@ -60,7 +60,7 @@ model:
       type: "simple"
       encoder:
         embed_dim: 1024
-        embed_proj_dim: 512  # 4x larger (128 -> 512)
+        embed_proj_dim: 128  # 4x larger (128 -> 512)
       cross_attention:
         num_heads: 8
         num_layers: 4  # Deeper reasoning (adds ~10M params, minimal VRAM)
