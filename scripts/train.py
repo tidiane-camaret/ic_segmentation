@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import hydra
+from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 import torch
 from tqdm import tqdm
@@ -17,16 +18,21 @@ def main(cfg: DictConfig) -> None:
     # Print config
     # print(OmegaConf.to_yaml(cfg))
 
+    # Initialize accelerator for multi-GPU support
+    accelerator = Accelerator()
+    device = accelerator.device
+
     # Set seed
     seed_everything(cfg.training.seed)
 
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    if accelerator.is_main_process:
+        print(f"Using device: {device}, num_processes: {accelerator.num_processes}")
 
-    # Create checkpoint dir
+    # Create checkpoint dir (only on main process)
     ckpt_dir = Path(cfg.paths.ckpts.save_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if accelerator.is_main_process:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     # Get dataset class and dataloader
     if cfg.dataset == "totalseg_no_context":
@@ -49,8 +55,8 @@ def main(cfg: DictConfig) -> None:
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset}")
 
-    # Logging
-    if cfg.logging.use_wandb:
+    # Logging (only on main process)
+    if cfg.logging.use_wandb and accelerator.is_main_process:
         import wandb
         wandb.init(
             project=cfg.logging.wandb_project,
@@ -118,16 +124,16 @@ def main(cfg: DictConfig) -> None:
             load_dinov3_features=cfg.get("load_dinov3_features", True),
         )
 
-    # Get model
+    # Get model (don't move to device yet - accelerator.prepare handles that)
     if cfg.method == "segformer3d":
         sys.path.insert(0, "/software/notebooks/camaret/repos/SegFormer3D")
-        model = build_segformer3d_model(cfg.model.segformer3d).to(device)
+        model = build_segformer3d_model(cfg.model.segformer3d)
     elif cfg.method == "global_local":
         from src.models.global_local import GlobalLocalModel
         model = GlobalLocalModel(
             cfg.model.global_local,
             context_size=cfg.get("context_size", 0),
-        ).to(device)
+        )
     elif cfg.method == "patch_icl":
         from src.models.patch_icl import PatchICL
 
@@ -135,12 +141,13 @@ def main(cfg: DictConfig) -> None:
         patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
         random_coloring_nb = cfg.get("random_coloring_nb", 0)
         patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
-        print(f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})")
+        if accelerator.is_main_process:
+            print(f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})")
 
         model = PatchICL(
             patch_icl_cfg,
             context_size=cfg.get("context_size", 0),
-        ).to(device)
+        )
 
         # Build and set loss functions from patch_icl config
         loss_cfg = patch_icl_cfg.get("loss", {})
@@ -150,12 +157,14 @@ def main(cfg: DictConfig) -> None:
         patch_criterion = build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args"))
         aggreg_criterion = build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args"))
         model.set_loss_functions(patch_criterion, aggreg_criterion)
-        print(f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}")
+        if accelerator.is_main_process:
+            print(f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}")
     else:
         raise ValueError(f"Unknown method: {cfg.method}")
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {num_params:,}")
+    if accelerator.is_main_process:
+        print(f"Model parameters: {num_params:,}")
 
     # Optimizer
     opt_type = cfg.optimizer.get("optimizer_type", "adamw").lower()
@@ -223,16 +232,22 @@ def main(cfg: DictConfig) -> None:
     else:
         scheduler = main_scheduler
 
+    # Prepare for distributed training
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
     # Training loop
     best_dice = 0.0
     num_epochs = cfg.training.num_epochs
     print_every = cfg.training.print_every
     grad_accumulate_steps = cfg.training.get("grad_accumulate_steps", 1)
 
-    for epoch in tqdm(range(num_epochs), desc="Training"):
+    for epoch in tqdm(range(num_epochs), desc="Training", disable=not accelerator.is_main_process):
         train_losses = train_epoch(
             model, train_loader, optimizer,
-            device, epoch, print_every, grad_accumulate_steps
+            device, epoch, print_every, grad_accumulate_steps,
+            accelerator=accelerator
         )
 
         # Validation with optional saving
@@ -243,32 +258,34 @@ def main(cfg: DictConfig) -> None:
 
         val_loss, val_local_dice, val_final_dice, val_context_dice = validate(
             model, val_loader, device,
-            save_dir=val_save_dir, max_save_batches=2
+            save_dir=val_save_dir, max_save_batches=2,
+            accelerator=accelerator
         )
 
         scheduler.step()
 
-        print(
-            f"Epoch {epoch:04d} | "
-            f"Train Loss: {train_losses['loss']:.5f} | "
-            f"Train LocalDice: {train_losses['local_dice']:.5f} | "
-            f"Train FinalDice: {train_losses['final_dice']:.5f} | "
-            f"Val Loss: {val_loss:.5f} | "
-            f"Val LocalDice: {val_local_dice:.5f} | "
-            f"Val FinalDice: {val_final_dice:.5f} | "
-            f"Val CtxDice: {val_context_dice:.5f} | "
-            f"LR: {scheduler.get_last_lr()[0]:.2e}"
-        )
-        print(
-            f"  Losses -> "
-            f"TargetPatch: {train_losses.get('target_patch_loss', 0):.4f} | "
-            f"TargetAggreg: {train_losses.get('target_aggreg_loss', 0):.4f} | "
-            f"ContextPatch: {train_losses.get('context_patch_loss', 0):.4f} | "
-            f"ContextAggreg: {train_losses.get('context_aggreg_loss', 0):.4f} "
+        if accelerator.is_main_process:
+            print(
+                f"Epoch {epoch:04d} | "
+                f"Train Loss: {train_losses['loss']:.5f} | "
+                f"Train LocalDice: {train_losses['local_dice']:.5f} | "
+                f"Train FinalDice: {train_losses['final_dice']:.5f} | "
+                f"Val Loss: {val_loss:.5f} | "
+                f"Val LocalDice: {val_local_dice:.5f} | "
+                f"Val FinalDice: {val_final_dice:.5f} | "
+                f"Val CtxDice: {val_context_dice:.5f} | "
+                f"LR: {scheduler.get_last_lr()[0]:.2e}"
+            )
+            print(
+                f"  Losses -> "
+                f"TargetPatch: {train_losses.get('target_patch_loss', 0):.4f} | "
+                f"TargetAggreg: {train_losses.get('target_aggreg_loss', 0):.4f} | "
+                f"ContextPatch: {train_losses.get('context_patch_loss', 0):.4f} | "
+                f"ContextAggreg: {train_losses.get('context_aggreg_loss', 0):.4f} "
 
-        )
+            )
 
-        if cfg.logging.use_wandb:
+        if cfg.logging.use_wandb and accelerator.is_main_process:
             log_dict = {
                 "epoch": epoch,
                 "train_loss": train_losses["loss"],
@@ -309,21 +326,26 @@ def main(cfg: DictConfig) -> None:
                     log_dict[f"train_level_{i}_context_feature_aggreg_loss"] = train_losses.get(f"level_{i}_context_feature_aggreg_loss", 0)
             wandb.log(log_dict)
 
-        # Save best
+        # Save best (only on main process)
         if val_final_dice > best_dice:
             best_dice = val_final_dice
-            print(f"  -> New best dice: {best_dice:.5f}")
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_dice": best_dice,
-                "config": OmegaConf.to_container(cfg, resolve=True),  # checkpoint needs plain dict
-            }, ckpt_dir / "best_model.pt")
+            if accelerator.is_main_process:
+                print(f"  -> New best dice: {best_dice:.5f}")
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                unwrapped_model = accelerator.unwrap_model(model)
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": unwrapped_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_dice": best_dice,
+                    "config": OmegaConf.to_container(cfg, resolve=True),  # checkpoint needs plain dict
+                }, ckpt_dir / "best_model.pt")
 
-    print(f"\nTraining complete! Best Dice: {best_dice:.5f}")
+    if accelerator.is_main_process:
+        print(f"\nTraining complete! Best Dice: {best_dice:.5f}")
 
-    if cfg.logging.use_wandb:
+    if cfg.logging.use_wandb and accelerator.is_main_process:
         wandb.finish()
 
 

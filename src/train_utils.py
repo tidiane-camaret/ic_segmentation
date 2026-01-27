@@ -71,9 +71,10 @@ def build_dataloaders(config: Dict, DatasetClass, collate_fn) -> tuple:
     return train_loader, val_loader
 
 
-def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad_accumulate_steps=1):
+def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad_accumulate_steps=1, accelerator=None):
     """Run one training epoch. Model must have loss functions set via set_loss_functions()."""
     model.train()
+    is_main = accelerator is None or accelerator.is_main_process
     total_loss = 0.0
     total_aggreg = 0.0
     total_local = 0.0
@@ -177,7 +178,10 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
 
         # Scale loss for gradient accumulation
         scaled_loss = loss / grad_accumulate_steps
-        scaled_loss.backward()
+        if accelerator is not None:
+            accelerator.backward(scaled_loss)
+        else:
+            scaled_loss.backward()
 
         # Step optimizer at end of accumulation window
         if (idx + 1) % grad_accumulate_steps == 0:
@@ -200,7 +204,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
         total_context_feature_patch += losses.get("context_feature_patch_loss", torch.tensor(0.0)).item()
         total_context_feature_aggreg += losses.get("context_feature_aggreg_loss", torch.tensor(0.0)).item()
 
-        if print_every and idx % print_every == 0:
+        if print_every and idx % print_every == 0 and is_main:
             ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
@@ -407,10 +411,12 @@ def validate(
     device,
     save_dir: Optional[Path] = None,
     max_save_batches: int = 2,
+    accelerator=None,
 ):
     """Run validation without oracle guidance (realistic inference).
     Uses model.aggreg_criterion for loss computation."""
     model.eval()
+    is_main = accelerator is None or accelerator.is_main_process
     total_loss = 0.0
     total_local_dice = 0.0
     total_final_dice = 0.0
@@ -507,13 +513,13 @@ def validate(
                 total_context_dice += ctx_dice.mean().item()
                 context_dice_count += 1
 
-        # Save outputs if requested
-        if save_dir is not None and batch_idx < max_save_batches:
+        # Save outputs if requested (only on main process)
+        if save_dir is not None and batch_idx < max_save_batches and is_main:
             case_ids = batch.get("case_id", None)
             save_predictions(save_dir, case_ids, images, labels, outputs,
                            context_in=context_in, context_out=context_out)
 
-    if save_dir is not None:
+    if save_dir is not None and is_main:
         print(f"  Saved validation outputs to {save_dir}")
 
     n = len(val_loader)
