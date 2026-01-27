@@ -1,0 +1,21 @@
+# Local machine configuration
+# Paths
+paths:
+  root: /data/ic_segmentation
+  DATA_DIR: ${.root}/data
+  RESULTS_DIR: ${.root}/results
+  totalseg: ${.DATA_DIR}/TotalSeg
+  medsegbench: ${.DATA_DIR}/MedSegBench
+  totalseg2d: ${.DATA_DIR}/TotalSeg2D
+  totalseg_stats: ${.totalseg}/totalseg_stats.pkl
+  ckpts:
+    save_dir: ${..RESULTS_DIR}/checkpoints
+    medverse: ${..root}/checkpoints/Medverse.ckpt
+    dino_vit: ${..root}/checkpoints/dinov3-vitl16
+    dino_convnext: ${..root}/checkpoints/dinov3-convnext-large
+
+# Cluster-specific training settings (smaller for local dev)
+train_batch_size: 8
+val_batch_size: 8
+training:
+  num_workers: 4

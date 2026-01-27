@@ -3,9 +3,9 @@
 # Multi-run sweep: python scripts/train.py -m context_size=1,2,3
 
 defaults:
-  - paths: nfs  # Options: nfs, local, dlclarge
   - _self_
-  - experiment: null  # Optional: override with experiment=attention (loaded last to override base)
+  - experiment: null  # Optional: override with experiment=attention
+  - cluster@_global_: nfs  # Options: nfs, local, dlclarge (loaded last with override)
 
 # Dataset
 dataset: totalseg2d
