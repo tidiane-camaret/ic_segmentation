@@ -194,6 +194,11 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
         total_local += losses["local_loss"].item()
         total_agg += losses["agg_loss"].item()
 
+        # Free memory
+        del outputs, losses
+        if idx % 10 == 0:
+            torch.cuda.empty_cache()
+
         # Track detailed losses (use .item() to get scalar, handle tensor(0.0) case)
         total_target_patch += losses.get("target_patch_loss", torch.tensor(0.0)).item()
         total_target_aggreg += losses.get("target_aggreg_loss", torch.tensor(0.0)).item()
