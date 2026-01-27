@@ -5,7 +5,7 @@
 defaults:
   - _self_
   - experiment: null  # Optional: override with experiment=attention
-  - cluster@_global_: nfs  # Options: nfs, local, dlclarge (loaded last with override)
+  - cluster: nfs  # Options: nfs, local, dlclarge
 
 # Dataset
 dataset: totalseg2d
