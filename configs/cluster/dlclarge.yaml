@@ -20,3 +20,6 @@ train_batch_size: 32
 val_batch_size: 32
 training:
   num_workers: 16
+
+logging:
+  save_imgs_masks: false
