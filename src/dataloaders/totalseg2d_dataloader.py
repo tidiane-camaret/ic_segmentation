@@ -157,15 +157,26 @@ class TotalSeg2DDataset(Dataset):
             self._filter_by_split(split)
 
         # Build list of all (case_id, label_id, axis) samples
+        # Also build (label_id, axis) -> [valid_case_ids] mapping for fast context lookup
         self.samples = []
+        self.valid_contexts: Dict[Tuple[str, str], List[str]] = {}  # (label_id, axis) -> [case_ids]
+
         for case_id, labels in self.stats.items():
-            for label_id in labels.keys():
+            for label_id, label_stats in labels.items():
                 if label_id in label_id_set:
                     # Check case exists in root_dir
                     case_dir = self.root_dir / case_id / label_id
                     if case_dir.exists():
                         for axis in self.axes:
-                            self.samples.append((case_id, label_id, axis))
+                            # Use slice_coverage from stats if available (after re-preprocessing)
+                            # Otherwise include all samples (will be filtered at runtime)
+                            slice_coverage = label_stats.get("slice_coverage", {})
+                            coverage = slice_coverage.get(axis, 1)  # default to 1 if not available
+
+                            if coverage > 0:
+                                self.samples.append((case_id, label_id, axis))
+                                key = (label_id, axis)
+                                self.valid_contexts.setdefault(key, []).append(case_id)
 
         print(f"Created {len(self.samples)} samples")
 
@@ -282,8 +293,8 @@ class TotalSeg2DDataset(Dataset):
         label_path_npy = slice_dir / f"{axis}_slice.npy"
 
         if img_path_npy.exists():
-            img = np.load(img_path_npy)
-            label = np.load(label_path_npy)
+            img = np.load(img_path_npy, mmap_mode='r')
+            label = np.load(label_path_npy, mmap_mode='r')
         else:
             # Legacy .nii.gz format
             img_path = slice_dir / f"{axis}_slice_img.nii.gz"
@@ -411,6 +422,10 @@ class TotalSeg2DDataset(Dataset):
         # Load target
         target_img, target_label = self._load_slice(target_case_id, label_id, axis)
 
+        # Warn if target mask is empty (shouldn't happen with proper preprocessing)
+        if target_label.max() == 0:
+            print(f"Warning: Empty target mask for {target_case_id}/{label_id}/{axis}")
+
         # Load target features if requested
         target_features = None
         if self.load_dinov3_features:
@@ -423,28 +438,38 @@ class TotalSeg2DDataset(Dataset):
 
         target_img = self._normalize_image(target_img)
 
-        # Get context cases with same label (excluding target)
-        available_contexts = [c for c in self.label_to_cases.get(label_id, []) if c != target_case_id]
+        # Get context cases with same label+axis that have non-empty masks (excluding target)
+        # Use precomputed valid_contexts if available, otherwise fall back to label_to_cases
+        context_key = (label_id, axis)
+        if context_key in self.valid_contexts:
+            available_contexts = [c for c in self.valid_contexts[context_key] if c != target_case_id]
+        else:
+            available_contexts = [c for c in self.label_to_cases.get(label_id, []) if c != target_case_id]
 
         if len(available_contexts) == 0:
-            raise RuntimeError(f"No context cases for label '{label_id}'")
+            raise RuntimeError(f"No context cases for label '{label_id}' axis '{axis}'")
 
-        # Sample context cases
-        k = min(self.context_size, len(available_contexts))
+        # Shuffle all available contexts and try until we have enough valid ones
         if self.random_context:
-            context_case_ids = random.sample(available_contexts, k)
-        else:
-            context_case_ids = available_contexts[:k]
+            random.shuffle(available_contexts)
 
-        # Load context slices
+        # Load context slices - try all candidates until we have enough
         context_imgs = []
         context_labels = []
         context_features_list = []
         valid_context_ids = []
 
-        for ctx_case_id in context_case_ids:
+        for ctx_case_id in available_contexts:
+            # Stop once we have enough valid contexts
+            if len(context_imgs) >= self.context_size:
+                break
+
             try:
                 ctx_img, ctx_label = self._load_slice(ctx_case_id, label_id, axis)
+
+                # Skip context if mask is empty (label doesn't exist in this slice)
+                if ctx_label.max() == 0:
+                    continue
 
                 # Load context features if requested
                 ctx_features = None
@@ -467,7 +492,7 @@ class TotalSeg2DDataset(Dataset):
                 continue
 
         if len(context_imgs) == 0:
-            raise RuntimeError(f"Failed to load any context for label '{label_id}'")
+            raise RuntimeError(f"Failed to load any context for label '{label_id}' axis '{axis}' (tried {len(available_contexts)} cases, all had empty masks)")
 
         # Resize if needed
         if self.image_size is not None:
@@ -549,25 +574,31 @@ class TotalSeg2DDataset(Dataset):
         if self.load_dinov3_features:
             target_features = self._load_features(target_case_id, sampled_labels[0], axis)
 
-        # Sample context cases (excluding target)
+        # Get context candidates (excluding target), shuffle if random
         context_candidates = [c for c in available_cases if c != target_case_id]
-        k = min(self.context_size, len(context_candidates))
         if self.random_context:
-            context_case_ids = random.sample(context_candidates, k)
-        else:
-            context_case_ids = context_candidates[:k]
+            random.shuffle(context_candidates)
 
-        # Load context slices with same color mapping
+        # Load context slices with same color mapping - try all until we have enough
         context_imgs = []
         context_labels = []
         context_features_list = []
         valid_context_ids = []
 
-        for ctx_case_id in context_case_ids:
+        for ctx_case_id in context_candidates:
+            # Stop once we have enough valid contexts
+            if len(context_imgs) >= self.context_size:
+                break
+
             try:
                 ctx_img, ctx_label = self._create_colored_mask(
                     ctx_case_id, sampled_labels, axis, color_map
                 )
+
+                # Skip context if mask is empty (labels don't exist in this slice)
+                if ctx_label.max() == 0:
+                    continue
+
                 ctx_img = self._normalize_image(ctx_img)
 
                 # Load context features if requested
@@ -585,7 +616,7 @@ class TotalSeg2DDataset(Dataset):
                 continue
 
         if len(context_imgs) == 0:
-            raise RuntimeError(f"Failed to load any context for labels {sampled_labels}")
+            raise RuntimeError(f"Failed to load any context for labels {sampled_labels} axis '{axis}' (tried {len(context_candidates)} cases)")
 
         # Resize if needed
         if self.image_size is not None:

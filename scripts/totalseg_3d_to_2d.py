@@ -40,15 +40,25 @@ def process_label_full(args):
         # Extract spacing from affine (diagonal elements give voxel size)
         spacing_3d = tuple(float(s) for s in nib.affines.voxel_sizes(label_nii.affine))
 
+        # Extract slices at position with maximum label coverage (not center)
+        # This handles discontinuous labels like costal_cartilages where center may be empty
+        z_counts = label_data.sum(axis=(1, 2))  # sum over y,x for each z
+        y_counts = label_data.sum(axis=(0, 2))  # sum over z,x for each y
+        x_counts = label_data.sum(axis=(0, 1))  # sum over z,y for each x
+
+        zc = int(z_counts.argmax())
+        yc = int(y_counts.argmax())
+        xc = int(x_counts.argmax())
+
         stats = {
             "bbox": ((zmin, zmax), (ymin, ymax), (xmin, xmax)),
             "volume": volume,
             "center": center,
             "spacing_3d": spacing_3d,  # (sz, sy, sx) in mm
+            "slice_indices": {"z": zc, "y": yc, "x": xc},
+            "slice_coverage": {"z": int(z_counts[zc]), "y": int(y_counts[yc]), "x": int(x_counts[xc])},
         }
 
-        # Extract slices at label center
-        zc, yc, xc = center
         slices = {"z": label_data[zc, :, :],
                   "y": label_data[:, yc, :],
                   "x": label_data[:, :, xc]}

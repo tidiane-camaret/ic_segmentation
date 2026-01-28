@@ -1225,15 +1225,16 @@ class ContinuousSampler(nn.Module):
         device = image.device
 
         # Valid sampling region (ensure patch fits)
-        valid_h = H - ps
-        valid_w = W - ps
+        valid_h = H - ps + 1
+        valid_w = W - ps + 1
 
         if valid_h <= 0 or valid_w <= 0:
             raise ValueError(f"Image size ({H}, {W}) too small for patch size {ps}")
 
-        # Crop weights to valid region and flatten
-        valid_weights = weights[:, :, :valid_h, :valid_w]  # [B, 1, valid_h, valid_w]
-        flat_weights = valid_weights.reshape(B, -1)  # [B, valid_h * valid_w]
+        # Pool weights over patch area - weight at (h,w) = max weight in patch starting at (h,w)
+        # Using max_pool ensures any patch containing foreground gets weight 1.0 (not diluted by avg)
+        pooled_weights = F.max_pool2d(weights, kernel_size=ps, stride=1, padding=0)  # [B, 1, valid_h, valid_w]
+        flat_weights = pooled_weights.reshape(B, -1)  # [B, valid_h * valid_w]
 
         # Normalize to probabilities with temperature
         flat_weights = flat_weights / self.temperature

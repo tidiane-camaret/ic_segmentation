@@ -16,7 +16,7 @@ paths:
     dino_convnext: ${..root}/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3
 
 # Cluster-specific training settings
-train_batch_size: 64
-val_batch_size: 64
+train_batch_size: 128
+val_batch_size: 128
 training:
-  num_workers: 8
+  num_workers: 4

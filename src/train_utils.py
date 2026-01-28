@@ -287,15 +287,16 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
     }
 
 def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=10,
-                     context_in=None, context_out=None, batch_idx=0):
+                     context_in=None, context_out=None, batch_idx=0, label_ids=None):
     """Save images, masks, and predictions to NIfTI files organized by case ID."""
     save_dir = Path(save_dir)
     B = min(images.shape[0], max_samples)
 
     for i in range(B):
         case_id = case_ids[i] if case_ids else f"case{i:04d}"
+        label_id = label_ids[i] if label_ids else "unk"
         # Include batch_idx and sample index to avoid overwrites when same case_id appears multiple times
-        case_dir = save_dir / f"{case_id}_b{batch_idx:02d}_s{i:02d}"
+        case_dir = save_dir / f"{case_id}_{label_id}_b{batch_idx:02d}_s{i:02d}"
         case_dir.mkdir(parents=True, exist_ok=True)
 
         # Input image
@@ -558,8 +559,10 @@ def validate(
         # Save outputs if requested (only on main process)
         if save_dir is not None and batch_idx < max_save_batches and is_main:
             case_ids = batch.get("case_id", None)
+            label_ids = batch.get("label_ids", None) or batch.get("label_id", None)
             save_predictions(save_dir, case_ids, images, labels, outputs,
-                           context_in=context_in, context_out=context_out, batch_idx=batch_idx)
+                           context_in=context_in, context_out=context_out, batch_idx=batch_idx,
+                           label_ids=label_ids)
 
     if save_dir is not None and is_main:
         print(f"  Saved validation outputs to {save_dir}")
