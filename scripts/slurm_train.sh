@@ -6,4 +6,4 @@
 #SBATCH --time=10:00:00
 
 cd ic_segmentation
-uv run accelerate launch scripts/train.py cluster=dlclarge experiment=attention
+uv run accelerate launch --mixed_precision=fp16 scripts/train.py experiment=high_capacity cluster=dlclarge

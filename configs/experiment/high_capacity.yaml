@@ -4,7 +4,7 @@
 
 train_batch_size: 64
 val_batch_size: 64
-max_ds_len: 100000
+max_ds_len: null 
 context_size: 1
 random_coloring_nb: 0  # Binary segmentation (clearer gradients)
 method: "patch_icl"
@@ -36,23 +36,23 @@ model:
         sampling_temperature: 0.3
 
     oracle_levels_train: [true]
-    oracle_levels_valid: [false]
+    oracle_levels_valid: [true]
 
     sampler:
-      type: "weighted"
+      type: "continuous"
       gumbel_tau: 1.0
       gumbel_tau_min: 0.1
       gumbel_hard: true
       stride_divisor: 4
       augmentation:
-        enabled: true
-        rotation: "90"
+        enabled: false
+        rotation: "continuous"
         flip_horizontal: false
         flip_vertical: false
 
     aggregator:
       type: "gaussian"
-      combine_mode: "coverage"
+      combine_mode: "average"
       sigma_ratio: 0.125
       min_coverage: 0.000001
 

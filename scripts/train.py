@@ -21,7 +21,7 @@ def main(cfg: DictConfig) -> None:
 
     # Initialize accelerator for multi-GPU support
     from accelerate import DistributedDataParallelKwargs
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
 
