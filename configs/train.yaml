@@ -17,6 +17,7 @@ method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
 train_label_ids: "train"
 val_label_ids: "val"
 
+feature_extraction_resolution: 256
 # Preprocessing
 preprocessing:
   image_size: [512, 512, 512]

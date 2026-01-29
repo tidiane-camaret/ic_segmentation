@@ -10,6 +10,9 @@ context_size: 1
 random_coloring_nb: 0  # Binary segmentation (clearer gradients)
 method: "patch_icl"
 
+preprocessing:
+  image_size: [256, 256, 256]
+
 training:
   seed: 42
   num_epochs: 200
@@ -57,7 +60,7 @@ model:
     backbone:
       type: "simple"
       encoder:
-        embed_dim: 1024
+        embed_dim: 768
         embed_proj_dim: 128  # 4x larger (128 -> 512)
       cross_attention:
         num_heads: 8

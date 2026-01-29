@@ -2484,10 +2484,9 @@ def build_modular_backbone(
     num_latents: int = 4,
     decoder_hidden_dim: int = 64,
     use_rope_2d: bool = True,
+    feature_grid_size: int = 8,
 ) -> ModularBackbone:
     """Factory function to build modular backbone from config."""
-
-    feature_grid_size = 7  # DINO ViT-L: 7x7 tokens per patch
 
     # Build encoder
     if encoder_type == "cnn":

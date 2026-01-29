@@ -311,13 +311,28 @@ class TotalSeg2DDataset(Dataset):
             features: [196, 1024] patch features (14x14 grid) or None if not found
         """
         slice_dir = self.root_dir / case_id / label_id
-        features_path = slice_dir / f"{axis}_slice_img_dinov3.npz"
+        features_path = slice_dir / f"{axis}_slice_img_meddino.npz"
 
         if not features_path.exists():
             return None
 
-        data = np.load(str(features_path))
-        return data["features"].astype(np.float32)
+        data = np.load(features_path)
+        layer_idx = 11
+        cls = torch.from_numpy(data[f"layer_{layer_idx}_cls"])
+        regs = torch.from_numpy(data[f"layer_{layer_idx}_registers"])
+        patches = torch.from_numpy(data[f"layer_{layer_idx}_patches"])
+
+        # Ensure they have a consistent batch dimension if needed
+        # Here we assume shape (N, 768)
+        if cls.ndim == 1: cls = cls.unsqueeze(0) 
+        if regs.ndim == 1: regs = regs.unsqueeze(0)
+        if patches.ndim == 1: patches = patches.unsqueeze(0)
+
+        # Concatenate along the sequence dimension (dim=0)
+        # Order: CLS (1) + Registers (4) + Patches (251?)
+        full_sequence = torch.cat([cls, regs, patches], dim=0)
+        
+        return full_sequence # Total length should be 256
 
     def _get_2d_bbox(self, case_id: str, label_id: str, axis: str) -> Tuple[int, int, int, int]:
         """
@@ -372,7 +387,7 @@ class TotalSeg2DDataset(Dataset):
 
     def _resize(self, arr: np.ndarray, size: Tuple[int, int], mode: str = "bilinear") -> np.ndarray:
         """Resize 2D array to target size."""
-        tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        tensor = torch.from_numpy(arr.copy()).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
         if mode == "bilinear":
             resized = torch.nn.functional.interpolate(tensor, size=size, mode="bilinear", align_corners=False)
         else:
@@ -521,10 +536,10 @@ class TotalSeg2DDataset(Dataset):
         # Add features if loaded
         if self.load_dinov3_features:
             if target_features is not None:
-                result["target_features"] = torch.from_numpy(target_features)  # [196, 1024]
+                result["target_features"] = target_features # [196, 1024]
             if context_features_list:
                 result["context_features"] = torch.stack(
-                    [torch.from_numpy(f) for f in context_features_list]
+                    [f for f in context_features_list]
                 )  # [k, 196, 1024]
 
         return result

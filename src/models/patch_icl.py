@@ -33,7 +33,7 @@ def extract_patch_features(
     coords: torch.Tensor,
     patch_size: int,
     level_resolution: int,
-    feature_grid_size: int = 14,
+    feature_grid_size: int = 16,
 ) -> torch.Tensor:
     """
     Extract patch features from pre-computed full-image feature maps (vectorized).
