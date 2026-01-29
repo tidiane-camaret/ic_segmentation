@@ -54,7 +54,7 @@ class SegmentationHead(nn.Module):
         embed_dim: int = 1024,
         num_classes: int = 1,
         patch_size: int = 16,
-        feature_grid_size: int = 7,
+        feature_grid_size: int = 8,
     ):
         """
         Args:
@@ -146,7 +146,7 @@ class PixelShuffleDecoder(nn.Module):
         embed_dim: int = 128,
         num_classes: int = 1,
         patch_size: int = 112,
-        feature_grid_size: int = 7,
+        feature_grid_size: int = 8,
         hidden_dim: int = 64,
     ):
         super().__init__()
@@ -230,7 +230,7 @@ class UNetDecoder(nn.Module):
         embed_dim: int = 128,
         num_classes: int = 1,
         patch_size: int = 112,
-        feature_grid_size: int = 7,
+        feature_grid_size: int = 8,
         bottleneck_dim: int = 128,
     ):
         super().__init__()
@@ -1953,7 +1953,7 @@ class PrecomputedFeatureBackbone(nn.Module):
 class PatchEncoderBase(nn.Module):
     """Base class for patch encoders that convert DINO features to compact representations."""
 
-    def __init__(self, embed_dim: int, output_dim: int, feature_grid_size: int = 7):
+    def __init__(self, embed_dim: int, output_dim: int, feature_grid_size: int = 8):
         super().__init__()
         self.embed_dim = embed_dim
         self.output_dim = output_dim
@@ -1986,7 +1986,7 @@ class CNNPatchEncoder(PatchEncoderBase):
         embed_dim: int = 1024,
         embed_proj_dim: int = 128,
         output_dim: int = 128,
-        feature_grid_size: int = 7,
+        feature_grid_size: int = 8,
     ):
         super().__init__(embed_dim, output_dim, feature_grid_size)
         self.embed_proj_dim = embed_proj_dim
@@ -2020,7 +2020,7 @@ class CNNPatchEncoder(PatchEncoderBase):
         h = w = self.feature_grid_size
         D = self.embed_proj_dim
 
-        # Project and reshape: [B, K, 49, 1024] → [B*K, D, 7, 7]
+        # Project and reshape: [B, K, 49, 1024] → [B*K, D, 8, 8]
         x = self.proj(img_patches.view(-1, E))
         x = x.view(B * K, NF, D).permute(0, 2, 1).view(B * K, D, h, w)
 
@@ -2052,7 +2052,7 @@ class PerceiverPatchEncoder(PatchEncoderBase):
         embed_dim: int = 1024,
         embed_proj_dim: int = 128,
         output_dim: int = 128,
-        feature_grid_size: int = 7,
+        feature_grid_size: int = 8,
         num_latents: int = 4,
         num_heads: int = 8,
     ):
@@ -2117,7 +2117,7 @@ class PerceiverPatchEncoder(PatchEncoderBase):
 class PatchDecoderBase(nn.Module):
     """Base class for patch decoders that convert compact representations to masks."""
 
-    def __init__(self, input_dim: int, num_classes: int, patch_size: int, feature_grid_size: int = 7):
+    def __init__(self, input_dim: int, num_classes: int, patch_size: int, feature_grid_size: int = 8):
         super().__init__()
         self.input_dim = input_dim
         self.num_classes = num_classes
@@ -2150,7 +2150,7 @@ class UNetPatchDecoder(PatchDecoderBase):
         input_dim: int = 128,
         num_classes: int = 1,
         patch_size: int = 112,
-        feature_grid_size: int = 7,
+        feature_grid_size: int = 8,
         hidden_dim: int = 64,
     ):
         super().__init__(input_dim, num_classes, patch_size, feature_grid_size)
@@ -2234,7 +2234,7 @@ class PerceiverPatchDecoder(PatchDecoderBase):
         input_dim: int = 128,
         num_classes: int = 1,
         patch_size: int = 112,
-        feature_grid_size: int = 7,
+        feature_grid_size: int = 8,
         hidden_dim: int = 64,
         num_heads: int = 8,
     ):
@@ -2484,9 +2484,10 @@ def build_modular_backbone(
     num_latents: int = 4,
     decoder_hidden_dim: int = 64,
     use_rope_2d: bool = True,
-    feature_grid_size: int = 8,
 ) -> ModularBackbone:
     """Factory function to build modular backbone from config."""
+
+    feature_grid_size = 7  # DINO ViT-L: 7x7 tokens per patch
 
     # Build encoder
     if encoder_type == "cnn":
