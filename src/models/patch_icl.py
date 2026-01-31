@@ -300,6 +300,7 @@ class PatchICL_Level(nn.Module):
         target_features: torch.Tensor = None,
         context_features: torch.Tensor = None,
         training: bool = False,
+        return_attn_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for this level.
@@ -312,6 +313,7 @@ class PatchICL_Level(nn.Module):
             original_coords_scale: Scale factor for coordinates
             context_in: [B, k, C, H, W] - context images
             context_out: [B, k, C_mask, H, W] - context masks
+            return_attn_weights: If True, return attention weights and register tokens
             target_features: [B, N, D] - Pre-computed features for target
             context_features: [B, k, N, D] - Pre-computed features for context
             training: Whether in training mode
@@ -441,12 +443,16 @@ class PatchICL_Level(nn.Module):
             )
 
             # Forward through backbone
-            backbone_out = self.backbone(**backbone_inputs)
+            backbone_out = self.backbone(**backbone_inputs, return_attn_weights=return_attn_weights)
 
             # Split predictions
             all_logits = backbone_out['mask_patch_logit_preds']
             patch_logits = all_logits[:, :K]
             context_patch_logits = all_logits[:, K:]
+
+            # Capture attention outputs if requested
+            attn_weights = backbone_out.get('attn_weights', None)
+            register_tokens = backbone_out.get('register_tokens', None)
 
             # Aggregate context predictions (apply inverse augmentation first)
             K_per_ctx = K_ctx // k
@@ -477,8 +483,12 @@ class PatchICL_Level(nn.Module):
                 target_coords=coords_scaled,
             )
 
-            backbone_out = self.backbone(**backbone_inputs)
+            backbone_out = self.backbone(**backbone_inputs, return_attn_weights=return_attn_weights)
             patch_logits = backbone_out['mask_patch_logit_preds']
+
+            # Capture attention outputs if requested
+            attn_weights = backbone_out.get('attn_weights', None)
+            register_tokens = backbone_out.get('register_tokens', None)
 
         # Apply inverse augmentation before aggregation
         patch_logits_for_agg = patch_logits
@@ -501,6 +511,8 @@ class PatchICL_Level(nn.Module):
             'context_coords': context_coords,
             'context_pred': context_pred,
             'context_labels': context_out_ds,
+            'attn_weights': attn_weights,
+            'register_tokens': register_tokens,
         }
 
 
@@ -806,8 +818,13 @@ class PatchICL(nn.Module):
         target_features: torch.Tensor = None,
         context_features: torch.Tensor = None,
         mode: str = "train",
+        return_attn_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Forward pass through all levels."""
+        """Forward pass through all levels.
+
+        Args:
+            return_attn_weights: If True, return attention weights and register tokens
+        """
         training = (mode == "train")
         _, _, H, W = image.shape
         self.original_size = (H, W)
@@ -834,6 +851,7 @@ class PatchICL(nn.Module):
                 target_features=target_features,
                 context_features=context_features,
                 training=training,
+                return_attn_weights=return_attn_weights,
             )
             level_outputs.append(level_out)
 
@@ -862,6 +880,8 @@ class PatchICL(nn.Module):
             'context_coords': finest_level.get('context_coords'),
             'target_mask': finest_level.get('target_mask'),
             'context_mask': finest_level.get('context_mask'),
+            'attn_weights': finest_level.get('attn_weights'),
+            'register_tokens': finest_level.get('register_tokens'),
         }
 
     def compute_loss(

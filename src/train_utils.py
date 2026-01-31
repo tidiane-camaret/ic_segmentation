@@ -287,7 +287,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
     }
 
 def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, max_samples=10,
-                     context_in=None, context_out=None, batch_idx=0, label_ids=None):
+                     context_in=None, context_out=None, label_ids=None, axes=None):
     """Save images, masks, and predictions to NIfTI files organized by case ID."""
     save_dir = Path(save_dir)
     B = min(images.shape[0], max_samples)
@@ -295,8 +295,8 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
     for i in range(B):
         case_id = case_ids[i] if case_ids else f"case{i:04d}"
         label_id = label_ids[i] if label_ids else "unk"
-        # Include batch_idx and sample index to avoid overwrites when same case_id appears multiple times
-        case_dir = save_dir / f"{case_id}_{label_id}_b{batch_idx:02d}_s{i:02d}"
+        axis = axes[i] if axes else "unk"
+        case_dir = save_dir / f"{case_id}_{label_id}_{axis}"
         case_dir.mkdir(parents=True, exist_ok=True)
 
         # Input image
@@ -406,6 +406,20 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
             vis_nib = nib.Nifti1Image(vis_img.astype(np.float32), affine=np.eye(4))
             nib.save(vis_nib, case_dir / f"level{level_idx}_patch_positions_mask.nii.gz")
 
+            # Save attention weights and register tokens if available
+            attn_weights = level_out.get("attn_weights")
+            register_tokens = level_out.get("register_tokens")
+
+            if attn_weights is not None:
+                # attn_weights is a list of [B, H, K, K] tensors per layer
+                for layer_idx, layer_attn in enumerate(attn_weights):
+                    attn_np = layer_attn[i].cpu().numpy()  # [H, K, K]
+                    np.save(case_dir / f"level{level_idx}_layer{layer_idx}_attn_weights.npy", attn_np)
+
+            if register_tokens is not None:
+                reg_np = register_tokens[i].cpu().numpy()  # [R, D]
+                np.save(case_dir / f"level{level_idx}_register_tokens.npy", reg_np)
+
 
 def _extract_patch_labels(labels: torch.Tensor, coords: torch.Tensor, patch_size: int, level_res: int) -> torch.Tensor:
     """Extract GT patch labels using coordinates from model output.
@@ -502,6 +516,8 @@ def validate(
         # Pass labels to model - oracle behavior is controlled by model config
         # (oracle_levels_valid). If oracle=False, model uses prev_pred for sampling.
         # If oracle=True, model uses GT. This allows config to control behavior.
+        # Return attention weights when saving outputs
+        should_save = save_dir is not None and batch_idx < max_save_batches and is_main
         outputs = model(
             images,
             labels=labels,
@@ -510,6 +526,7 @@ def validate(
             target_features=target_features,
             context_features=context_features,
             mode="test",
+            return_attn_weights=should_save,
         )
         predictions = outputs["final_logit"]
 
@@ -553,11 +570,13 @@ def validate(
         # Track per-case and per-label dice
         batch_case_ids = batch.get("case_id", [None] * images.shape[0])
         batch_label_ids = batch.get("label_ids", None) or batch.get("label_id", [None] * images.shape[0])
+        batch_axes = batch.get("axes", [None] * images.shape[0])
         for i in range(images.shape[0]):
             case_id = batch_case_ids[i] if batch_case_ids else f"batch{batch_idx}_sample{i}"
             label_id = batch_label_ids[i] if batch_label_ids else "unknown"
+            axis = batch_axes[i] if batch_axes else "unknown"
             dice_val = final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
-            case_results.append({"case_id": case_id, "label_id": label_id, "dice": dice_val})
+            case_results.append({"case_id": case_id, "label_id": label_id, "axis": axis, "dice": dice_val})
             if label_id not in label_dice_scores:
                 label_dice_scores[label_id] = []
             label_dice_scores[label_id].append(dice_val)
@@ -578,12 +597,13 @@ def validate(
                 context_dice_count += 1
 
         # Save outputs if requested (only on main process)
-        if save_dir is not None and batch_idx < max_save_batches and is_main:
+        if should_save:
             case_ids = batch.get("case_id", None)
             label_ids = batch.get("label_ids", None) or batch.get("label_id", None)
+            axes = batch.get("axes", None)
             save_predictions(save_dir, case_ids, images, labels, outputs,
-                           context_in=context_in, context_out=context_out, batch_idx=batch_idx,
-                           label_ids=label_ids)
+                           context_in=context_in, context_out=context_out,
+                           label_ids=label_ids, axes=axes)
 
     if save_dir is not None and is_main:
         print(f"  Saved validation outputs to {save_dir}")

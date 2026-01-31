@@ -233,14 +233,17 @@ class AttentionBlock(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        return_attn_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             x: [B, K, D] - tokens (including registers)
             attn_mask: [B, H, K, K] - float attention mask (-inf for blocked)
+            return_attn_weights: If True, compute and return attention weights
 
         Returns:
-            [B, K, D] - updated tokens
+            x: [B, K, D] - updated tokens
+            attn_weights: [B, H, K, K] or None - attention weights if requested
         """
         B, K, D = x.shape
         H = self.num_heads
@@ -251,11 +254,22 @@ class AttentionBlock(nn.Module):
         k = self.k_proj(x_normed).view(B, K, H, -1).transpose(1, 2)
         v = self.v_proj(x_normed).view(B, K, H, -1).transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout.p if self.training else 0.0,
-        )
+        attn_weights = None
+        if return_attn_weights:
+            # Manual attention computation to get weights
+            scale = 1.0 / math.sqrt(q.shape[-1])
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn_scores = attn_scores + attn_mask
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            if self.training and self.dropout.p > 0:
+                attn_weights = self.dropout(attn_weights)
+            out = torch.matmul(attn_weights, v)
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
 
         out = out.transpose(1, 2).reshape(B, K, D)
         out = self.out_proj(out)
@@ -264,7 +278,7 @@ class AttentionBlock(nn.Module):
         # Pre-norm MLP
         x = x + self.mlp(self.norm2(x))
 
-        return x
+        return x, attn_weights
 
 
 class CrossPatchAttention(nn.Module):
@@ -357,15 +371,18 @@ class CrossPatchAttention(nn.Module):
         x: torch.Tensor,
         coords: torch.Tensor,
         is_context: torch.Tensor,
-    ) -> torch.Tensor:
+        return_attn_weights: bool = False,
+    ) -> tuple[torch.Tensor, dict | None]:
         """
         Args:
             x: [B, K, D] - patch tokens
             coords: [B, K, 2] - patch coordinates (y, x)
             is_context: [B, K] - True for context patches
+            return_attn_weights: If True, return attention weights and registers
 
         Returns:
-            [B, K, D] - updated tokens
+            x: [B, K, D] - updated tokens
+            extras: dict with 'attn_weights' and 'register_tokens' if requested, else None
         """
         B, K, D = x.shape
         device = x.device
@@ -399,17 +416,32 @@ class CrossPatchAttention(nn.Module):
         float_mask = float_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
 
         # Run through attention layers
+        all_attn_weights = []
         for layer in self.layers:
-            x = layer(x, float_mask)
+            x, attn_w = layer(x, float_mask, return_attn_weights=return_attn_weights)
+            if attn_w is not None:
+                all_attn_weights.append(attn_w)
 
         # Final norm
         x = self.final_norm(x)
+
+        # Capture register tokens before removing
+        register_tokens_out = None
+        if return_attn_weights and self.register_tokens is not None:
+            register_tokens_out = x[:, :self.num_registers].clone()
 
         # Remove registers
         if self.register_tokens is not None:
             x = x[:, self.num_registers:]
 
-        return x
+        extras = None
+        if return_attn_weights:
+            extras = {
+                'attn_weights': all_attn_weights,  # List of [B, H, K, K] per layer
+                'register_tokens': register_tokens_out,  # [B, R, D]
+            }
+
+        return x, extras
 
 
 class SimpleCNNDecoder(nn.Module):
@@ -595,6 +627,7 @@ class SimpleBackbone(nn.Module):
         img_patches: torch.Tensor,
         coords: torch.Tensor = None,
         ctx_id_labels: torch.Tensor = None,
+        return_attn_weights: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass: encode → attention → decode.
@@ -603,9 +636,13 @@ class SimpleBackbone(nn.Module):
             img_patches: [B, K, 49, 1024] - DINO features per patch
             coords: [B, K, 2] - Patch coordinates (y, x)
             ctx_id_labels: [B, K] - 0 for target, >0 for context
+            return_attn_weights: If True, return attention weights and register tokens
 
         Returns:
-            Dict with 'mask_patch_logit_preds': [B, K, C, ps, ps]
+            Dict with:
+                'mask_patch_logit_preds': [B, K, C, ps, ps]
+                'attn_weights': List of [B, H, K, K] per layer (if return_attn_weights)
+                'register_tokens': [B, R, D] (if return_attn_weights)
         """
         B, K, NF, E = img_patches.shape
         device = img_patches.device
@@ -625,11 +662,17 @@ class SimpleBackbone(nn.Module):
         encoded, skips = self.encoder(img_patches)
 
         # Cross-patch attention
-        attended = self.attention(encoded, coords, is_context)
+        attended, extras = self.attention(encoded, coords, is_context, return_attn_weights)
 
         # Decode
         mask_pred = self.decoder(attended, skips)
 
-        return {
+        result = {
             'mask_patch_logit_preds': mask_pred,
         }
+
+        if extras is not None:
+            result['attn_weights'] = extras['attn_weights']
+            result['register_tokens'] = extras['register_tokens']
+
+        return result
