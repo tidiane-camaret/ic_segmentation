@@ -455,7 +455,12 @@ def validate(
     accelerator=None,
 ):
     """Run validation without oracle guidance (realistic inference).
-    Uses model.aggreg_criterion for loss computation."""
+    Uses model.aggreg_criterion for loss computation.
+
+    Returns:
+        Tuple of (avg_loss, avg_local_dice, avg_final_dice, avg_context_dice, detailed_results)
+        where detailed_results is a dict with per-case and per-label dice scores.
+    """
     model.eval()
     is_main = accelerator is None or accelerator.is_main_process
     # Get unwrapped model for accessing custom attributes (aggreg_criterion, etc.)
@@ -465,6 +470,10 @@ def validate(
     total_final_dice = 0.0
     total_context_dice = 0.0
     context_dice_count = 0
+
+    # Per-case and per-label tracking
+    case_results = []  # List of {case_id, label_id, dice}
+    label_dice_scores = {}  # label_id -> list of dice scores
 
     for batch_idx, batch in enumerate(val_loader):
         images = batch["image"].to(device)
@@ -541,6 +550,18 @@ def validate(
         final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
         total_final_dice += final_dice.mean().item()
 
+        # Track per-case and per-label dice
+        batch_case_ids = batch.get("case_id", [None] * images.shape[0])
+        batch_label_ids = batch.get("label_ids", None) or batch.get("label_id", [None] * images.shape[0])
+        for i in range(images.shape[0]):
+            case_id = batch_case_ids[i] if batch_case_ids else f"batch{batch_idx}_sample{i}"
+            label_id = batch_label_ids[i] if batch_label_ids else "unknown"
+            dice_val = final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
+            case_results.append({"case_id": case_id, "label_id": label_id, "dice": dice_val})
+            if label_id not in label_dice_scores:
+                label_dice_scores[label_id] = []
+            label_dice_scores[label_id].append(dice_val)
+
         # Context dice: on aggregated context predictions vs context GT
         if level_outputs:
             finest_level = level_outputs[-1]
@@ -569,5 +590,14 @@ def validate(
 
     n = len(val_loader)
     ctx_dice_final = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
-    return total_loss / n, total_local_dice / n, total_final_dice / n, ctx_dice_final
+
+    # Compute per-label averages
+    label_avg_dice = {label_id: sum(scores) / len(scores) for label_id, scores in label_dice_scores.items()}
+
+    detailed_results = {
+        "per_case": case_results,
+        "per_label": label_avg_dice,
+    }
+
+    return total_loss / n, total_local_dice / n, total_final_dice / n, ctx_dice_final, detailed_results
 

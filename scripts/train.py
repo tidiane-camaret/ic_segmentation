@@ -261,7 +261,7 @@ def main(cfg: DictConfig) -> None:
         if save_imgs and epoch % 10 == 0:
             val_save_dir = Path(cfg.paths.RESULTS_DIR) / f"{cfg.dataset}"
 
-        val_loss, val_local_dice, val_final_dice, val_context_dice = validate(
+        val_loss, val_local_dice, val_final_dice, val_context_dice, _ = validate(
             model, val_loader, device,
             save_dir=val_save_dir, max_save_batches=2,
             accelerator=accelerator

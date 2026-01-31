@@ -194,7 +194,7 @@ def main(cfg: DictConfig) -> None:
     if accelerator.is_main_process:
         print(f"save_imgs_masks={save_imgs}, val_save_dir={val_save_dir}")
 
-    val_loss, val_local_dice, val_final_dice, val_context_dice = validate(
+    val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
         model, val_loader, device,
         save_dir=val_save_dir, max_save_batches=len(val_loader),
         accelerator=accelerator
@@ -204,9 +204,12 @@ def main(cfg: DictConfig) -> None:
             f"Val Loss: {val_loss:.5f} | "
             f"Val LocalDice: {val_local_dice:.5f} | "
             f"Val FinalDice: {val_final_dice:.5f} | "
-            f"Val CtxDice: {val_context_dice:.5f} | "
-            f"LR: {scheduler.get_last_lr()[0]:.2e}"
+            f"Val CtxDice: {val_context_dice:.5f}"
         )
+        # Print per-label dice
+        print("\nPer-label Dice:")
+        for label_id, dice in sorted(detailed_results["per_label"].items(), key=lambda x: x[1], reverse=True):
+            print(f"  {label_id}: {dice:.4f}")
 
     if cfg.logging.use_wandb and accelerator.is_main_process:
         log_dict = {
@@ -214,9 +217,17 @@ def main(cfg: DictConfig) -> None:
             "val_local_dice": val_local_dice,
             "val_final_dice": val_final_dice,
             "val_context_dice": val_context_dice,
-            "lr": scheduler.get_last_lr()[0],
         }
+        # Log per-label dice
+        for label_id, dice in detailed_results["per_label"].items():
+            log_dict[f"dice_label/{label_id}"] = dice
         wandb.log(log_dict)
+
+        # Log per-case results as a wandb Table
+        case_table = wandb.Table(columns=["case_id", "label_id", "dice"])
+        for result in detailed_results["per_case"]:
+            case_table.add_data(result["case_id"], result["label_id"], result["dice"])
+        wandb.log({"per_case_dice": case_table})
 
     # Save best (only on main process)
     if val_final_dice > best_dice:
