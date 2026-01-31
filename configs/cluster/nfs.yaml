@@ -17,7 +17,7 @@ paths:
     meddino_vit: ${..root}/checkpoints/med_dino_v3model.pth
 
 # Cluster-specific training settings
-train_batch_size: 256
-val_batch_size: 256
+train_batch_size: 32
+val_batch_size: 32
 training:
   num_workers: 8

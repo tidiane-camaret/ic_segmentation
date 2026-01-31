@@ -59,12 +59,15 @@ model:
 
     backbone:
       type: "simple"
+      # Flat config (required for SimpleBackbone)
+      embed_dim: 768            # DINO ViT-B input dimension
+      embed_proj_dim: 512       # Working dimension (4x larger: 128 -> 512)
+      # Nested config (optional, read with fallbacks)
       encoder:
-        embed_dim: 768
-        embed_proj_dim: 128  # 4x larger (128 -> 512)
+        image_size: 256
       cross_attention:
-        num_heads: 8
-        num_layers: 4  # Deeper reasoning (adds ~10M params, minimal VRAM)
+        num_heads: 64
+        num_layers: 4           # Deeper reasoning
         num_registers: 8
         target_self_attention: true
         dropout: 0.1

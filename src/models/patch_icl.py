@@ -16,7 +16,6 @@ from src.models.backbone import (
     MultiLayerCrossPatchBackbone,
     build_modular_backbone,
 )
-from src.models.simple_backbone import SimpleBackbone
 from src.models.sampling import (
     ContinuousSampler,
     DeterministicTopKSampler,
@@ -26,6 +25,7 @@ from src.models.sampling import (
     SlidingWindowSampler,
     UniformSampler,
 )
+from src.models.simple_backbone import SimpleBackbone
 
 
 def extract_patch_features(
