@@ -8,7 +8,7 @@ from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for src imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src import in meta cluster
 from src.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate
 

@@ -15,6 +15,7 @@ paths:
     dino_vit: ${..root}/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51
     dino_convnext: ${..root}/checkpoints/models--facebook--dinov3-convnext-large-pretrain-lvd1689m/snapshots/e959efa74c867491dcfe3ec3e4f97382e39025b3
     meddino_vit: ${..root}/checkpoints/med_dino_v3model.pth
+    patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
 
 # Cluster-specific training settings
 train_batch_size: 32

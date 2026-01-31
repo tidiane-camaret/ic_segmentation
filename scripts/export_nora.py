@@ -9,8 +9,8 @@ config_path = Path(__file__).parent.parent / "configs"
 initialize_config_dir(config_dir=str(config_path.absolute()), version_base=None)
 cfg = compose(config_name="train")
 
-dir_to_export = Path(cfg.paths.RESULTS_DIR)
-patient_name = cfg.dataset
+dir_to_export = Path(cfg.paths.RESULTS_DIR) 
+patient_name = cfg.dataset + "_val"
 
 project_name = "camaret___in_context_segmentation"
 

@@ -88,5 +88,5 @@ model:
 
 logging:
   use_wandb: true
-  wandb_project: "patch_icl_train"
+  wandb_project: "patch_icl"
   save_imgs_masks: true
