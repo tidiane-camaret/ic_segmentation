@@ -1,5 +1,82 @@
 # Research Logs
 
+## 2026-02-01: Eval Script Improvements + Attention Visualization
+
+### Checkpoint Loading in eval.py
+
+Added checkpoint loading before evaluation:
+```python
+ckpt_path = cfg.paths.ckpts.get(str(cfg.method), None)  # e.g., paths.ckpts.patch_icl
+if ckpt_path:
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state_dict"])
+```
+
+### Per-Case and Per-Label Dice Logging
+
+Modified `validate()` in `train_utils.py` to track individual dice scores:
+- Returns 5-tuple: `(loss, local_dice, final_dice, context_dice, detailed_results)`
+- `detailed_results["per_case"]`: List of `{case_id, label_id, axis, dice}` for each sample
+- `detailed_results["per_label"]`: Dict of average dice per label_id
+
+Updated `eval.py` to log to wandb:
+- Per-label dice as `dice_label/{label_id}` metrics
+- Per-case results as a wandb Table with columns `[case_id, label_id, axis, dice]`
+
+### Axis-Based File Naming
+
+Changed output folder naming from `{case_id}_{label_id}_b{batch}_s{sample}` to `{case_id}_{label_id}_{axis}`:
+```
+Before: s0001_liver_b00_s02/
+After:  s0001_liver_z/
+```
+- `axis` is x, y, or z (the slice plane)
+- Extracted from batch via `batch.get("axes")`
+
+### Attention Weights and Register Token Saving
+
+Modified `simple_backbone.py` to optionally return attention internals:
+
+**AttentionBlock.forward:**
+- Added `return_attn_weights` parameter
+- When True, computes attention manually to capture weights
+- Returns `(x, attn_weights)` where `attn_weights` is `[B, H, K, K]`
+
+**CrossPatchAttention.forward:**
+- Collects attention from all layers into `all_attn_weights` list
+- Captures `register_tokens` after attention, before removal
+- Returns `(x, extras)` where `extras = {'attn_weights': [...], 'register_tokens': [B, R, D]}`
+
+**SimpleBackbone.forward:**
+- Passes through `return_attn_weights` flag
+- Includes `attn_weights` and `register_tokens` in output dict
+
+**PatchICL propagation:**
+- `PatchICL_Level.forward`: Added `return_attn_weights` param, captures backbone outputs
+- `PatchICL.forward`: Passes flag through, includes in final output
+
+**Saving in train_utils.py:**
+- `validate()`: Passes `return_attn_weights=True` only when saving outputs
+- `save_predictions()`: Saves per-layer attention as `.npy`:
+  - `level{idx}_layer{idx}_attn_weights.npy` - shape `[H, K_total, K_total]`
+  - `level{idx}_register_tokens.npy` - shape `[R, D]`
+
+**Attention weight structure:**
+```
+K_total = num_registers + num_target_patches + num_context_patches
+
+Sequence order:
+[0 : R]              → Register tokens
+[R : R + K_target]   → Target patches
+[R + K_target : end] → Context patches
+```
+
+**Files modified:**
+- `scripts/eval.py`: Checkpoint loading, per-case/label logging, axis naming
+- `src/train_utils.py`: `validate()` returns detailed_results, `save_predictions()` saves attention
+- `src/models/simple_backbone.py`: `return_attn_weights` through all layers
+- `src/models/patch_icl.py`: Propagate flag through PatchICL_Level and PatchICL
+
 ## 2027-01-27: SimpleBackbone + High-Capacity Training Config
 
 ### SimpleBackbone Implementation
