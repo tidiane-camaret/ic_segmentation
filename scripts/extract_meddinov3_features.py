@@ -124,7 +124,7 @@ def save_worker(save_queue, stop_event):
 # --- MAIN ---
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg: DictConfig):
-    data_dir = Path(cfg.paths.totalseg2d)
+    data_dir = Path(cfg.paths.totalsegmri2d)
     model_path = cfg.paths.ckpts.meddino_vit
     batch_size = cfg.get("batch_size", 512)
     target_res = cfg.get("feature_extraction_resolution", 256)

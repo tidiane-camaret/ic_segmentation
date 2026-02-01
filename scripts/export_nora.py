@@ -1,8 +1,8 @@
 """Export images and masks to nora project."""
 import os
-from pathlib import Path
-import tempfile
 import shutil
+import tempfile
+from pathlib import Path
 
 from hydra import compose, initialize_config_dir
 
@@ -12,6 +12,7 @@ initialize_config_dir(config_dir=str(config_path.absolute()), version_base=None)
 cfg = compose(config_name="train")
 
 dir_to_export = Path(cfg.paths.RESULTS_DIR) 
+cfg.dataset = "totalsegmri2d"
 patient_name = cfg.dataset + "_" + cfg.method
 
 project_name = "camaret___in_context_segmentation"

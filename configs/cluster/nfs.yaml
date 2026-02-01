@@ -5,10 +5,13 @@ paths:
   root: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122
   DATA_DIR: ${.root}/data
   RESULTS_DIR: ${.root}/results
-  totalseg: ${.DATA_DIR}/TotalSeg
   medsegbench: ${.DATA_DIR}/MedSegBench
+  totalseg: ${.DATA_DIR}/TotalSeg
   totalseg2d: ${.DATA_DIR}/TotalSeg2D
   totalseg_stats: ${.totalseg}/totalseg_stats.pkl
+  totalsegmri: ${.DATA_DIR}/TotalSegMRI
+  totalsegmri2d: ${.DATA_DIR}/TotalSegMRI2D
+  totalsegmri_stats: ${.totalsegmri}/totalsegmri_stats.pkl
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints
     medverse: /nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt

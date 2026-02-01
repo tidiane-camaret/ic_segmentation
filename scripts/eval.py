@@ -49,6 +49,10 @@ def main(cfg: DictConfig) -> None:
         from src.dataloaders.totalseg2d_dataloader import (
             get_dataloader as get_totalseg2d_dataloader,
         )
+    elif cfg.dataset == "totalsegmri2d":
+        from src.dataloaders.totalseg2d_dataloader import (
+            get_dataloader as get_totalseg2d_dataloader,
+        )
 
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset}")
@@ -67,6 +71,25 @@ def main(cfg: DictConfig) -> None:
         val_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d,
             stats_path=cfg.paths.totalseg_stats,
+            label_id_list=val_labels,
+            context_size=cfg.context_size,
+            batch_size=cfg.val_batch_size,
+            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+            bbox_padding=cfg.preprocessing.bbox_padding,
+            num_workers=cfg.training.get("num_workers", 4),
+            split="val",
+            shuffle=False,
+            load_dinov3_features=cfg.get("load_dinov3_features", True),
+            max_ds_len=cfg.get("max_ds_len"),
+            random_coloring_nb=cfg.get("random_coloring_nb", 0),
+        )
+    elif cfg.dataset == "totalsegmri2d":
+        # Handle label_ids: keep string for split names, convert to list for explicit IDs
+        val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
+        val_loader = get_totalseg2d_dataloader(
+            root_dir=cfg.paths.totalsegmri2d,
+            stats_path=cfg.paths.totalsegmri_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,

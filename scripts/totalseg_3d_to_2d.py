@@ -64,7 +64,7 @@ def process_label_full(args):
                   "x": label_data[:, :, xc]}
 
         # Load image data (only once per label)
-        img_nii = nib.load(str(case_path / "ct.nii.gz"))
+        img_nii = nib.load(str(case_path / "mri.nii.gz"))
         img_data = img_nii.get_fdata()
         img_slices = {"z": img_data[zc, :, :],
                       "y": img_data[:, yc, :],
@@ -86,9 +86,9 @@ def process_label_full(args):
 def main(cfg: DictConfig) -> None:
     import pickle
 
-    totalseg_dir = Path(cfg.paths.totalseg)
-    totalseg_2d_dir = Path(cfg.paths.totalseg2d)
-    stats_path = Path(cfg.paths.totalseg_stats)
+    totalseg_dir = Path(cfg.paths.totalsegmri)
+    totalseg_2d_dir = Path(cfg.paths.totalsegmri2d)
+    stats_path = Path(cfg.paths.totalsegmri_stats)
 
     print(f"Input dir: {totalseg_dir}")
     print(f"Output dir: {totalseg_2d_dir}")
