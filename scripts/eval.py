@@ -106,6 +106,17 @@ def main(cfg: DictConfig) -> None:
         model.set_loss_functions(patch_criterion, aggreg_criterion)
         if accelerator.is_main_process:
             print(f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}")
+    elif cfg.method == "universeg":
+        from src.models.universeg_baseline import UniverSegBaseline
+
+        model = UniverSegBaseline(pretrained=True)
+        
+        # Set loss functions for evaluation
+        aggreg_criterion = build_loss_fn("dice", None)
+        patch_criterion = build_loss_fn("dice", None)
+        model.set_loss_functions(patch_criterion, aggreg_criterion)
+        if accelerator.is_main_process:
+            print("Using UniverSeg baseline model")
     else:
         raise ValueError(f"Unknown method: {cfg.method}")
     
@@ -190,7 +201,7 @@ def main(cfg: DictConfig) -> None:
 
     # Validation with optional saving
     save_imgs = cfg.logging.get("save_imgs_masks", False)
-    val_save_dir = Path(cfg.paths.RESULTS_DIR) / f"{cfg.dataset}_val" if save_imgs else None
+    val_save_dir = Path(cfg.paths.RESULTS_DIR) / f"{cfg.dataset}_{cfg.method}" if save_imgs else None
     if accelerator.is_main_process:
         print(f"save_imgs_masks={save_imgs}, val_save_dir={val_save_dir}")
 
