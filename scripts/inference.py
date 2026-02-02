@@ -183,6 +183,10 @@ def preprocess_2d(
     image_size: tuple = (512, 512),
 ) -> tuple:
     """Preprocess 2D image and optional mask."""
+    # Ensure 2D arrays (squeeze any trailing dimensions)
+    if img.ndim > 2:
+        img = img.squeeze()
+    
     # Normalize image
     img = normalize_image(img)
     
@@ -191,6 +195,9 @@ def preprocess_2d(
     img_tensor = F.interpolate(img_tensor, size=image_size, mode='bilinear', align_corners=False)
     
     if mask is not None:
+        # Ensure 2D mask (squeeze any trailing dimensions like [H, W, 1])
+        if mask.ndim > 2:
+            mask = mask.squeeze()
         mask_tensor = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
         mask_tensor = F.interpolate(mask_tensor, size=image_size, mode='nearest')
         return img_tensor, mask_tensor
@@ -198,8 +205,14 @@ def preprocess_2d(
     return img_tensor, None
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
-    """Load PatchICL model from checkpoint."""
+def load_model(checkpoint_path: str, device: torch.device, num_patches: int = None) -> torch.nn.Module:
+    """Load PatchICL model from checkpoint.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        device: torch device
+        num_patches: Override number of sampled patches (None = use config value)
+    """
     from src.models.patch_icl import PatchICL
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -213,9 +226,15 @@ def load_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
     random_coloring_nb = config.get('random_coloring_nb', 0)
     patch_icl_cfg['num_mask_channels'] = 3 if random_coloring_nb > 0 else 1
     
+    # Override num_patches if specified
+    if num_patches is not None:
+        for level_cfg in patch_icl_cfg.get('levels', []):
+            level_cfg['num_patches'] = num_patches
+        print(f"Overriding num_patches to {num_patches}")
+    
     # Build model
     model = PatchICL(patch_icl_cfg, context_size=context_size)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)  # strict=False for num_patches change
     model.to(device)
     model.eval()
     
@@ -234,6 +253,7 @@ def run_inference(
     device: torch.device,
     target_features: torch.Tensor = None,
     context_features: torch.Tensor = None,
+    prior_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Run inference on a single target image with context examples.
@@ -246,6 +266,8 @@ def run_inference(
         device: torch device
         target_features: [1, N, D] precomputed target features (optional)
         context_features: [1, K, N, D] precomputed context features (optional)
+        prior_mask: [1, 1, H, W] optional prior/hint mask for oracle sampling
+                    (pass GT mask here to match eval behavior when oracle_levels_valid=[true])
         
     Returns:
         pred_mask: [H, W] predicted mask (probabilities)
@@ -258,16 +280,19 @@ def run_inference(
         target_features = target_features.to(device)
     if context_features is not None:
         context_features = context_features.to(device)
+    if prior_mask is not None:
+        prior_mask = prior_mask.to(device)
     
     # Forward pass
+    # Note: passing labels enables oracle sampling if oracle_levels_valid=[true] in config
     outputs = model(
         image=target_image,
-        labels=None,
+        labels=prior_mask,  # Pass prior_mask as labels for oracle sampling
         context_in=context_images,
         context_out=context_masks,
         target_features=target_features,
         context_features=context_features,
-        mode="eval",
+        mode="test",  # Use "test" to match validate() behavior
     )
     
     # Get prediction
@@ -280,13 +305,15 @@ def run_inference(
 def main():
     parser = argparse.ArgumentParser(description="PatchICL Inference Script")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--target_image", type=str, required=True, help="Path to target image (2D NIfTI)")
+    parser.add_argument("--target_image", type=str, required=True, help="Path to target image (2D NIfTI or .npy)")
+    parser.add_argument("--target_mask", type=str, default=None, help="Path to target GT mask (for oracle sampling, to match eval behavior)")
     parser.add_argument("--context_images", type=str, nargs="+", required=True, help="Paths to context images")
     parser.add_argument("--context_masks", type=str, nargs="+", required=True, help="Paths to context masks")
     parser.add_argument("--output", type=str, required=True, help="Path to save output mask")
     parser.add_argument("--meddino_path", type=str, required=True, help="Path to MedDINOv3 model weights")
     parser.add_argument("--image_size", type=int, nargs=2, default=[512, 512], help="Image size for inference")
     parser.add_argument("--feature_size", type=int, default=256, help="Image size for MedDINOv3 feature extraction (must match training config)")
+    parser.add_argument("--num_patches", type=int, default=None, help="Number of patches to sample (None = use config value)")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binary mask")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     
@@ -300,7 +327,7 @@ def main():
     image_size = tuple(args.image_size)
     
     # Load model
-    model, config = load_model(args.checkpoint, device)
+    model, config = load_model(args.checkpoint, device, num_patches=args.num_patches)
     
     # Load MedDINOv3 feature extractor
     print("Initializing MedDINOv3 feature extractor...")
@@ -314,6 +341,13 @@ def main():
     target_np, target_affine = load_image(args.target_image)
     original_shape = target_np.shape[:2]
     target_tensor, _ = preprocess_2d(target_np, image_size=image_size)
+    
+    # Load target mask if provided (for oracle sampling to match eval behavior)
+    target_mask_tensor = None
+    if args.target_mask:
+        target_mask_np, _ = load_image(args.target_mask)
+        _, target_mask_tensor = preprocess_2d(target_np, target_mask_np, image_size=image_size)
+        print(f"Loaded target mask for oracle sampling: {args.target_mask}")
     
     # Extract target features
     print("Extracting target features...")
@@ -347,12 +381,15 @@ def main():
     print(f"Context masks shape: {context_masks.shape}")
     print(f"Target features shape: {target_features.shape}")
     print(f"Context features shape: {context_features.shape}")
+    if target_mask_tensor is not None:
+        print(f"Target mask shape: {target_mask_tensor.shape} (oracle sampling enabled)")
     
     # Run inference
     pred_probs = run_inference(
         model, target_tensor, context_imgs, context_masks, device,
         target_features=target_features,
         context_features=context_features,
+        prior_mask=target_mask_tensor,  # Pass GT mask for oracle sampling (to match eval)
     )
     
     # Resize prediction back to original size
