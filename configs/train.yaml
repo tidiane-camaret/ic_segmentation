@@ -17,7 +17,24 @@ method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
 train_label_ids: "train"
 val_label_ids: "val"
 
-feature_extraction_resolution: 256
+# Feature extraction mode
+# Options:
+#   - "precomputed": Load features from pre-extracted .npz files (faster, requires disk space)
+#   - "on_the_fly": Compute features during training (10-30% slower, saves disk)
+feature_mode: "precomputed"
+
+# Feature extractor type (only used when feature_mode="on_the_fly")
+# Options:
+#   - "meddino": MedDINOv3 ViT-base (768-dim features, recommended resolution: 256)
+#   - "medsam2": MedSAM2 Hiera backbone (256-dim features, recommended resolution: 1024)
+feature_extractor_type: "meddino"
+feature_extraction_resolution: 256  # Use 256 for MedDINO, 1024 for MedSAM2
+
+# MedDINO-specific options
+meddino_layer_idx: 11  # Which transformer layer to extract (default: 11, final layer)
+
+# MedSAM2-specific options
+medsam2_config: "sam2.1_hiera_l.yaml"  # SAM2 config: sam2.1_hiera_t/s/b+/l.yaml
 # Preprocessing
 preprocessing:
   image_size: [512, 512, 512]

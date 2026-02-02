@@ -521,11 +521,21 @@ class PatchICL(nn.Module):
     Multi-resolution PatchICL model.
 
     Chains multiple PatchICL_Level modules at progressively finer resolutions.
+    Supports both precomputed features and on-the-fly feature extraction.
     """
 
-    def __init__(self, config: dict, context_size: int = 0):
+    def __init__(self, config: dict, context_size: int = 0, feature_extractor: nn.Module = None):
+        """
+        Args:
+            config: Model configuration dict
+            context_size: Number of context examples per sample
+            feature_extractor: Optional MedDINOFeatureExtractor for on-the-fly features.
+                If provided and no precomputed features are passed, features will be
+                computed on-the-fly during forward pass.
+        """
         super().__init__()
         self.context_size = context_size
+        self.feature_extractor = feature_extractor
 
         levels_cfg = config.get('levels', [
             {'resolution': 64, 'patch_size': 16, 'num_patches': 16},
@@ -809,6 +819,40 @@ class PatchICL(nn.Module):
         self.patch_criterion = patch_criterion
         self.aggreg_criterion = aggreg_criterion
 
+    def set_feature_extractor(self, feature_extractor: nn.Module):
+        """Set or update the feature extractor for on-the-fly feature computation."""
+        self.feature_extractor = feature_extractor
+
+    @torch.no_grad()
+    def _extract_features(
+        self,
+        target_images: torch.Tensor,
+        context_images: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Extract features on-the-fly using the feature extractor.
+
+        Args:
+            target_images: [B, C, H, W] target images (C=1 for grayscale)
+            context_images: [B, k, C, H, W] context images (optional)
+
+        Returns:
+            target_features: [B, N, D] extracted target features
+            context_features: [B, k, N, D] extracted context features or None
+        """
+        if self.feature_extractor is None:
+            raise RuntimeError(
+                "No feature extractor available. Either pass precomputed features "
+                "or set a feature extractor via set_feature_extractor()."
+            )
+
+        # Extract features using the extractor's batch method
+        target_features, context_features = self.feature_extractor.extract_batch(
+            target_images, context_images
+        )
+
+        return target_features, context_features
+
     def forward(
         self,
         image: torch.Tensor,
@@ -823,7 +867,17 @@ class PatchICL(nn.Module):
         """Forward pass through all levels.
 
         Args:
+            image: [B, C, H, W] target images
+            labels: [B, C_mask, H, W] ground truth masks (optional)
+            context_in: [B, k, C, H, W] context images (optional)
+            context_out: [B, k, C_mask, H, W] context masks (optional)
+            target_features: [B, N, D] precomputed target features (optional)
+            context_features: [B, k, N, D] precomputed context features (optional)
+            mode: "train" or "eval"
             return_attn_weights: If True, return attention weights and register tokens
+
+        If target_features is None and a feature_extractor is available,
+        features will be computed on-the-fly from the input images.
         """
         training = (mode == "train")
         _, _, H, W = image.shape
@@ -831,6 +885,12 @@ class PatchICL(nn.Module):
 
         if labels is not None and labels.dim() == 3:
             labels = labels.unsqueeze(1)
+
+        # On-the-fly feature extraction if needed
+        if target_features is None and self.feature_extractor is not None:
+            target_features, context_features = self._extract_features(
+                image, context_in
+            )
 
         prev_pred = None
         level_outputs = []

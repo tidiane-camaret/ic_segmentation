@@ -1,5 +1,103 @@
 # Research Logs
 
+## 2026-02-02: On-the-fly Feature Extraction (MedDINO + MedSAM2)
+
+### Overview
+
+Added support for computing features on-the-fly during training/inference, as an alternative to loading precomputed features from disk. Supports two feature extractors:
+- **MedDINOv3**: ViT-base model (768-dim features)
+- **MedSAM2**: SAM2.1-based Hiera backbone (256-dim features, from HuggingFace wanglab/MedSAM2)
+
+### New Files
+
+**`src/models/meddino_extractor.py`**: Feature extraction module
+
+**MedDINO classes:**
+- `MedDINOProcessor`: Preprocesses images (percentile clipping, [0,1] rescale, RGB, ImageNet norm)
+- `MedDINOFeatureExtractor`: Wraps MedDINOv3 ViT-base, outputs [B, N, 768]
+- `create_meddino_extractor()`: Factory function
+
+**MedSAM2 classes:**
+- `MedSAM2Processor`: Preprocesses images (percentile clipping, [0,255] rescale, RGB, SAM norm)
+- `MedSAM2FeatureExtractor`: Wraps SAM2.1 Hiera encoder, outputs [B, N, 256]
+  - Supports Hiera tiny/small/base+/large variants via config
+  - Auto-downloads from HuggingFace (wanglab/MedSAM2) if no local checkpoint
+- `create_medsam2_extractor()`: Factory function
+- `create_feature_extractor(type, ...)`: Generic factory for either extractor
+
+### Config Changes
+
+New options in `configs/train.yaml`:
+```yaml
+feature_mode: "precomputed"  # or "on_the_fly"
+feature_extractor_type: "meddino"  # or "medsam2"
+feature_extraction_resolution: 256  # Use 256 for MedDINO, 1024 for MedSAM2
+meddino_layer_idx: 11  # MedDINO: which transformer layer
+medsam2_config: "sam2.1_hiera_l.yaml"  # MedSAM2: t/s/b+/l variants
+```
+
+### Model Changes
+
+**`src/models/patch_icl.py`**:
+- `PatchICL.__init__()` now accepts optional `feature_extractor` parameter
+- `PatchICL.set_feature_extractor()` method to set/update extractor post-init
+- `PatchICL._extract_features()` internal method for on-the-fly extraction
+- `PatchICL.forward()` automatically extracts features if none provided but extractor available
+
+### Training Script Changes
+
+**`scripts/train.py`**:
+- Added `feature_mode` and `feature_extractor_type` config parsing
+- When `feature_mode="on_the_fly"`:
+  - Creates MedDINO or MedSAM2 extractor based on `feature_extractor_type`
+  - Passes extractor to PatchICL
+  - Dataloader skips loading precomputed `.npz` files
+- When `feature_mode="precomputed"` (default): unchanged
+
+### Usage
+
+**Precomputed features (default):**
+```bash
+python scripts/train.py
+```
+
+**On-the-fly MedDINO:**
+```bash
+python scripts/train.py feature_mode=on_the_fly feature_extractor_type=meddino
+```
+
+**On-the-fly MedSAM2:**
+```bash
+python scripts/train.py feature_mode=on_the_fly feature_extractor_type=medsam2 feature_extraction_resolution=1024
+```
+
+### Feature Extractor Comparison
+
+| Aspect | MedDINO | MedSAM2 |
+|--------|---------|---------|
+| Architecture | ViT-base | Hiera (t/s/b+/l) |
+| Feature dim | 768 | 256 |
+| Recommended resolution | 256 | 1024 |
+| GPU memory | ~350 MB | ~150-900 MB |
+| Source | Local checkpoint | HuggingFace |
+
+### Performance Tradeoffs
+
+| Aspect | Precomputed | On-the-fly |
+|--------|-------------|------------|
+| Training speed | Faster | 10-30% slower |
+| Disk storage | ~300KB/image | ~100KB/image |
+| GPU memory | Lower | +1.5-2.5 GB |
+| Flexibility | Fixed | Can experiment |
+
+### Files Modified
+
+- `src/models/meddino_extractor.py` (NEW): MedDINO + MedSAM2 extractors
+- `src/models/patch_icl.py`: Added feature_extractor support
+- `scripts/train.py`: Feature mode + extractor type handling
+- `configs/train.yaml`: New config options
+- `configs/cluster/nfs.yaml`: Added medsam2 checkpoint path option
+
 ## 2026-02-01: Eval Script Improvements + Attention Visualization
 
 ### Checkpoint Loading in eval.py

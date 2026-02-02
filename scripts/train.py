@@ -68,6 +68,10 @@ def main(cfg: DictConfig) -> None:
         )
 
     # Build dataloaders
+    # Determine whether to load precomputed features based on feature_mode
+    feature_mode = cfg.get("feature_mode", "precomputed")
+    load_precomputed_features = (feature_mode == "precomputed") and cfg.get("load_dinov3_features", True)
+
     if cfg.dataset == "totalseg2d":
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
@@ -85,7 +89,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=cfg.training.get("num_workers", 4),
             split="train",
             shuffle=True,
-            load_dinov3_features=cfg.get("load_dinov3_features", True),
+            load_dinov3_features=load_precomputed_features,
             max_ds_len=cfg.get("max_ds_len"),
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
@@ -101,7 +105,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=cfg.training.get("num_workers", 4),
             split="val",
             shuffle=False,
-            load_dinov3_features=cfg.get("load_dinov3_features", True),
+            load_dinov3_features=load_precomputed_features,
             max_ds_len=cfg.get("max_ds_len"),
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
@@ -114,7 +118,7 @@ def main(cfg: DictConfig) -> None:
             download=cfg.download,
             label_ids=list(cfg.train_label_ids),
             context_size=cfg.context_size,
-            load_dinov3_features=cfg.get("load_dinov3_features", True),
+            load_dinov3_features=load_precomputed_features,
         )
         val_loader = get_dataloader(
             dataset_name=cfg.dataset,
@@ -124,7 +128,7 @@ def main(cfg: DictConfig) -> None:
             download=cfg.download,
             label_ids=list(cfg.val_label_ids),
             context_size=cfg.context_size,
-            load_dinov3_features=cfg.get("load_dinov3_features", True),
+            load_dinov3_features=load_precomputed_features,
         )
 
     # Get model (don't move to device yet - accelerator.prepare handles that)
@@ -147,9 +151,52 @@ def main(cfg: DictConfig) -> None:
         if accelerator.is_main_process:
             print(f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})")
 
+        # Create feature extractor for on-the-fly mode if needed
+        feature_extractor = None
+        feature_mode = cfg.get("feature_mode", "precomputed")
+        if feature_mode == "on_the_fly":
+            extractor_type = cfg.get("feature_extractor_type", "meddino").lower()
+
+            if extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
+                from src.models.meddino_extractor import create_meddino_extractor
+                if accelerator.is_main_process:
+                    print("Initializing MedDINOv3 for on-the-fly feature extraction...")
+                feature_extractor = create_meddino_extractor(
+                    model_path=cfg.paths.ckpts.meddino_vit,
+                    target_size=cfg.get("feature_extraction_resolution", 256),
+                    device=device,
+                    layer_idx=cfg.get("meddino_layer_idx", 11),
+                    freeze=True,
+                )
+                if accelerator.is_main_process:
+                    print(f"Feature mode: on_the_fly (MedDINO, resolution={cfg.get('feature_extraction_resolution', 256)})")
+
+            elif extractor_type in ["medsam2", "medsam", "sam2"]:
+                from src.models.meddino_extractor import create_medsam2_extractor
+                if accelerator.is_main_process:
+                    print("Initializing MedSAM2 for on-the-fly feature extraction...")
+                # Get MedSAM2 checkpoint path (can be None to download from HuggingFace)
+                medsam2_path = cfg.paths.ckpts.get("medsam2", None)
+                feature_extractor = create_medsam2_extractor(
+                    model_path=medsam2_path,
+                    config_name=cfg.get("medsam2_config", "sam2.1_hiera_l.yaml"),
+                    target_size=cfg.get("feature_extraction_resolution", 1024),
+                    device=device,
+                    freeze=True,
+                )
+                if accelerator.is_main_process:
+                    print(f"Feature mode: on_the_fly (MedSAM2, resolution={cfg.get('feature_extraction_resolution', 1024)})")
+
+            else:
+                raise ValueError(f"Unknown feature_extractor_type: {extractor_type}. Choose 'meddino' or 'medsam2'.")
+        else:
+            if accelerator.is_main_process:
+                print(f"Feature mode: precomputed")
+
         model = PatchICL(
             patch_icl_cfg,
             context_size=cfg.get("context_size", 0),
+            feature_extractor=feature_extractor,
         )
 
         # Build and set loss functions from patch_icl config
