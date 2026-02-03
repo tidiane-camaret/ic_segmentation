@@ -1,5 +1,127 @@
 # Research Logs
 
+## 2026-02-03: Refinement Bug Fixes + Sampling Improvements
+
+### Overview
+
+Fixed critical bugs in the iterative refinement mechanism and improved patch sampling to better handle boundary regions.
+
+### Refinement Fixes
+
+**Problem 1: Confident predictions destroyed during refinement**
+
+When refinement sampled only uncertain regions, confident regions got no patches. The aggregator filled uncovered regions with -10 logits (≈0 probability), destroying good predictions from pass 1.
+
+**Fix:** Added `prev_pred_for_agg` parameter to `PatchICL_Level.forward()` that passes the previous prediction to the aggregator. Combined with `combine_mode: "coverage"`, uncovered regions now preserve their previous predictions.
+
+```python
+# In refinement loop
+prev_level_pred = level_out['pred'].detach()
+level_out = level(..., prev_pred_for_agg=prev_level_pred)
+
+# In aggregator with combine_mode="coverage"
+return torch.where(covered, aggregated, prev_pred)  # Preserve uncovered
+```
+
+**Problem 2: Uncovered regions appear "falsely confident"**
+
+Regions filled with -10 logits had sigmoid ≈ 0, which the uncertainty computation interpreted as "confident background" (uncertainty ≈ 0). These regions were never resampled.
+
+**Fix:** Detect logits < -5 and mark as high uncertainty:
+```python
+uncovered_mask = (pred < -5).any(dim=1, keepdim=True)
+uncertainty = torch.where(uncovered_mask, torch.ones_like(uncertainty), uncertainty)
+```
+
+**Problem 3: Wrong gradient flow (double-counting)**
+
+Previous predictions flowed gradients through refinement passes, causing confident regions to be counted in loss multiple times.
+
+**Fix:** Detach previous prediction before refinement:
+```python
+prev_level_pred = level_out['pred'].detach()
+```
+
+**Problem 4: Wasteful resolution ping-pong**
+
+Uncertainty was upsampled to full resolution, then immediately downsampled back in the level.
+
+**Fix:** Pass uncertainty at level resolution directly (level's `downsample()` handles it).
+
+### Config Changes
+
+Updated `configs/experiment/patch_icl_v2.yaml`:
+```yaml
+aggregator:
+  combine_mode: "coverage"  # Essential for refinement (was "average")
+  min_coverage: 0.01        # Meaningful threshold (was 0.000001)
+```
+
+### Sampling Improvements
+
+**Problem: Boundary patches under-sampled**
+
+`avg_pool2d` computed mean weight per patch, giving interior patches (all foreground) higher scores than boundary patches (mixed foreground/background). Boundaries are critical for segmentation accuracy but were under-sampled.
+
+| Patch Location | Avg Score | Max Score |
+|----------------|-----------|-----------|
+| Fully inside   | 1.0       | 1.0       |
+| Boundary (50%) | 0.5       | 1.0       |
+| Outside        | 0.0       | 0.0       |
+
+**Fix:** Changed to `max_pool2d` in `sampling.py`:
+```python
+# Before: avg_pool favors interior patches
+scores_map = F.avg_pool2d(weights, kernel_size=ps, stride=stride)
+
+# After: max_pool gives boundaries equal opportunity
+scores_map = F.max_pool2d(weights, kernel_size=ps, stride=stride)
+```
+
+### Output Saving Improvements
+
+**Problem:** Refinement passes were saved as separate "levels" with confusing names.
+
+**Fix:** Updated `save_predictions()` in `train_utils.py` to track level AND pass:
+```
+# Before (confusing)
+level0_patch_positions_mask.nii.gz
+level1_patch_positions_mask.nii.gz  # Actually refinement!
+
+# After (clear)
+level0_pass0_patch_positions_mask.nii.gz  # Initial
+level0_pass1_patch_positions_mask.nii.gz  # Refinement 1
+level0_pass2_patch_positions_mask.nii.gz  # Refinement 2
+```
+
+Also applies to attention weights and register tokens.
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl.py` | `prev_pred_for_agg` param, uncertainty fix, detach, resolution fix |
+| `src/models/sampling.py` | `avg_pool2d` → `max_pool2d` |
+| `src/train_utils.py` | Level/pass tracking in `save_predictions()` |
+| `configs/experiment/patch_icl_v2.yaml` | `combine_mode`, `min_coverage` |
+| `README.md` | Added experiment and refinement documentation |
+
+### Summary of Refinement Flow (After Fixes)
+
+```
+Pass 1: Sample patches (uniform/weighted) → Predict → Aggregate
+                                                         ↓
+Pass 2: Compute uncertainty ← ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+        Sample from uncertain regions
+        Predict new patches
+        Aggregate: new predictions WHERE covered
+                   previous predictions WHERE uncovered (preserved)
+                                                         ↓
+Pass 3+: Repeat...                                       ↓
+                                                         ↓
+Final: Combined prediction with refined uncertain regions
+```
+
 ## 2026-02-02: On-the-fly Feature Extraction (MedDINO + MedSAM2)
 
 ### Overview

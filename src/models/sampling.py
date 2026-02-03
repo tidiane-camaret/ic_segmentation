@@ -580,8 +580,9 @@ class PatchSampler(nn.Module):
         ps = self.patch_size
         stride = max(1, ps // self.stride_divisor)
 
-        # Avg pool to get per-patch scores
-        scores_map = F.avg_pool2d(weights, kernel_size=ps, stride=stride, padding=0)
+        # Max pool to get per-patch scores
+        # (ensures boundary patches get equal opportunity as interior patches)
+        scores_map = F.max_pool2d(weights, kernel_size=ps, stride=stride, padding=0)
 
         # Resize to expected grid if needed
         if scores_map.shape[-2:] != (grid_h, grid_w):
