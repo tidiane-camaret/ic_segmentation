@@ -118,6 +118,11 @@ model:
       confidence_temperature: 2.0
       hidden_dim: 32
 
+    # Iterative refinement (uncertainty-based re-sampling)
+    refinement:
+      passes: 1  # 1 = no refinement (default), 2+ = iterative
+      uncertainty_type: "confidence"  # "confidence", "entropy", "margin"
+
     backbone:
       # Backbone type: "perceiver" (single-layer), "multilayer" (multi-layer), "cnn"
       type: "perceiver"

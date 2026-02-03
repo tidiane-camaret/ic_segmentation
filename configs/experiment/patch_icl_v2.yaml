@@ -48,6 +48,11 @@ model:
     oracle_levels_train: [false]
     oracle_levels_valid: [false]
 
+    # Iterative refinement (uncertainty-based re-sampling)
+    refinement:
+      passes: 2  # 1 = no refinement (default), 2+ = iterative
+      uncertainty_type: "confidence"  # "confidence", "entropy", "margin"
+
     sampler:
       type: "continuous"
       stride_divisor: 4

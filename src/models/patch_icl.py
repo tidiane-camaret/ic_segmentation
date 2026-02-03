@@ -6,6 +6,8 @@ Each level processes patches at progressively finer resolution.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -617,6 +619,11 @@ class PatchICL(nn.Module):
         }
         self.level_loss_weights = weights_cfg.get('levels', None)
 
+        # Refinement config (iterative uncertainty-based re-sampling)
+        refinement_cfg = config.get('refinement', {})
+        self.refinement_passes = refinement_cfg.get('passes', 1)  # 1 = no refinement
+        self.uncertainty_type = refinement_cfg.get('uncertainty_type', 'confidence')
+
         # Create backbone
         backbone_cfg = config.get('backbone', {})
 
@@ -814,6 +821,50 @@ class PatchICL(nn.Module):
                         weights[key] = level_weights[key]
         return weights
 
+    def _compute_uncertainty(
+        self,
+        pred: torch.Tensor,
+        method: str = "confidence",
+    ) -> torch.Tensor:
+        """
+        Convert prediction logits to uncertainty map for refinement sampling.
+
+        Args:
+            pred: [B, C, H, W] prediction logits
+            method: "confidence", "entropy", or "margin"
+
+        Returns:
+            uncertainty: [B, 1, H, W] uncertainty map (high = uncertain)
+        """
+        if method == "confidence":
+            probs = torch.sigmoid(pred)
+            confidence = (probs - 0.5).abs() * 2  # [0,1] where 1=confident
+            uncertainty = 1.0 - confidence.max(dim=1, keepdim=True)[0]
+
+        elif method == "entropy":
+            probs = torch.sigmoid(pred)
+            # Binary entropy: -p*log(p) - (1-p)*log(1-p)
+            entropy = -(
+                probs * torch.log(probs.clamp(min=1e-8))
+                + (1 - probs) * torch.log((1 - probs).clamp(min=1e-8))
+            )
+            uncertainty = entropy.max(dim=1, keepdim=True)[0] / math.log(2)  # Normalize
+
+        elif method == "margin":
+            # For multi-class: difference between top-2 probabilities
+            probs = torch.sigmoid(pred)
+            if pred.shape[1] > 1:
+                sorted_probs, _ = probs.sort(dim=1, descending=True)
+                margin = sorted_probs[:, 0:1] - sorted_probs[:, 1:2]
+            else:
+                margin = (probs - 0.5).abs() * 2
+            uncertainty = 1.0 - margin
+
+        else:
+            raise ValueError(f"Unknown uncertainty method: {method}")
+
+        return uncertainty
+
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
         """Set the loss functions for patch and aggreg losses."""
         self.patch_criterion = patch_criterion
@@ -900,6 +951,7 @@ class PatchICL(nn.Module):
             oracle_levels = self.oracle_levels_train if training else self.oracle_levels_valid
             use_oracle = oracle_levels[i] if i < len(oracle_levels) else False
 
+            # First pass (standard forward)
             level_out = level(
                 image=image,
                 labels=labels,
@@ -914,6 +966,34 @@ class PatchICL(nn.Module):
                 return_attn_weights=return_attn_weights,
             )
             level_outputs.append(level_out)
+
+            # Refinement passes (if enabled)
+            for _ in range(self.refinement_passes - 1):
+                # Compute uncertainty from current prediction
+                uncertainty = self._compute_uncertainty(
+                    level_out['pred'],
+                    method=self.uncertainty_type,
+                )
+                # Upsample uncertainty to full resolution for next level
+                uncertainty_full = F.interpolate(
+                    uncertainty, size=(H, W), mode='bilinear', align_corners=False
+                )
+
+                # Re-run level with uncertainty as sampling weights
+                level_out = level(
+                    image=image,
+                    labels=labels,
+                    prev_pred=uncertainty_full,  # Uncertainty guides sampling
+                    use_oracle=False,  # Never use oracle on refinement
+                    original_coords_scale=coord_scale,
+                    context_in=context_in,
+                    context_out=context_out,
+                    target_features=target_features,
+                    context_features=context_features,
+                    training=training,
+                    return_attn_weights=return_attn_weights,
+                )
+                level_outputs.append(level_out)
 
             prev_pred = F.interpolate(
                 level_out['pred'], size=(H, W), mode='bilinear', align_corners=False
