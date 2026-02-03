@@ -1,0 +1,98 @@
+# @package _global_
+# MedSAM2-based patch_icl config
+# Based on patch_icl_v1 but with MedSAM2 features (256-dim instead of 768-dim)
+
+dataset: "totalseg2d"
+train_label_ids: ['colon', 'costal_cartilages', 'duodenum', 'iliopsoas_right', 'inferior_vena_cava', 'kidney_left', 'kidney_right', 'lung_middle_lobe_right', 'pancreas', 'scapula_left', 'small_bowel', 'spleen', 'sternum', 'stomach', 'trachea', 'vertebrae_T10', 'vertebrae_T11', 'vertebrae_T12', 'vertebrae_T3', 'vertebrae_T4', 'vertebrae_T5', 'vertebrae_T9']
+val_label_ids: ['aorta', 'autochthon_left', 'autochthon_right', 'esophagus', 'heart', 'iliopsoas_left', 'liver', 'lung_lower_lobe_left', 'lung_lower_lobe_right', 'lung_upper_lobe_left', 'lung_upper_lobe_right', 'scapula_right', 'spinal_cord', 'vertebrae_L1', 'vertebrae_T7', 'vertebrae_T8']
+max_ds_len: null
+context_size: 1
+random_coloring_nb: 0  # Binary segmentation (clearer gradients)
+method: "patch_icl"
+
+# MedSAM2 feature extraction settings
+feature_mode: "on_the_fly"
+feature_extractor_type: "medsam2"
+feature_extraction_resolution: 512  
+medsam2_config: "sam2.1_hiera_t.yaml"  # MedSAM2 uses tiny architecture
+
+preprocessing:
+  image_size: [256, 256, 256]
+
+training:
+  seed: 42
+  num_epochs: 200
+  print_every: 50
+  grad_accumulate_steps: 1
+  num_workers: 8
+  log_every: 10
+
+optimizer:
+  optimizer_type: "adamw"
+  optimizer_args:
+    lr: 0.0003  # Scaled for larger batch
+    weight_decay: 0.01
+
+warmup_scheduler:
+  enabled: true
+  warmup_epochs: 10
+
+model:
+  patch_icl:
+    levels:
+      - resolution: 32
+        patch_size: 16
+        num_patches: 32  # 6x more patches - dense coverage
+        sampling_temperature: 0.001
+
+    oracle_levels_train: [false]
+    oracle_levels_valid: [false]
+
+    sampler:
+      type: "continuous"
+      stride_divisor: 4
+      augmentation:
+        enabled: false
+        rotation: "continuous"
+        flip_horizontal: false
+        flip_vertical: false
+
+    aggregator:
+      type: "gaussian"
+      combine_mode: "average"
+      sigma_ratio: 0.125
+      min_coverage: 0.000001
+
+    backbone:
+      type: "simple"
+      # Flat config (required for SimpleBackbone)
+      embed_dim: 256            # MedSAM2 FPN output dimension (was 768 for DINO)
+      embed_proj_dim: 256       # Working dimension (scaled down from 512)
+      # Nested config (optional, read with fallbacks)
+      encoder:
+        image_size: 256
+      cross_attention:
+        num_heads: 32           # Reduced from 64 (must divide embed_proj_dim)
+        num_layers: 4           # Deeper reasoning
+        num_registers: 8
+        target_self_attention: true
+        dropout: 0.1
+
+    loss:
+      patch_loss:
+        type: "diceCE"
+        args: null
+      aggreg_loss:
+        type: "diceCE"
+        args: null
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 0.0
+          context_patch: 0.0  # Enable context supervision
+          context_aggreg: 0.0
+
+logging:
+  use_wandb: true
+  wandb_project: "patch_icl"
+  save_imgs_masks: true

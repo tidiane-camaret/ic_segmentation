@@ -22,7 +22,7 @@ paths:
     patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
 
 # Cluster-specific training settings
-train_batch_size: 32
-val_batch_size: 32
+train_batch_size: 128
+val_batch_size: 128
 training:
   num_workers: 8

@@ -424,7 +424,7 @@ class MedSAM2FeatureExtractor(nn.Module):
     def __init__(
         self,
         model_path: Optional[str] = None,
-        config_name: str = "sam2.1_hiera_l.yaml",
+        config_name: str = "sam2.1_hiera_t.yaml",
         target_size: int = 1024,
         device: Union[str, torch.device] = "cuda",
         freeze: bool = True,
@@ -433,7 +433,7 @@ class MedSAM2FeatureExtractor(nn.Module):
         """
         Args:
             model_path: Path to MedSAM2 checkpoint (if None, downloads from HuggingFace)
-            config_name: SAM2 config file name (e.g., "sam2.1_hiera_l.yaml")
+            config_name: SAM2 config file name (default: "sam2.1_hiera_t.yaml" for MedSAM2)
             target_size: Input resolution for feature extraction (default: 1024)
             device: Device for model and computation
             freeze: Whether to freeze model weights (default: True)
@@ -526,7 +526,7 @@ class MedSAM2FeatureExtractor(nn.Module):
 
         # Import SAM2 components directly
         from sam2.modeling.backbones.hieradet import Hiera
-        from sam2.modeling.backbones.image_encoder import ImageEncoder, FpnNeck
+        from sam2.modeling.backbones.image_encoder import FpnNeck, ImageEncoder
         from sam2.modeling.position_encoding import PositionEmbeddingSine
 
         # Model configurations for different sizes
@@ -704,7 +704,7 @@ class MedSAM2FeatureExtractor(nn.Module):
 
 def create_medsam2_extractor(
     model_path: Optional[str] = None,
-    config_name: str = "sam2.1_hiera_l.yaml",
+    config_name: str = "sam2.1_hiera_t.yaml",
     target_size: int = 1024,
     device: Union[str, torch.device] = "cuda",
     freeze: bool = True,
@@ -714,7 +714,7 @@ def create_medsam2_extractor(
 
     Args:
         model_path: Path to MedSAM2 checkpoint. If None, downloads from HuggingFace.
-        config_name: SAM2 config file (e.g., "sam2.1_hiera_l.yaml" for large model)
+        config_name: SAM2 config file (default: "sam2.1_hiera_t.yaml" for MedSAM2 tiny model)
         target_size: Input resolution (default: 1024 for SAM2)
         device: Device for computation
         freeze: Whether to freeze model weights

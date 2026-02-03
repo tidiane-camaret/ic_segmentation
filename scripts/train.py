@@ -177,15 +177,17 @@ def main(cfg: DictConfig) -> None:
                     print("Initializing MedSAM2 for on-the-fly feature extraction...")
                 # Get MedSAM2 checkpoint path (can be None to download from HuggingFace)
                 medsam2_path = cfg.paths.ckpts.get("medsam2", None)
+                # Default to tiny model - the official MedSAM2 checkpoint uses embed_dim=96
+                medsam2_config = cfg.get("medsam2_config", "sam2.1_hiera_t.yaml")
                 feature_extractor = create_medsam2_extractor(
                     model_path=medsam2_path,
-                    config_name=cfg.get("medsam2_config", "sam2.1_hiera_l.yaml"),
+                    config_name=medsam2_config,
                     target_size=cfg.get("feature_extraction_resolution", 1024),
                     device=device,
                     freeze=True,
                 )
                 if accelerator.is_main_process:
-                    print(f"Feature mode: on_the_fly (MedSAM2, resolution={cfg.get('feature_extraction_resolution', 1024)})")
+                    print(f"Feature mode: on_the_fly (MedSAM2 {medsam2_config}, resolution={cfg.get('feature_extraction_resolution', 1024)})")
 
             else:
                 raise ValueError(f"Unknown feature_extractor_type: {extractor_type}. Choose 'meddino' or 'medsam2'.")

@@ -34,7 +34,7 @@ feature_extraction_resolution: 256  # Use 256 for MedDINO, 1024 for MedSAM2
 meddino_layer_idx: 11  # Which transformer layer to extract (default: 11, final layer)
 
 # MedSAM2-specific options
-medsam2_config: "sam2.1_hiera_l.yaml"  # SAM2 config: sam2.1_hiera_t/s/b+/l.yaml
+medsam2_config: "sam2.1_hiera_t.yaml"  # SAM2 config: sam2.1_hiera_t/s/b+/l.yaml (MedSAM2 uses tiny)
 # Preprocessing
 preprocessing:
   image_size: [512, 512, 512]
