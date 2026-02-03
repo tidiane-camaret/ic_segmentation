@@ -303,6 +303,7 @@ class PatchICL_Level(nn.Module):
         context_features: torch.Tensor = None,
         training: bool = False,
         return_attn_weights: bool = False,
+        prev_pred_for_agg: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for this level.
@@ -498,8 +499,8 @@ class PatchICL_Level(nn.Module):
             patch_logits_for_agg = self.sampler.augmenter.inverse(patch_logits, aug_params)
 
         #print("PatchICL_Level forward: patch_logits_for_agg shape:", patch_logits_for_agg.shape)
-        # Aggregate to full prediction
-        pred = self.aggregate(patch_logits_for_agg, coords, (self.resolution, self.resolution))
+        # Aggregate to full prediction (pass prev_pred_for_agg to preserve confident regions during refinement)
+        pred = self.aggregate(patch_logits_for_agg, coords, (self.resolution, self.resolution), prev_pred=prev_pred_for_agg)
 
         return {
             'pred': pred,
@@ -836,6 +837,10 @@ class PatchICL(nn.Module):
         Returns:
             uncertainty: [B, 1, H, W] uncertainty map (high = uncertain)
         """
+        # Detect uncovered regions (filled with -10 logits by aggregator)
+        # These should be marked as high uncertainty so they get resampled
+        uncovered_mask = (pred < -5).any(dim=1, keepdim=True)
+
         if method == "confidence":
             probs = torch.sigmoid(pred)
             confidence = (probs - 0.5).abs() * 2  # [0,1] where 1=confident
@@ -862,6 +867,9 @@ class PatchICL(nn.Module):
 
         else:
             raise ValueError(f"Unknown uncertainty method: {method}")
+
+        # Mark uncovered regions as maximum uncertainty
+        uncertainty = torch.where(uncovered_mask, torch.ones_like(uncertainty), uncertainty)
 
         return uncertainty
 
@@ -969,21 +977,24 @@ class PatchICL(nn.Module):
 
             # Refinement passes (if enabled)
             for _ in range(self.refinement_passes - 1):
-                # Compute uncertainty from current prediction
+                # Store previous prediction to preserve confident regions
+                # Detach to prevent gradients flowing through preserved regions
+                # (avoids double-counting confident regions in loss)
+                prev_level_pred = level_out['pred'].detach()
+
+                # Compute uncertainty from current prediction (at level resolution)
+                # No need to upsample - level.downsample() handles any resolution
                 uncertainty = self._compute_uncertainty(
-                    level_out['pred'],
+                    prev_level_pred,
                     method=self.uncertainty_type,
-                )
-                # Upsample uncertainty to full resolution for next level
-                uncertainty_full = F.interpolate(
-                    uncertainty, size=(H, W), mode='bilinear', align_corners=False
                 )
 
                 # Re-run level with uncertainty as sampling weights
+                # Pass prev_level_pred to aggregator to preserve confident regions
                 level_out = level(
                     image=image,
                     labels=labels,
-                    prev_pred=uncertainty_full,  # Uncertainty guides sampling
+                    prev_pred=uncertainty,  # Uncertainty guides sampling (at level resolution)
                     use_oracle=False,  # Never use oracle on refinement
                     original_coords_scale=coord_scale,
                     context_in=context_in,
@@ -992,6 +1003,7 @@ class PatchICL(nn.Module):
                     context_features=context_features,
                     training=training,
                     return_attn_weights=return_attn_weights,
+                    prev_pred_for_agg=prev_level_pred,  # Preserve confident predictions (detached)
                 )
                 level_outputs.append(level_out)
 

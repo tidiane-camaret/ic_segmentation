@@ -64,9 +64,9 @@ model:
 
     aggregator:
       type: "gaussian"
-      combine_mode: "average"
+      combine_mode: "coverage"  # Use prev prediction where no patches sampled (essential for refinement)
       sigma_ratio: 0.125
-      min_coverage: 0.000001
+      min_coverage: 0.01  # Increased for meaningful coverage detection with Gaussian weights
 
     backbone:
       type: "simple"

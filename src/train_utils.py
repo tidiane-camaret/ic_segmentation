@@ -362,15 +362,34 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
                 ctx_p_gt_nib = nib.Nifti1Image(ctx_p_gt.astype(np.float32), affine=np.eye(4))
                 nib.save(ctx_p_gt_nib, case_dir / f"context_patch{c}_gt_mask.nii.gz")
 
-        # Save patch position visualization for each level
+        # Save patch position visualization for each level and refinement pass
+        # Refinement passes have the same resolution as their parent level
         level_outputs = outputs.get("level_outputs", [])
-        for level_idx, level_out in enumerate(level_outputs):
+
+        # Group outputs by level (same resolution = same level, consecutive = refinement passes)
+        current_level = 0
+        current_pass = 0
+        prev_res = None
+
+        for level_out in level_outputs:
             coords = level_out.get("coords")  # [B, K, 2]
             pred = level_out.get("pred")  # [B, 1, res, res]
             if coords is None or pred is None:
                 continue
 
             level_res = pred.shape[-1]
+
+            # Detect level vs refinement pass by resolution change
+            if prev_res is not None:
+                if level_res != prev_res:
+                    # New level (different resolution)
+                    current_level += 1
+                    current_pass = 0
+                else:
+                    # Same level, refinement pass
+                    current_pass += 1
+            prev_res = level_res
+
             patch_size = level_out.get("patches", outputs["patches"]).shape[-1]
 
             # Create visualization: copy of image with bounding boxes
@@ -382,7 +401,9 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
             vis_img = images[i, 0].cpu().numpy().copy()
 
             # Draw bounding boxes by setting border pixels to max value
-            box_value = vis_img.max() + 0.2 * (vis_img.max() - vis_img.min())
+            # Use different intensity for refinement passes to distinguish them
+            intensity_offset = 0.2 + 0.1 * current_pass  # Brighter for later passes
+            box_value = vis_img.max() + intensity_offset * (vis_img.max() - vis_img.min())
             coords_i = coords[i].cpu().numpy()  # [K, 2]
 
             for k in range(coords_i.shape[0]):
@@ -404,7 +425,8 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
                 vis_img[r_start:r_end, max(0, c_end-thickness):c_end] = box_value
 
             vis_nib = nib.Nifti1Image(vis_img.astype(np.float32), affine=np.eye(4))
-            nib.save(vis_nib, case_dir / f"level{level_idx}_patch_positions_mask.nii.gz")
+            # Name includes both level and pass: level0_pass0, level0_pass1 (refinement), etc.
+            nib.save(vis_nib, case_dir / f"level{current_level}_pass{current_pass}_patch_positions_mask.nii.gz")
 
             # Save attention weights and register tokens if available
             attn_weights = level_out.get("attn_weights")
@@ -414,11 +436,11 @@ def save_predictions(save_dir: Path, case_ids: list, images, labels, outputs, ma
                 # attn_weights is a list of [B, H, K, K] tensors per layer
                 for layer_idx, layer_attn in enumerate(attn_weights):
                     attn_np = layer_attn[i].cpu().numpy()  # [H, K, K]
-                    np.save(case_dir / f"level{level_idx}_layer{layer_idx}_attn_weights.npy", attn_np)
+                    np.save(case_dir / f"level{current_level}_pass{current_pass}_layer{layer_idx}_attn_weights.npy", attn_np)
 
             if register_tokens is not None:
                 reg_np = register_tokens[i].cpu().numpy()  # [R, D]
-                np.save(case_dir / f"level{level_idx}_register_tokens.npy", reg_np)
+                np.save(case_dir / f"level{current_level}_pass{current_pass}_register_tokens.npy", reg_np)
 
 
 def _extract_patch_labels(labels: torch.Tensor, coords: torch.Tensor, patch_size: int, level_res: int) -> torch.Tensor:
