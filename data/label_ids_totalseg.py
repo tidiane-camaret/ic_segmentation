@@ -127,9 +127,6 @@ label_ids = [
 ]
 
 
-""" COMMON LABELS
-
-"""
 # Train/Val split (80/20 split with fixed random seed for reproducibility)
 _rng = random.Random(42)
 _shuffled = label_ids.copy()
