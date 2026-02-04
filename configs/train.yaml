@@ -13,7 +13,7 @@ download: false
 load_dinov3_features: true
 context_size: 1
 random_coloring_nb: 0  # 0: single-label binary masks, >0: multi-label RGB masks with N random labels
-method: "patch_icl"  # Options: "segformer3d", "global_local", "patch_icl"
+method: "patch_icl"  # Options: "patch_icl", "segformer3d"
 train_label_ids: "train"
 val_label_ids: "val"
 
@@ -124,27 +124,15 @@ model:
       uncertainty_type: "confidence"  # "confidence", "entropy", "margin"
 
     backbone:
-      # Backbone type: "perceiver" (single-layer), "multilayer" (multi-layer), "cnn"
-      type: "perceiver"
-      share_backbone: false
+      # SimpleBackbone: CNN encoder + cross-patch attention + CNN decoder
       image_size: 224
-      embed_dim: 1024
-      embed_proj_dim: 128
+      embed_dim: 1024          # Input feature dimension (DINOv3 ViT-L)
+      embed_proj_dim: 128      # Projected embedding dimension
       num_heads: 8
-      pretrained_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51"
-      use_mask_conditioning: true
-      
-      # Perceiver/MultiLayer options
-      num_latents_per_patch: 4
+      num_layers: 1            # Number of attention layers
       num_registers: 4
-      use_rope_2d: true
-      decoder_hidden_dim: 64
-      
-      # MultiLayer-specific options (only used when type: "multilayer")
-      # Multi-layer enables: deeper reasoning, target-target attention, attention pooling
-      num_layers: 3           # Number of cross-patch attention layers
-      dropout: 0.1
-      use_spatial_attn: true  # Per-patch spatial self-attention in each layer
+      dropout: 0.0
+      target_self_attention: false
 
     masking:
       target_mask_ratio: 1
@@ -170,34 +158,6 @@ model:
           feature_aggreg: 1.0
           context_feature_patch: 1.0
           context_feature_aggreg: 1.0
-
-  global_local:
-    global:
-      backbone: "ground_truth"
-      down_size_rate: 16
-      base_channels: 16
-      image_size: 512
-      patch_size: 16
-      overlap: 0.5
-      num_train_patches: 50
-      starting_tau: 0.6666
-      final_tau: 0.6666
-      tau_decay_epochs: 100
-      loss:
-        objective: "gt_mask"
-        weight: 1.0
-
-    local:
-      backbone: "patch_transformer"
-      loss:
-        objective: "gt_mask"
-        weight: 1.0
-
-    aggregation:
-      learnable: false
-      loss:
-        objective: "gt_mask"
-        weight: 1.0
 
   segformer3d:
     in_channels: 1

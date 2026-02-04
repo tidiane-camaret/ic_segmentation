@@ -69,19 +69,14 @@ model:
       min_coverage: 0.01  # Increased for meaningful coverage detection with Gaussian weights
 
     backbone:
-      type: "simple"
-      # Flat config (required for SimpleBackbone)
+      image_size: 256
       embed_dim: 256            # MedSAM2 FPN output dimension (was 768 for DINO)
       embed_proj_dim: 256       # Working dimension (scaled down from 512)
-      # Nested config (optional, read with fallbacks)
-      encoder:
-        image_size: 256
-      cross_attention:
-        num_heads: 32           # Reduced from 64 (must divide embed_proj_dim)
-        num_layers: 4           # Deeper reasoning
-        num_registers: 8
-        target_self_attention: true
-        dropout: 0.1
+      num_heads: 32             # Reduced from 64 (must divide embed_proj_dim)
+      num_layers: 4             # Deeper reasoning
+      num_registers: 8
+      target_self_attention: true
+      dropout: 0.1
 
     loss:
       patch_loss:

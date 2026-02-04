@@ -136,7 +136,7 @@ def main(cfg: DictConfig) -> None:
         sys.path.insert(0, "/software/notebooks/camaret/repos/SegFormer3D")
         model = build_segformer3d_model(cfg.model.segformer3d)
     elif cfg.method == "global_local":
-        from src.models.global_local import GlobalLocalModel
+        from src.models.old.global_local import GlobalLocalModel
         model = GlobalLocalModel(
             cfg.model.global_local,
             context_size=cfg.get("context_size", 0),
