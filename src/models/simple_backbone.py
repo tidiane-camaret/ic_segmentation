@@ -88,6 +88,16 @@ def apply_rope_2d(
     y_pos = coords_normalized[:, :, 0].long()
     x_pos = coords_normalized[:, :, 1].long()
 
+    # Validate RoPE indices are within bounds
+    max_y = y_pos.max().item()
+    max_x = x_pos.max().item()
+    if max_y >= max_pos or max_x >= max_pos:
+        raise ValueError(
+            f"apply_rope_2d: position indices out of bounds. "
+            f"max_y={max_y}, max_x={max_x}, max_pos={max_pos}, "
+            f"image_size={image_size}, coords range: [{coords.min().item()}, {coords.max().item()}]"
+        )
+
     rope_cache = rope_cache.to(device)
     y_rope = rope_cache[y_pos]  # [B, K, dim/4, 2]
     x_rope = rope_cache[x_pos]

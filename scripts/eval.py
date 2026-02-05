@@ -114,9 +114,68 @@ def main(cfg: DictConfig) -> None:
         if accelerator.is_main_process:
             print(f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})")
 
+        # Create feature extractor for on-the-fly mode if needed
+        feature_extractor = None
+        feature_mode = cfg.get("feature_mode", "precomputed")
+        if feature_mode == "on_the_fly":
+            fe_cfg = patch_icl_cfg.get("feature_extractor", None)
+            if fe_cfg is not None:
+                extractor_type = fe_cfg.get("type", "meddino").lower()
+            else:
+                extractor_type = cfg.get("feature_extractor_type", "meddino").lower()
+
+            if extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
+                from src.models.meddino_extractor import create_meddino_extractor
+                if accelerator.is_main_process:
+                    print("Initializing MedDINOv3 for on-the-fly feature extraction...")
+                if fe_cfg is not None:
+                    feature_extractor = create_meddino_extractor(
+                        model_path=fe_cfg.get("model_path", cfg.paths.ckpts.meddino_vit),
+                        target_size=fe_cfg.get("target_size", 256),
+                        device=device,
+                        layer_idx=fe_cfg.get("layer_idx", 11),
+                        freeze=fe_cfg.get("freeze", True),
+                    )
+                else:
+                    feature_extractor = create_meddino_extractor(
+                        model_path=cfg.paths.ckpts.meddino_vit,
+                        target_size=cfg.get("feature_extraction_resolution", 256),
+                        device=device,
+                        layer_idx=cfg.get("meddino_layer_idx", 11),
+                        freeze=True,
+                    )
+                if accelerator.is_main_process:
+                    print(f"Feature mode: on_the_fly (MedDINO, resolution={fe_cfg.get('target_size', 256) if fe_cfg else cfg.get('feature_extraction_resolution', 256)})")
+
+            elif extractor_type in ["medsam_v1", "medsam_v1_layer"]:
+                from src.models.medsam_extractor import MedSAMv1LayerExtractor
+                if accelerator.is_main_process:
+                    print("Initializing MedSAM v1 for on-the-fly feature extraction...")
+                target_size = fe_cfg.get("target_size", 1024) if fe_cfg else 1024
+                output_grid = fe_cfg.get("output_grid_size") if fe_cfg else None
+                feature_extractor = MedSAMv1LayerExtractor(
+                    checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
+                    target_size=target_size,
+                    device=device,
+                    layer_idx=fe_cfg.get("layer_idx", 11) if fe_cfg else 11,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=output_grid,
+                )
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, "
+                          f"input={info['target_size']}×{info['target_size']}, "
+                          f"grid={info['output_grid_size']}×{info['output_grid_size']})")
+            else:
+                raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
+        else:
+            if accelerator.is_main_process:
+                print(f"Feature mode: precomputed")
+
         model = PatchICL(
             patch_icl_cfg,
             context_size=cfg.get("context_size", 0),
+            feature_extractor=feature_extractor,
         )
 
         # Build and set loss functions from patch_icl config

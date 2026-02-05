@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 def seed_everything(seed: int) -> None:
@@ -111,7 +112,16 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
     total_context_feature_patch = 0.0
     total_context_feature_aggreg = 0.0
 
-    for idx, batch in enumerate(train_loader):
+    # Progress bar for training
+    pbar = tqdm(
+        train_loader,
+        desc=f"Epoch {epoch}",
+        disable=not is_main,
+        unit="batch",
+        dynamic_ncols=True,
+    )
+
+    for idx, batch in enumerate(pbar):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
 
@@ -281,6 +291,14 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
         total_feature_aggreg += losses.get("target_feature_aggreg_loss", torch.tensor(0.0)).item()
         total_context_feature_patch += losses.get("context_feature_patch_loss", torch.tensor(0.0)).item()
         total_context_feature_aggreg += losses.get("context_feature_aggreg_loss", torch.tensor(0.0)).item()
+
+        # Update progress bar with running metrics
+        n_batches = idx + 1
+        pbar.set_postfix({
+            "loss": f"{total_loss / n_batches:.4f}",
+            "dice": f"{total_final_dice / n_batches:.4f}",
+            "local": f"{total_local_dice / n_batches:.4f}",
+        })
 
         # Free memory
         del outputs, losses
@@ -561,7 +579,9 @@ def validate(
         Tuple of (avg_loss, avg_local_dice, avg_final_dice, avg_context_dice, detailed_results)
         where detailed_results is a dict with per-case and per-label dice scores.
     """
-    model.eval()
+    # DEBUG: Use train mode to test if BatchNorm running stats are the issue
+    # model.eval()
+    model.train()
     is_main = accelerator is None or accelerator.is_main_process
     # Get unwrapped model for accessing custom attributes (aggreg_criterion, etc.)
     unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
@@ -575,7 +595,16 @@ def validate(
     case_results = []  # List of {case_id, label_id, dice}
     label_dice_scores = {}  # label_id -> list of dice scores
 
-    for batch_idx, batch in enumerate(val_loader):
+    # Progress bar for validation
+    pbar = tqdm(
+        val_loader,
+        desc="Validating",
+        disable=not is_main,
+        unit="batch",
+        dynamic_ncols=True,
+    )
+
+    for batch_idx, batch in enumerate(pbar):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
 
@@ -604,6 +633,7 @@ def validate(
         # If oracle=True, model uses GT. This allows config to control behavior.
         # Return attention weights when saving outputs
         should_save = save_dir is not None and batch_idx < max_save_batches and is_main
+        # DEBUG: Try mode="train" to see if that's causing the dice discrepancy
         outputs = model(
             images,
             labels=labels,
@@ -611,7 +641,7 @@ def validate(
             context_out=context_out,
             target_features=target_features,
             context_features=context_features,
-            mode="test",
+            mode="train",  # DEBUG: was "test"
             return_attn_weights=should_save,
         )
         predictions = outputs["final_logit"]
@@ -619,34 +649,35 @@ def validate(
         loss = unwrapped_model.aggreg_criterion(predictions, labels.float())
         total_loss += loss.item()
 
-        # Local dice: extract GT patches using coordinates from model
+        # Local dice: use patch labels from model output (same as training)
         patch_logits = outputs["patch_logits"]  # [B, K, 1, ps, ps]
-        patch_coords = outputs["patch_coords"]  # [B, K, 2]
-        patch_size = patch_logits.shape[-1]
+        patch_labels = outputs["patch_labels"]  # [B, K, 1, ps, ps] - from model, same as training
 
         # Get level resolution from level_outputs if available
         level_outputs = outputs.get("level_outputs", [])
-        if level_outputs:
-            level_res = level_outputs[-1]["pred"].shape[-1]
-        else:
-            # Fallback: assume single level at coarse_pred resolution
-            level_res = outputs["coarse_pred"].shape[-1]
-
-        # Extract GT patch labels post-hoc
-        patch_labels = _extract_patch_labels(labels, patch_coords, patch_size, level_res)
-        patch_labels = patch_labels.to(device)
 
         patch_pred_binary = (torch.sigmoid(patch_logits) > 0.5).float()
         patch_labels_binary = (patch_labels > 0).float()
-        # Compute dice per patch then average
-        patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(2, 3, 4))
-        patch_union = patch_pred_binary.sum(dim=(2, 3, 4)) + patch_labels_binary.sum(dim=(2, 3, 4))
-        local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
+        # Compute dice using MICRO averaging (same as training) - sum all patches then compute dice
+        patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(1, 2, 3, 4))  # [B]
+        patch_union = patch_pred_binary.sum(dim=(1, 2, 3, 4)) + patch_labels_binary.sum(dim=(1, 2, 3, 4))  # [B]
+        local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)  # [B]
         total_local_dice += local_dice.mean().item()
 
-        # Final dice: on full prediction
-        pred_binary = (torch.sigmoid(predictions) > 0.5).float()
-        labels_binary = (labels > 0).float()
+        # Final dice: at LEVEL RESOLUTION (same as training) - NOT upsampled
+        # Using upsampled prediction creates blurry boundaries that don't match sharp GT
+        if level_outputs:
+            level_pred = level_outputs[-1]["pred"]  # [B, C, level_res, level_res]
+            level_res = level_pred.shape[-1]
+            # Downsample labels to match level resolution using max pooling (same as training)
+            scale_factor = labels.shape[-1] // level_res
+            labels_ds = F.max_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
+            pred_binary = (torch.sigmoid(level_pred) > 0.5).float()
+            labels_binary = (labels_ds > 0).float()
+        else:
+            # Fallback to full resolution if no level outputs
+            pred_binary = (torch.sigmoid(predictions) > 0.5).float()
+            labels_binary = (labels > 0).float()
         spatial_dims = tuple(range(2, pred_binary.dim()))
         intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
         union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
@@ -681,6 +712,14 @@ def validate(
                 ctx_dice = (2 * ctx_intersection + 1e-6) / (ctx_union + 1e-6)
                 total_context_dice += ctx_dice.mean().item()
                 context_dice_count += 1
+
+        # Update progress bar with running metrics
+        n_batches = batch_idx + 1
+        pbar.set_postfix({
+            "loss": f"{total_loss / n_batches:.4f}",
+            "dice": f"{total_final_dice / n_batches:.4f}",
+            "local": f"{total_local_dice / n_batches:.4f}",
+        })
 
         # Save outputs if requested (only on main process)
         if should_save:

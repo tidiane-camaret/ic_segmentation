@@ -13,7 +13,7 @@ cfg = compose(config_name="train")
 
 dir_to_export = Path(cfg.paths.RESULTS_DIR) 
 
-patient_name = "totalseg2d" # cfg.dataset # + "_" + cfg.method
+patient_name = "totalseg2d_patch_icl_train_split" # cfg.dataset # + "_" + cfg.method
 
 project_name = "camaret___in_context_segmentation"
 

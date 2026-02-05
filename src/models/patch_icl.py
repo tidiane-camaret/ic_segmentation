@@ -68,6 +68,21 @@ def extract_patch_features(
     fw_expanded = fw.unsqueeze(-1) + offset_grid_w.view(1, 1, -1)
 
     flat_indices = fh_expanded * feature_grid_size + fw_expanded
+
+    # Validate indices are within bounds
+    N = features.shape[1]  # Total number of feature tokens
+    max_idx = flat_indices.max().item()
+    if max_idx >= N:
+        raise ValueError(
+            f"extract_patch_features: flat_indices max ({max_idx}) >= N ({N}). "
+            f"feature_grid_size={feature_grid_size}, level_resolution={level_resolution}, "
+            f"patch_size={patch_size}, coords range: h=[{coords[:,:,0].min().item()}, {coords[:,:,0].max().item()}], "
+            f"w=[{coords[:,:,1].min().item()}, {coords[:,:,1].max().item()}]"
+        )
+
+    # Clamp to be safe (shouldn't be needed if above passes)
+    flat_indices = flat_indices.clamp(0, N - 1)
+
     batch_indices = torch.arange(B, device=device).view(B, 1, 1).expand(B, K, tokens_per_patch)
 
     patch_features = features[batch_indices, flat_indices]

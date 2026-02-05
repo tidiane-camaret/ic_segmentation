@@ -53,13 +53,13 @@ class MedSAMProcessor:
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
-        Process images for MedSAM v1.
+        Process images for MedSAM v1 (vectorized for efficiency).
 
         Args:
             images: [B, 1, H, W] grayscale images, normalized to [0, 1]
 
         Returns:
-            processed: [B, 3, 1024, 1024] normalized RGB tensor
+            processed: [B, 3, target_size, target_size] normalized RGB tensor
         """
         if device is None:
             device = images.device
@@ -68,30 +68,34 @@ class MedSAMProcessor:
             images = images.unsqueeze(1)
 
         B = images.shape[0]
-        processed = []
 
-        for i in range(B):
-            img = images[i, 0]
+        # Flatten spatial dims for per-image quantile computation: [B, H*W]
+        flat = images[:, 0].reshape(B, -1)
 
-            # Percentile clipping
-            lower = torch.quantile(img, 0.005)
-            upper = torch.quantile(img, 0.995)
-            img = torch.clamp(img, lower, upper)
+        # Vectorized percentile clipping
+        lower = torch.quantile(flat, 0.005, dim=1, keepdim=True)  # [B, 1]
+        upper = torch.quantile(flat, 0.995, dim=1, keepdim=True)  # [B, 1]
 
-            # Rescale to [0, 255] (SAM expects this range before normalization)
-            img_min, img_max = img.min(), img.max()
-            if img_max > img_min:
-                img = (img - img_min) / (img_max - img_min) * 255.0
-            else:
-                img = torch.zeros_like(img)
+        # Reshape for broadcasting: [B, 1, 1, 1]
+        lower = lower.view(B, 1, 1, 1)
+        upper = upper.view(B, 1, 1, 1)
 
-            processed.append(img)
+        # Clip values
+        processed = torch.clamp(images, lower, upper)
 
-        # Stack and expand to RGB
-        processed = torch.stack(processed, dim=0).unsqueeze(1)
-        processed = processed.expand(-1, 3, -1, -1).clone()
+        # Per-image min/max for rescaling
+        img_min = processed.view(B, -1).min(dim=1, keepdim=True)[0].view(B, 1, 1, 1)
+        img_max = processed.view(B, -1).max(dim=1, keepdim=True)[0].view(B, 1, 1, 1)
 
-        # Resize to 1024x1024
+        # Rescale to [0, 255] (SAM expects this range before normalization)
+        denom = img_max - img_min
+        denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+        processed = (processed - img_min) / denom * 255.0
+
+        # Expand to RGB: [B, 1, H, W] -> [B, 3, H, W]
+        processed = processed.expand(-1, 3, -1, -1).contiguous()
+
+        # Resize to target_size
         processed = F.interpolate(
             processed,
             size=(self.target_size, self.target_size),
@@ -249,9 +253,16 @@ class MedSAMv1LayerExtractor(nn.Module):
         was_training = self.image_encoder.training
         self.image_encoder.eval()
 
+        # Use input tensor's device (in case model was moved by accelerator.prepare)
+        device = images.device
+
+        # Ensure encoder is on the same device as input
+        if next(self.image_encoder.parameters()).device != device:
+            self.image_encoder.to(device)
+
         # Preprocess
-        x = self.processor(images, device=self.device)
-        x = x.to(self.device)
+        x = self.processor(images, device=device)
+        x = x.to(device)
 
         # Patch embedding: [B, 3, target_size, target_size] -> [B, native_grid, native_grid, 768]
         x = self.image_encoder.patch_embed(x)
