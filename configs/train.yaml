@@ -1,40 +1,28 @@
-# Training configuration for Hydra
-# Override any parameter via CLI: python scripts/train.py dataset=medsegbench_livertumor
+# Simplified training configuration for PatchICL v2
+# Override any parameter via CLI: python scripts/train.py experiment=patch_icl_v1
 # Multi-run sweep: python scripts/train.py -m context_size=1,2,3
 
 defaults:
   - _self_
-  - experiment: null  # Optional: override with experiment=attention
-  - cluster: nfs  # Options: nfs, local, dlclarge
+  - experiment: null
+  - cluster: nfs
 
-# Dataset
+# Dataset (TotalSeg2D only)
 dataset: totalseg2d
 download: false
 load_dinov3_features: true
 context_size: 1
-random_coloring_nb: 0  # 0: single-label binary masks, >0: multi-label RGB masks with N random labels
-method: "patch_icl"  # Options: "patch_icl", "segformer3d"
+random_coloring_nb: 0
+method: "patch_icl"
 train_label_ids: "train"
 val_label_ids: "val"
 
-# Feature extraction mode
-# Options:
-#   - "precomputed": Load features from pre-extracted .npz files (faster, requires disk space)
-#   - "on_the_fly": Compute features during training (10-30% slower, saves disk)
+# Feature extraction mode: "precomputed" or "on_the_fly"
 feature_mode: "precomputed"
-
-# Feature extractor type (only used when feature_mode="on_the_fly")
-# Options:
-#   - "meddino": MedDINOv3 ViT-base (768-dim features, recommended resolution: 256)
-#   - "medsam2": MedSAM2 Hiera backbone (256-dim features, recommended resolution: 1024)
 feature_extractor_type: "meddino"
-feature_extraction_resolution: 256  # Use 256 for MedDINO, 1024 for MedSAM2
+feature_extraction_resolution: 256
+meddino_layer_idx: 11
 
-# MedDINO-specific options
-meddino_layer_idx: 11  # Which transformer layer to extract (default: 11, final layer)
-
-# MedSAM2-specific options
-medsam2_config: "sam2.1_hiera_t.yaml"  # SAM2 config: sam2.1_hiera_t/s/b+/l.yaml (MedSAM2 uses tiny)
 # Preprocessing
 preprocessing:
   image_size: [512, 512, 512]
@@ -45,7 +33,7 @@ preprocessing:
 # Dataloader
 train_batch_size: 50
 val_batch_size: 64
-max_ds_len: null # Use full dataset
+max_ds_len: null
 
 # Optimizer
 optimizer:
@@ -58,28 +46,28 @@ optimizer:
 warmup_scheduler:
   enabled: true
   warmup_epochs: 10
+
 train_scheduler:
-  scheduler_type: "cosine_annealing_wr"
+  scheduler_type: "cosine_annealing"
   scheduler_args:
-    t_0_epochs: 100
-    t_mult: 1
     min_lr: 0.000001
 
-# Training (renamed from training_parameters for cleaner access)
+# Training
 training:
   seed: 42
   num_epochs: 200
   print_every: 50
   grad_accumulate_steps: 1
   num_workers: 8
-  log_every: 10  
+  log_every: 10
+
 # Logging
 logging:
   use_wandb: true
   wandb_project: "patch_icl"
-  save_imgs_masks: true
+  save_imgs_masks: false
 
-# Model parameters
+# Model
 model:
   patch_icl:
     levels:
@@ -92,15 +80,8 @@ model:
     oracle_levels_valid: [true]
 
     sampler:
-      type: "gumbel"  # Options: "weighted", "uniform", "topk", "gumbel", "sliding_window"
-      exploration_noise: 0.5
-      stride_divisor: 4
-      # Gumbel-Softmax options
-      gumbel_tau: 1.0
-      gumbel_tau_min: 0.1
-      gumbel_hard: true
-      # Sliding window options (only used when type: "sliding_window")
-      sliding_window_stride: null  # If null, uses patch_size (no overlap)
+      type: "continuous"  # Options: "continuous", "sliding_window"
+      sliding_window_stride: null
       augmentation:
         enabled: true
         rotation: "90"
@@ -109,39 +90,26 @@ model:
         flip_vertical: true
 
     aggregator:
-      type: "gaussian"
+      type: "gaussian"  # Options: "average", "gaussian"
       combine_mode: "coverage"
       combine_weight: 0.5
       fill_uncovered: "zero"
       min_coverage: 0.000001
       sigma_ratio: 0.125
-      confidence_temperature: 2.0
-      hidden_dim: 32
-
-    # Iterative refinement (uncertainty-based re-sampling)
-    refinement:
-      passes: 1  # 1 = no refinement (default), 2+ = iterative
-      uncertainty_type: "confidence"  # "confidence", "entropy", "margin"
 
     backbone:
-      # SimpleBackbone: CNN encoder + cross-patch attention + CNN decoder
       image_size: 224
-      embed_dim: 1024          # Input feature dimension (DINOv3 ViT-L)
-      embed_proj_dim: 128      # Projected embedding dimension
+      embed_dim: 1024
+      embed_proj_dim: 128
+      feature_grid_size: 16
+      patch_feature_grid_size: 16
       num_heads: 8
-      num_layers: 1            # Number of attention layers
+      num_layers: 1
       num_registers: 4
       dropout: 0.0
       target_self_attention: false
 
-    masking:
-      target_mask_ratio: 1
-      context_mask_ratio: 0
-
     loss:
-      # Loss types: binarycrossentropy, dice, diceCE, smoothl1, mse, l1
-      # For RGB masks (random_coloring_nb > 0), use regression losses: smoothl1, mse, l1
-      # smoothl1/mse/l1 args: {beta: 1.0, apply_sigmoid: true} (beta only for smoothl1)
       patch_loss:
         type: "binarycrossentropy"
         args: null
@@ -154,24 +122,6 @@ model:
           target_aggreg: 0.5
           context_patch: 0.5
           context_aggreg: 0.5
-          feature_patch: 1.0
-          feature_aggreg: 1.0
-          context_feature_patch: 1.0
-          context_feature_aggreg: 1.0
-
-  segformer3d:
-    in_channels: 1
-    sr_ratios: [4, 2, 1, 1]
-    embed_dims: [32, 64, 160, 256]
-    patch_kernel_size: [7, 3, 3, 3]
-    patch_stride: [4, 2, 2, 2]
-    patch_padding: [3, 1, 1, 1]
-    mlp_ratios: [4, 4, 4, 4]
-    num_heads: [1, 2, 5, 8]
-    depths: [2, 2, 2, 2]
-    num_classes: 1
-    decoder_dropout: 0.0
-    decoder_head_embedding_dim: 256
 
 # Hydra settings
 hydra:

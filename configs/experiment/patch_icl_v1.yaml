@@ -1,14 +1,16 @@
 # @package _global_
-# High-capacity single-level config optimized for ~49GB VRAM
-# ~22GB VRAM, 28M params (14x original), 44% GPU utilization
+# PatchICL v1: Precomputed features + continuous sampling + gaussian aggregation
 
 dataset: "totalseg2d"
 train_label_ids: ['colon', 'costal_cartilages', 'duodenum', 'iliopsoas_right', 'inferior_vena_cava', 'kidney_left', 'kidney_right', 'lung_middle_lobe_right', 'pancreas', 'scapula_left', 'small_bowel', 'spleen', 'sternum', 'stomach', 'trachea', 'vertebrae_T10', 'vertebrae_T11', 'vertebrae_T12', 'vertebrae_T3', 'vertebrae_T4', 'vertebrae_T5', 'vertebrae_T9']
 val_label_ids: ['aorta', 'autochthon_left', 'autochthon_right', 'esophagus', 'heart', 'iliopsoas_left', 'liver', 'lung_lower_lobe_left', 'lung_lower_lobe_right', 'lung_upper_lobe_left', 'lung_upper_lobe_right', 'scapula_right', 'spinal_cord', 'vertebrae_L1', 'vertebrae_T7', 'vertebrae_T8']
 max_ds_len: null
 context_size: 1
-random_coloring_nb: 0  # Binary segmentation (clearer gradients)
-method: "patch_icl"
+random_coloring_nb: 0
+
+# Use precomputed DINOv3 features
+feature_mode: "precomputed"
+load_dinov3_features: true
 
 preprocessing:
   image_size: [256, 256, 256]
@@ -24,7 +26,7 @@ training:
 optimizer:
   optimizer_type: "adamw"
   optimizer_args:
-    lr: 0.0003  # Scaled for larger batch
+    lr: 0.0003
     weight_decay: 0.01
 
 warmup_scheduler:
@@ -36,7 +38,7 @@ model:
     levels:
       - resolution: 32
         patch_size: 16
-        num_patches: 32  # 6x more patches - dense coverage
+        num_patches: 32
         sampling_temperature: 0.001
 
     oracle_levels_train: [true]
@@ -44,12 +46,8 @@ model:
 
     sampler:
       type: "continuous"
-      stride_divisor: 4
       augmentation:
         enabled: false
-        rotation: "continuous"
-        flip_horizontal: false
-        flip_vertical: false
 
     aggregator:
       type: "gaussian"
@@ -59,10 +57,10 @@ model:
 
     backbone:
       image_size: 256
-      embed_dim: 768            # DINO ViT-B input dimension
-      embed_proj_dim: 512       # Working dimension (4x larger: 128 -> 512)
+      embed_dim: 768
+      embed_proj_dim: 512
       num_heads: 64
-      num_layers: 4             # Deeper reasoning
+      num_layers: 4
       num_registers: 8
       target_self_attention: true
       dropout: 0.1
@@ -78,10 +76,10 @@ model:
         default:
           target_patch: 1.0
           target_aggreg: 0.0
-          context_patch: 0.0  # Enable context supervision
+          context_patch: 0.0
           context_aggreg: 0.0
 
 logging:
   use_wandb: true
   wandb_project: "patch_icl"
-  save_imgs_masks: true
+  save_imgs_masks: false

@@ -1,18 +1,16 @@
 # @package _global_
-# MedSAM-based patch_icl config
-# Supports MedSAM v1 layer features (768-dim) or MedSAM2 features (256-dim)
+# PatchICL v2: On-the-fly MedSAM v1 features + sliding window sampling + average aggregation
 
 dataset: "totalseg2d"
 train_label_ids: ['colon', 'costal_cartilages', 'duodenum', 'iliopsoas_right', 'inferior_vena_cava', 'kidney_left', 'kidney_right', 'lung_middle_lobe_right', 'pancreas', 'scapula_left', 'small_bowel', 'spleen', 'sternum', 'stomach', 'trachea', 'vertebrae_T10', 'vertebrae_T11', 'vertebrae_T12', 'vertebrae_T3', 'vertebrae_T4', 'vertebrae_T5', 'vertebrae_T9']
 val_label_ids: ['aorta', 'autochthon_left', 'autochthon_right', 'esophagus', 'heart', 'iliopsoas_left', 'liver', 'lung_lower_lobe_left', 'lung_lower_lobe_right', 'lung_upper_lobe_left', 'lung_upper_lobe_right', 'scapula_right', 'spinal_cord', 'vertebrae_L1', 'vertebrae_T7', 'vertebrae_T8']
-max_ds_len: 500  # Reduced for faster testing
+max_ds_len: null
 context_size: 1
-random_coloring_nb: 0  # Binary segmentation (clearer gradients)
-method: "patch_icl"
+random_coloring_nb: 0
 
-# Feature extraction mode
+# Use on-the-fly MedSAM v1 features
 feature_mode: "on_the_fly"
-load_dinov3_features: false  # Disable pre-computed features to use on-the-fly extraction
+load_dinov3_features: false
 
 preprocessing:
   image_size: [256, 256, 256]
@@ -28,7 +26,7 @@ training:
 optimizer:
   optimizer_type: "adamw"
   optimizer_args:
-    lr: 0.0003  # Scaled for larger batch
+    lr: 0.0003
     weight_decay: 0.01
 
 warmup_scheduler:
@@ -37,66 +35,42 @@ warmup_scheduler:
 
 model:
   patch_icl:
-    # Feature extractor configuration (used for on-the-fly extraction)
-    # Options: "meddino", "medsam_v1" (layer 11 features, 768-dim)
-    # 
-    # MedSAM v1 grid size = target_size / 16:
-    #   - target_size=1024 → 64×64 grid (slow)
-    #   - target_size=512  → 32×32 grid (recommended)
-    #   - target_size=256  → 16×16 grid (fast)
-    #
-    # For best quality, use target_size = output_grid_size * 16 (native extraction)
     feature_extractor:
       type: "medsam_v1"
       checkpoint_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/medsam_vit_b.pth"
-      layer_idx: 11           # Transformer block (0-11), 11 = last block
+      layer_idx: 11
       freeze: true
-      target_size: 512        # Input resolution: 512 → native 32×32 grid (no pooling!)
-      output_grid_size: 32    # Output grid size (32×32 = 1024 tokens)
-                              # At level_res=32, patch_size=16: tokens_per_patch = 16×16 = 256
+      target_size: 512
+      output_grid_size: 32
 
     levels:
       - resolution: 32
         patch_size: 16
-        num_patches: 4
+        num_patches: 4  # Ignored for sliding_window
         sampling_temperature: 0.001
 
     oracle_levels_train: [false]
     oracle_levels_valid: [false]
-
-    # Iterative refinement (uncertainty-based re-sampling)
-    refinement:
-      passes: 1  # 1 = no refinement (default), 2+ = iterative
-      uncertainty_type: "confidence"  # "confidence", "entropy", "margin"
-      sampler:
-        type: "continuous"
-        num_patches: 1
-        temperature: 0.001
 
     sampler:
       type: "sliding_window"
       sliding_window_stride: 16
       augmentation:
         enabled: false
-        rotation: "continuous"
-        flip_horizontal: false
-        flip_vertical: false
 
     aggregator:
-      type: "average"  # Use simple averaging for non-overlapping sliding window
+      type: "average"
       combine_mode: "average"
       min_coverage: 1e-6
 
     backbone:
       image_size: 256
-      embed_dim: 768            # MedSAM v1 layer features dimension (768-dim)
-      embed_proj_dim: 256       # Working dimension (projection from 768)
-      feature_grid_size: 32     # Full image feature grid (must match feature_extractor.output_grid_size)
-      patch_feature_grid_size: 16  # Spatial size of features PER PATCH (16x16 = 256 tokens)
-                                   # = patch_size * (feature_grid_size / level_resolution)
-                                   # = 16 * (32 / 32) = 16
-      num_heads: 8              # Must divide embed_proj_dim (256 / 8 = 32)
-      num_layers: 4             # Deeper reasoning
+      embed_dim: 768
+      embed_proj_dim: 256
+      feature_grid_size: 32
+      patch_feature_grid_size: 16
+      num_heads: 8
+      num_layers: 4
       num_registers: 8
       target_self_attention: true
       dropout: 0.1
@@ -112,10 +86,10 @@ model:
         default:
           target_patch: 1.0
           target_aggreg: 1.0
-          context_patch: 0.0  # Enable context supervision
+          context_patch: 0.0
           context_aggreg: 0.0
 
 logging:
   use_wandb: true
   wandb_project: "patch_icl"
-  save_imgs_masks: true
+  save_imgs_masks: false
