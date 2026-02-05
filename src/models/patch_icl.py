@@ -98,6 +98,7 @@ class PatchICL_Level(nn.Module):
         target_mask_ratio: float = 0.0,
         context_mask_ratio: float = 0.0,
         num_mask_channels: int = 1,
+        feature_grid_size: int = 32,
     ):
         super().__init__()
         self.resolution = resolution
@@ -109,6 +110,7 @@ class PatchICL_Level(nn.Module):
         self.target_mask_ratio = target_mask_ratio
         self.context_mask_ratio = context_mask_ratio
         self.num_mask_channels = num_mask_channels
+        self.feature_grid_size = feature_grid_size
 
         if sampler is not None:
             self.sampler = sampler
@@ -133,15 +135,19 @@ class PatchICL_Level(nn.Module):
     def downsample_mask(self, mask: torch.Tensor) -> torch.Tensor:
         """Downsample mask to this level's resolution.
         
-        For single-channel binary masks, uses nearest neighbor to preserve labels.
+        For single-channel binary masks, uses max pooling to preserve any foreground.
+        This ensures small structures aren't lost and overestimates rather than underestimates.
         For multi-channel (e.g., RGB) masks, uses bilinear to preserve color values.
         """
         if mask.shape[-1] == self.resolution and mask.shape[-2] == self.resolution:
             return mask
-        # Use bilinear for multi-channel masks (RGB colors), nearest for binary
-        mode = 'bilinear' if mask.shape[1] > 1 else 'nearest'
-        if mode == 'bilinear':
+        # Use bilinear for multi-channel masks (RGB colors), max pooling for binary
+        if mask.shape[1] > 1:
             return F.interpolate(mask.float(), size=(self.resolution, self.resolution), mode='bilinear', align_corners=False)
+        # Max pooling for binary masks: output=1 if ANY pixel in region is foreground
+        scale_factor = mask.shape[-1] // self.resolution
+        if scale_factor > 1:
+            return F.max_pool2d(mask.float(), kernel_size=scale_factor, stride=scale_factor)
         return F.interpolate(mask.float(), size=(self.resolution, self.resolution), mode='nearest')
 
     def _mask_to_weights(self, mask: torch.Tensor) -> torch.Tensor:
@@ -298,6 +304,7 @@ class PatchICL_Level(nn.Module):
         training: bool = False,
         return_attn_weights: bool = False,
         prev_pred_for_agg: torch.Tensor = None,
+        refinement_sampler: PatchSampler | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for this level.
@@ -342,7 +349,8 @@ class PatchICL_Level(nn.Module):
             labels_ds = torch.zeros(B, self.num_mask_channels, self.resolution, self.resolution, device=device)
 
         # Select target patches (without features for now - we'll extract and augment features after)
-        patches, patch_labels, coords, _, aug_params = self.select_patches(
+        sampler = refinement_sampler if refinement_sampler is not None else self.sampler
+        patches, patch_labels, coords, _, aug_params = sampler(
             image_ds, labels_ds, weights, None
         )
         K = patches.shape[1]
@@ -358,6 +366,7 @@ class PatchICL_Level(nn.Module):
                 coords=coords,
                 patch_size=self.patch_size,
                 level_resolution=self.resolution,
+                feature_grid_size=self.feature_grid_size,
             )
             # Apply the SAME augmentation to features that was applied to patches
             if self.sampler.augmenter is not None and aug_params:
@@ -408,6 +417,7 @@ class PatchICL_Level(nn.Module):
                         coords=ctx_coords,
                         patch_size=self.patch_size,
                         level_resolution=self.resolution,
+                        feature_grid_size=self.feature_grid_size,
                     )
                     # Apply the SAME augmentation to context features that was applied to context patches
                     if self.sampler.augmenter is not None:
@@ -439,8 +449,9 @@ class PatchICL_Level(nn.Module):
                 num_context_images=k,
             )
 
+
             # Forward through backbone
-            backbone_out = self.backbone(**backbone_inputs, return_attn_weights=return_attn_weights)
+            backbone_out = self.backbone(**backbone_inputs, return_attn_weights=return_attn_weights )
 
             # Split predictions
             all_logits = backbone_out['mask_patch_logit_preds']
@@ -479,6 +490,7 @@ class PatchICL_Level(nn.Module):
                 target_features=target_patch_features,
                 target_coords=coords_scaled,
             )
+
 
             backbone_out = self.backbone(**backbone_inputs, return_attn_weights=return_attn_weights)
             patch_logits = backbone_out['mask_patch_logit_preds']
@@ -519,6 +531,20 @@ class PatchICL(nn.Module):
 
     Chains multiple PatchICL_Level modules at progressively finer resolutions.
     Supports both precomputed features and on-the-fly feature extraction.
+
+    Feature Extractor Options (config['feature_extractor']):
+        - type: "meddino" (default) or "medsam_v1"
+        - For MedDINO: model_path, target_size, layer_idx
+        - For MedSAM v1: checkpoint_path, layer_idx (0-11, default 11)
+
+    Example config:
+        {
+            "feature_extractor": {
+                "type": "medsam_v1",
+                "checkpoint_path": "/path/to/medsam_vit_b.pth",
+                "layer_idx": 11,
+            }
+        }
     """
 
     def __init__(self, config: dict, context_size: int = 0, feature_extractor: nn.Module = None):
@@ -526,13 +552,18 @@ class PatchICL(nn.Module):
         Args:
             config: Model configuration dict
             context_size: Number of context examples per sample
-            feature_extractor: Optional MedDINOFeatureExtractor for on-the-fly features.
+            feature_extractor: Optional feature extractor for on-the-fly features.
+                Supported: MedDINOFeatureExtractor, MedSAMv1LayerExtractor.
                 If provided and no precomputed features are passed, features will be
                 computed on-the-fly during forward pass.
+                Can also be configured via config['feature_extractor'].
         """
         super().__init__()
         self.context_size = context_size
         self.feature_extractor = feature_extractor
+
+        # Feature extractor config (can be created from config if not passed directly)
+        self._feature_extractor_cfg = config.get('feature_extractor', None)
 
         levels_cfg = config.get('levels', [
             {'resolution': 64, 'patch_size': 16, 'num_patches': 16},
@@ -619,8 +650,29 @@ class PatchICL(nn.Module):
         self.refinement_passes = refinement_cfg.get('passes', 1)  # 1 = no refinement
         self.uncertainty_type = refinement_cfg.get('uncertainty_type', 'confidence')
 
+        # Create refinement sampler if configured
+        self.refinement_sampler = None
+        if self.refinement_passes > 1 and 'sampler' in refinement_cfg:
+            rs_cfg = refinement_cfg['sampler']
+            self.refinement_sampler = self._create_sampler(
+                patch_size=levels_cfg[0]['patch_size'],  # Assume same patch size for now
+                num_patches=rs_cfg.get('num_patches', 32),
+                temperature=rs_cfg.get('temperature', 0.3),
+                sampler_type=rs_cfg.get('type', 'continuous'),
+            )
+
         # Create backbone
         backbone_cfg = config.get('backbone', {})
+        
+        # Feature grid size for extract_patch_features:
+        # This is the full image feature grid size (e.g., 32x32 = 1024 tokens)
+        self.feature_grid_size = backbone_cfg.get('feature_grid_size', 16)
+        
+        # Per-patch feature grid size for SimpleBackbone CNN encoder:
+        # This is the spatial size of features per patch (e.g., 16x16 = 256 tokens)
+        # Computed from: patch_size * (feature_grid_size / level_resolution)
+        # Default to 16 for MedSAM features
+        patch_feature_grid_size = backbone_cfg.get('patch_feature_grid_size', 16)
 
         # SimpleBackbone: CNN encoder + cross-patch attention + CNN decoder
         backbone = SimpleBackbone(
@@ -634,6 +686,7 @@ class PatchICL(nn.Module):
             input_dim=backbone_cfg.get('embed_dim', 1024),
             target_self_attention=backbone_cfg.get('target_self_attention', False),
             dropout=backbone_cfg.get('dropout', 0.0),
+            feature_grid_size=patch_feature_grid_size,
         )
 
         # Create levels
@@ -658,6 +711,7 @@ class PatchICL(nn.Module):
                 target_mask_ratio=self.target_mask_ratio,
                 context_mask_ratio=self.context_mask_ratio,
                 num_mask_channels=self.num_mask_channels,
+                feature_grid_size=self.feature_grid_size,
             )
             self.levels.append(level)
 
@@ -669,9 +723,11 @@ class PatchICL(nn.Module):
         patch_size: int,
         num_patches: int,
         temperature: float,
+        sampler_type: str = None,
     ) -> PatchSampler:
         """Create sampler based on config."""
-        if self.sampler_type == 'uniform':
+        stype = sampler_type if sampler_type is not None else self.sampler_type
+        if stype == 'uniform':
             return UniformSampler(
                 patch_size=patch_size,
                 num_patches=num_patches,
@@ -680,7 +736,7 @@ class PatchICL(nn.Module):
                 stride_divisor=self.stride_divisor,
                 augmenter=self.augmenter,
             )
-        elif self.sampler_type == 'topk':
+        elif stype == 'topk':
             return DeterministicTopKSampler(
                 patch_size=patch_size,
                 num_patches=num_patches,
@@ -689,7 +745,7 @@ class PatchICL(nn.Module):
                 stride_divisor=self.stride_divisor,
                 augmenter=self.augmenter,
             )
-        elif self.sampler_type == 'gumbel':
+        elif stype == 'gumbel':
             return GumbelSoftmaxSampler(
                 patch_size=patch_size,
                 num_patches=num_patches,
@@ -700,13 +756,13 @@ class PatchICL(nn.Module):
                 stride_divisor=self.stride_divisor,
                 augmenter=self.augmenter,
             )
-        elif self.sampler_type == 'sliding_window':
+        elif stype == 'sliding_window':
             return SlidingWindowSampler(
                 patch_size=patch_size,
                 stride=self.sliding_window_stride,
                 augmenter=self.augmenter,
             )
-        elif self.sampler_type == 'continuous':
+        elif stype == 'continuous':
             return ContinuousSampler(
                 patch_size=patch_size,
                 num_patches=num_patches,
@@ -802,6 +858,56 @@ class PatchICL(nn.Module):
     def set_feature_extractor(self, feature_extractor: nn.Module):
         """Set or update the feature extractor for on-the-fly feature computation."""
         self.feature_extractor = feature_extractor
+
+    def create_feature_extractor_from_config(self, device: str = "cuda") -> nn.Module:
+        """
+        Create a feature extractor based on the configuration.
+
+        Args:
+            device: Device to load the extractor on
+
+        Returns:
+            Feature extractor module (MedDINOFeatureExtractor or MedSAMv1LayerExtractor)
+
+        Raises:
+            ValueError: If config is missing or invalid
+        """
+        if self._feature_extractor_cfg is None:
+            raise ValueError(
+                "No feature_extractor config provided. "
+                "Set config['feature_extractor'] or pass feature_extractor directly."
+            )
+
+        cfg = self._feature_extractor_cfg
+        extractor_type = cfg.get('type', 'meddino')
+
+        if extractor_type == 'meddino':
+            from src.models.meddino_extractor import MedDINOFeatureExtractor
+            extractor = MedDINOFeatureExtractor(
+                model_path=cfg.get('model_path'),
+                target_size=cfg.get('target_size', 256),
+                device=device,
+                layer_idx=cfg.get('layer_idx', 11),
+                freeze=cfg.get('freeze', True),
+            )
+        elif extractor_type in ('medsam_v1', 'medsam_v1_layer'):
+            from src.models.medsam_extractor import MedSAMv1LayerExtractor
+            extractor = MedSAMv1LayerExtractor(
+                checkpoint_path=cfg.get('checkpoint_path'),
+                target_size=cfg.get('target_size', 1024),
+                device=device,
+                layer_idx=cfg.get('layer_idx', 11),
+                freeze=cfg.get('freeze', True),
+                output_grid_size=cfg.get('output_grid_size', 64),
+            )
+        else:
+            raise ValueError(
+                f"Unknown feature extractor type: {extractor_type}. "
+                f"Supported: 'meddino', 'medsam_v1', 'medsam_v1_layer'"
+            )
+
+        self.feature_extractor = extractor
+        return extractor
 
     @torch.no_grad()
     def _extract_features(
@@ -925,6 +1031,7 @@ class PatchICL(nn.Module):
                     training=training,
                     return_attn_weights=return_attn_weights,
                     prev_pred_for_agg=prev_level_pred,  # Preserve confident predictions (detached)
+                    refinement_sampler=self.refinement_sampler,
                 )
                 level_outputs.append(level_out)
 

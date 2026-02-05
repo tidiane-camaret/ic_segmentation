@@ -299,6 +299,172 @@ class MedDINOFeatureExtractor(nn.Module):
             return target_features, None
 
 
+class MultiLayerFeatureExtractor(nn.Module):
+    """
+    Extract and fuse features from multiple MedDINO layers.
+
+    Supports different fusion strategies:
+    - "average": Simple averaging across layers
+    - "learned_weighted": Learned weighted combination (trainable)
+    - "concat_proj": Concatenate + project back to original dimension
+    """
+
+    def __init__(
+        self,
+        base_extractor: MedDINOFeatureExtractor,
+        layers: list[int] = [2, 5, 8, 11],
+        fusion: str = "average",
+        embed_dim: int = 768,
+    ):
+        """
+        Args:
+            base_extractor: MedDINOFeatureExtractor instance
+            layers: List of layer indices to extract (default: [2, 5, 8, 11])
+            fusion: Fusion strategy - "average", "learned_weighted", "concat_proj"
+            embed_dim: Embedding dimension (768 for ViT-base)
+        """
+        super().__init__()
+        self.base_extractor = base_extractor
+        self.layers = layers
+        self.fusion = fusion
+        self.embed_dim = embed_dim
+        self.num_layers = len(layers)
+
+        # Initialize fusion parameters based on strategy
+        if fusion == "learned_weighted":
+            # Learnable weights for each layer, initialized to uniform
+            self.layer_weights = nn.Parameter(torch.ones(self.num_layers) / self.num_layers)
+        elif fusion == "concat_proj":
+            # Linear projection from concatenated features back to embed_dim
+            self.proj = nn.Linear(embed_dim * self.num_layers, embed_dim)
+        # "average" requires no additional parameters
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Extract and fuse features from multiple layers."""
+        return self.extract_features(images)
+
+    @torch.no_grad()
+    def extract_features(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Extract and fuse features from multiple MedDINO layers.
+
+        Args:
+            images: [B, 1, H, W] or [B, H, W] grayscale images
+
+        Returns:
+            fused_features: [B, N, D] where N = total tokens, D = embed_dim
+        """
+        # Get features from all specified layers
+        layer_features = self.base_extractor.extract_features(images, return_all_layers=True)
+
+        # Collect patch features from each layer
+        # Each layer has CLS + registers + patches, we focus on patches
+        all_layer_patches = []
+        for layer_idx in self.layers:
+            patches = layer_features[f"layer_{layer_idx}_patches"]  # [B, num_patches, D]
+            all_layer_patches.append(patches)
+
+        # Stack: [num_layers, B, N, D]
+        stacked = torch.stack(all_layer_patches, dim=0)
+
+        # Apply fusion strategy
+        if self.fusion == "average":
+            fused = stacked.mean(dim=0)  # [B, N, D]
+        elif self.fusion == "learned_weighted":
+            # Normalize weights with softmax for stable training
+            weights = F.softmax(self.layer_weights, dim=0)
+            # Weighted sum: [num_layers, B, N, D] * [num_layers, 1, 1, 1] -> sum
+            weights = weights.view(-1, 1, 1, 1)
+            fused = (stacked * weights).sum(dim=0)  # [B, N, D]
+        elif self.fusion == "concat_proj":
+            # Concatenate along feature dimension
+            B, N, D = stacked.shape[1:]
+            concat = stacked.permute(1, 2, 0, 3).reshape(B, N, -1)  # [B, N, D*num_layers]
+            fused = self.proj(concat)  # [B, N, D]
+        else:
+            raise ValueError(f"Unknown fusion strategy: {self.fusion}")
+
+        return fused
+
+    def extract_batch(
+        self,
+        target_images: torch.Tensor,
+        context_images: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Extract fused features for target and context images.
+
+        Args:
+            target_images: [B, 1, H, W] target images
+            context_images: [B, k, 1, H, W] context images (optional)
+
+        Returns:
+            target_features: [B, N, D]
+            context_features: [B, k, N, D] or None
+        """
+        B = target_images.shape[0]
+
+        if context_images is not None:
+            k = context_images.shape[1]
+            ctx_flat = context_images.view(B * k, *context_images.shape[2:])
+            all_images = torch.cat([target_images, ctx_flat], dim=0)
+            all_features = self.extract_features(all_images)
+            target_features = all_features[:B]
+            context_features = all_features[B:].view(B, k, *all_features.shape[1:])
+            return target_features, context_features
+        else:
+            target_features = self.extract_features(target_images)
+            return target_features, None
+
+    def get_layer_weights(self) -> Optional[torch.Tensor]:
+        """Get current layer weights (for learned_weighted fusion)."""
+        if self.fusion == "learned_weighted":
+            return F.softmax(self.layer_weights, dim=0).detach()
+        return None
+
+
+def create_multilayer_extractor(
+    model_path: str,
+    layers: list[int] = [2, 5, 8, 11],
+    fusion: str = "average",
+    target_size: int = 256,
+    device: Union[str, torch.device] = "cuda",
+    freeze_base: bool = True,
+) -> MultiLayerFeatureExtractor:
+    """
+    Factory function to create a multi-layer MedDINO feature extractor.
+
+    Args:
+        model_path: Path to MedDINOv3 checkpoint
+        layers: List of layer indices to extract (default: [2, 5, 8, 11])
+        fusion: Fusion strategy - "average", "learned_weighted", "concat_proj"
+        target_size: Input resolution for feature extraction
+        device: Device for computation
+        freeze_base: Whether to freeze base extractor weights
+
+    Returns:
+        MultiLayerFeatureExtractor instance
+    """
+    # Create base extractor (layer_idx doesn't matter since we use return_all_layers)
+    base_extractor = MedDINOFeatureExtractor(
+        model_path=model_path,
+        target_size=target_size,
+        device=device,
+        layer_idx=11,  # Default, won't be used
+        freeze=freeze_base,
+    )
+
+    extractor = MultiLayerFeatureExtractor(
+        base_extractor=base_extractor,
+        layers=layers,
+        fusion=fusion,
+        embed_dim=768,  # ViT-base
+    )
+    extractor.to(device)
+
+    return extractor
+
+
 def create_meddino_extractor(
     model_path: str,
     target_size: int = 256,

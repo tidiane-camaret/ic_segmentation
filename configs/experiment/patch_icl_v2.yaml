@@ -1,6 +1,6 @@
 # @package _global_
-# MedSAM2-based patch_icl config
-# Based on patch_icl_v1 but with MedSAM2 features (256-dim instead of 768-dim)
+# MedSAM-based patch_icl config
+# Supports MedSAM v1 layer features (768-dim) or MedSAM2 features (256-dim)
 
 dataset: "totalseg2d"
 train_label_ids: ['colon', 'costal_cartilages', 'duodenum', 'iliopsoas_right', 'inferior_vena_cava', 'kidney_left', 'kidney_right', 'lung_middle_lobe_right', 'pancreas', 'scapula_left', 'small_bowel', 'spleen', 'sternum', 'stomach', 'trachea', 'vertebrae_T10', 'vertebrae_T11', 'vertebrae_T12', 'vertebrae_T3', 'vertebrae_T4', 'vertebrae_T5', 'vertebrae_T9']
@@ -10,11 +10,8 @@ context_size: 1
 random_coloring_nb: 0  # Binary segmentation (clearer gradients)
 method: "patch_icl"
 
-# MedSAM2 feature extraction settings
+# Feature extraction mode
 feature_mode: "on_the_fly"
-feature_extractor_type: "medsam2"
-feature_extraction_resolution: 512  
-medsam2_config: "sam2.1_hiera_t.yaml"  # MedSAM2 uses tiny architecture
 
 preprocessing:
   image_size: [256, 256, 256]
@@ -39,10 +36,28 @@ warmup_scheduler:
 
 model:
   patch_icl:
+    # Feature extractor configuration (used for on-the-fly extraction)
+    # Options: "meddino", "medsam_v1" (layer 11 features, 768-dim)
+    # 
+    # MedSAM v1 grid size = target_size / 16:
+    #   - target_size=1024 → 64×64 grid (slow)
+    #   - target_size=512  → 32×32 grid (recommended)
+    #   - target_size=256  → 16×16 grid (fast)
+    #
+    # For best quality, use target_size = output_grid_size * 16 (native extraction)
+    feature_extractor:
+      type: "medsam_v1"
+      checkpoint_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/medsam_vit_b.pth"
+      layer_idx: 11           # Transformer block (0-11), 11 = last block
+      freeze: true
+      target_size: 512        # Input resolution: 512 → native 32×32 grid (no pooling!)
+      output_grid_size: 32    # Output grid size (32×32 = 1024 tokens)
+                              # At level_res=32, patch_size=16: tokens_per_patch = 16×16 = 256
+
     levels:
       - resolution: 32
         patch_size: 16
-        num_patches: 32  # 6x more patches - dense coverage
+        num_patches: 4
         sampling_temperature: 0.001
 
     oracle_levels_train: [false]
@@ -50,12 +65,16 @@ model:
 
     # Iterative refinement (uncertainty-based re-sampling)
     refinement:
-      passes: 2  # 1 = no refinement (default), 2+ = iterative
+      passes: 1  # 1 = no refinement (default), 2+ = iterative
       uncertainty_type: "confidence"  # "confidence", "entropy", "margin"
+      sampler:
+        type: "continuous"
+        num_patches: 1
+        temperature: 0.001
 
     sampler:
-      type: "continuous"
-      stride_divisor: 4
+      type: "sliding_window"
+      sliding_window_stride: 16
       augmentation:
         enabled: false
         rotation: "continuous"
@@ -63,16 +82,19 @@ model:
         flip_vertical: false
 
     aggregator:
-      type: "gaussian"
-      combine_mode: "coverage"  # Use prev prediction where no patches sampled (essential for refinement)
-      sigma_ratio: 0.125
-      min_coverage: 0.01  # Increased for meaningful coverage detection with Gaussian weights
+      type: "average"  # Use simple averaging for non-overlapping sliding window
+      combine_mode: "average"
+      min_coverage: 1e-6
 
     backbone:
       image_size: 256
-      embed_dim: 256            # MedSAM2 FPN output dimension (was 768 for DINO)
-      embed_proj_dim: 256       # Working dimension (scaled down from 512)
-      num_heads: 32             # Reduced from 64 (must divide embed_proj_dim)
+      embed_dim: 768            # MedSAM v1 layer features dimension (768-dim)
+      embed_proj_dim: 256       # Working dimension (projection from 768)
+      feature_grid_size: 32     # Full image feature grid (must match feature_extractor.output_grid_size)
+      patch_feature_grid_size: 16  # Spatial size of features PER PATCH (16x16 = 256 tokens)
+                                   # = patch_size * (feature_grid_size / level_resolution)
+                                   # = 16 * (32 / 32) = 16
+      num_heads: 8              # Must divide embed_proj_dim (256 / 8 = 32)
       num_layers: 4             # Deeper reasoning
       num_registers: 8
       target_self_attention: true
@@ -88,7 +110,7 @@ model:
       weights:
         default:
           target_patch: 1.0
-          target_aggreg: 0.0
+          target_aggreg: 1.0
           context_patch: 0.0  # Enable context supervision
           context_aggreg: 0.0
 

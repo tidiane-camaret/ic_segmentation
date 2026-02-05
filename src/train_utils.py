@@ -6,6 +6,7 @@ from typing import Dict, Optional
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
@@ -152,21 +153,86 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
 
         # Compute Dice scores
         with torch.no_grad():
-            # Local dice: on sampled patches
+            # Local dice: on sampled patches using MICRO averaging (sum all, then compute dice)
+            # This matches how aggregated dice is computed and avoids empty patches getting dice=1.0
             patch_logits = outputs["patch_logits"]  # [B, K, 1, ps, ps]
             patch_labels = outputs["patch_labels"]  # [B, K, 1, ps, ps]
             patch_pred_binary = (torch.sigmoid(patch_logits) > 0.5).float()
             patch_labels_binary = (patch_labels > 0).float()
-            # Compute dice per patch then average
             B, K = patch_logits.shape[:2]
-            patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(2, 3, 4))
-            patch_union = patch_pred_binary.sum(dim=(2, 3, 4)) + patch_labels_binary.sum(dim=(2, 3, 4))
-            local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
+            # Sum intersections and unions per image, then compute dice per image
+            patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(1, 2, 3, 4))  # [B]
+            patch_union = patch_pred_binary.sum(dim=(1, 2, 3, 4)) + patch_labels_binary.sum(dim=(1, 2, 3, 4))  # [B]
+            local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)  # [B]
             total_local_dice += local_dice.mean().item()
 
-            # Final dice: on full prediction
-            pred_binary = (torch.sigmoid(outputs["final_logit"]) > 0.5).float()
-            labels_binary = (labels > 0).float()
+            # Final dice: on aggregated prediction at level resolution (not upsampled)
+            # This avoids interpolation artifacts when comparing to patch dice
+            level_outputs = outputs.get("level_outputs")
+            if level_outputs:
+                finest_level = level_outputs[-1]
+                level_pred = finest_level["pred"]  # [B, C, res, res] at level resolution
+                level_res = level_pred.shape[-1]
+                
+                # DEBUG: Verify aggregation by manually reassembling patches
+                if idx == 0:
+                    coords = outputs["patch_coords"]  # [B, K, 2]
+                    ps = patch_logits.shape[-1]
+                    manual_agg = torch.zeros_like(level_pred)
+                    for b in range(B):
+                        for k in range(K):
+                            h, w = int(coords[b, k, 0].item()), int(coords[b, k, 1].item())
+                            manual_agg[b, :, h:h+ps, w:w+ps] = patch_logits[b, k]
+                    diff = (level_pred - manual_agg).abs().max().item()
+                    print(f"DEBUG: Aggregation diff (should be ~0): {diff:.6f}")
+                    print(f"DEBUG: level_pred range: [{level_pred.min().item():.3f}, {level_pred.max().item():.3f}]")
+                    print(f"DEBUG: patch_logits range: [{patch_logits.min().item():.3f}, {patch_logits.max().item():.3f}]")
+                    print(f"DEBUG: coords: {coords[0]}")
+                    # Check patch_labels vs downsampled labels
+                    scale_factor = labels.shape[-1] // level_res
+                    labels_ds_check = F.max_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
+                    manual_patch_labels = torch.zeros_like(patch_labels)
+                    for b in range(B):
+                        for k in range(K):
+                            h, w = int(coords[b, k, 0].item()), int(coords[b, k, 1].item())
+                            manual_patch_labels[b, k] = labels_ds_check[b, :, h:h+ps, w:w+ps]
+                    label_diff = (patch_labels - manual_patch_labels).abs().max().item()
+                    print(f"DEBUG: Patch labels diff (should be ~0): {label_diff:.6f}")
+                
+                # Downsample labels to match level resolution using max pooling
+                # Max pooling ensures output=1 if ANY pixel in region is foreground
+                scale_factor = labels.shape[-1] // level_res
+                labels_ds = F.max_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
+                pred_binary = (torch.sigmoid(level_pred) > 0.5).float()
+                labels_binary = (labels_ds > 0).float()
+                
+                # DEBUG: Compare micro vs macro dice computation
+                if idx == 0:
+                    # Micro dice (aggregated) - what we compute now
+                    agg_inter = (pred_binary * labels_binary).sum().item()
+                    agg_union = (pred_binary.sum() + labels_binary.sum()).item()
+                    micro_dice = (2 * agg_inter + 1e-6) / (agg_union + 1e-6)
+                    
+                    # Macro dice (patch-level) - compute same way as patch dice
+                    patch_pred_agg = (torch.sigmoid(patch_logits) > 0.5).float()
+                    patch_lbl_agg = (patch_labels > 0).float()
+                    p_inter = (patch_pred_agg * patch_lbl_agg).sum(dim=(2,3,4))
+                    p_union = patch_pred_agg.sum(dim=(2,3,4)) + patch_lbl_agg.sum(dim=(2,3,4))
+                    p_dice = (2 * p_inter + 1e-6) / (p_union + 1e-6)
+                    macro_dice = p_dice.mean().item()
+                    
+                    # Also compute micro from patches (should equal aggregated if tiling is correct)
+                    micro_from_patches = (2 * p_inter.sum().item() + 1e-6) / (p_union.sum().item() + 1e-6)
+                    
+                    print(f"DEBUG: Micro dice (aggregated): {micro_dice:.5f}")
+                    print(f"DEBUG: Macro dice (per-patch avg): {macro_dice:.5f}")  
+                    print(f"DEBUG: Micro from patches: {micro_from_patches:.5f}")
+                    print(f"DEBUG: pred_binary sum: {pred_binary.sum().item():.0f}, labels_binary sum: {labels_binary.sum().item():.0f}")
+                    print(f"DEBUG: Per-patch dice values: {p_dice[0].tolist()}")
+            else:
+                # Fallback to upsampled prediction
+                pred_binary = (torch.sigmoid(outputs["final_logit"]) > 0.5).float()
+                labels_binary = (labels > 0).float()
             spatial_dims = tuple(range(2, pred_binary.dim()))
             intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
             union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
@@ -174,10 +240,8 @@ def train_epoch(model, train_loader, optimizer, device, epoch, print_every, grad
             total_final_dice += final_dice.mean().item()
 
             # Context dice: on aggregated context predictions vs context GT
-            # Get from finest level outputs
-            level_outputs = outputs.get("level_outputs")
-            if level_outputs:
-                finest_level = level_outputs[-1]
+            # (reuse finest_level from above)
+            if level_outputs and finest_level is not None:
                 context_pred = finest_level.get("context_pred")  # [B, k, 1, res, res]
                 context_labels = finest_level.get("context_labels")  # [B, k, 1, res, res]
                 if context_pred is not None and context_labels is not None:

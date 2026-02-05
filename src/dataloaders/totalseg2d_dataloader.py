@@ -86,6 +86,8 @@ class TotalSeg2DDataset(Dataset):
         max_ds_len: Optional[int] = None,
         load_dinov3_features: bool = False,
         random_coloring_nb: int = 0,
+        feature_layer_idx: int = 11,
+        feature_layers: Optional[List[int]] = None,
     ):
         """
         Args:
@@ -94,6 +96,10 @@ class TotalSeg2DDataset(Dataset):
                 If > 0, samples this many labels, finds cases with all labels,
                 assigns random RGB colors, and returns 3-channel masks.
                 If 0, uses standard single-label binary masks (default behavior).
+            feature_layer_idx: Which MedDINO layer to load features from (default: 11).
+                Only used when load_dinov3_features=True.
+            feature_layers: If provided, load features from multiple layers as a list.
+                Overrides feature_layer_idx. Returns dict with features from each layer.
         """
         self.root_dir = Path(root_dir)
 
@@ -113,6 +119,8 @@ class TotalSeg2DDataset(Dataset):
         self.max_ds_len = max_ds_len
         self.load_dinov3_features = load_dinov3_features
         self.random_coloring_nb = random_coloring_nb
+        self.feature_layer_idx = feature_layer_idx
+        self.feature_layers = feature_layers
 
         # Load stats dict
         with open(stats_path, "rb") as f:
@@ -304,11 +312,20 @@ class TotalSeg2DDataset(Dataset):
 
         return img, label
 
-    def _load_features(self, case_id: str, label_id: str, axis: str) -> Optional[np.ndarray]:
+    def _load_features(
+        self, case_id: str, label_id: str, axis: str, layer_idx: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
         """Load pre-computed DINOv3 features for a specific case/label/axis.
 
+        Args:
+            case_id: Case identifier
+            label_id: Label identifier
+            axis: Slice axis ('x', 'y', 'z')
+            layer_idx: Specific layer to load (overrides self.feature_layer_idx)
+
         Returns:
-            features: [196, 1024] patch features (14x14 grid) or None if not found
+            features: [N, D] where N = CLS + registers + patches, D = 768
+                If self.feature_layers is set, returns dict with features from each layer.
         """
         slice_dir = self.root_dir / case_id / label_id
         features_path = slice_dir / f"{axis}_slice_img_meddino.npz"
@@ -317,22 +334,43 @@ class TotalSeg2DDataset(Dataset):
             return None
 
         data = np.load(features_path)
-        layer_idx = 11
-        cls = torch.from_numpy(data[f"layer_{layer_idx}_cls"])
-        regs = torch.from_numpy(data[f"layer_{layer_idx}_registers"])
-        patches = torch.from_numpy(data[f"layer_{layer_idx}_patches"])
 
-        # Ensure they have a consistent batch dimension if needed
-        # Here we assume shape (N, 768)
-        if cls.ndim == 1: cls = cls.unsqueeze(0) 
-        if regs.ndim == 1: regs = regs.unsqueeze(0)
-        if patches.ndim == 1: patches = patches.unsqueeze(0)
+        # Determine which layer(s) to load
+        if self.feature_layers is not None:
+            # Multi-layer mode: return dict of features
+            result = {}
+            for lidx in self.feature_layers:
+                cls = torch.from_numpy(data[f"layer_{lidx}_cls"])
+                regs = torch.from_numpy(data[f"layer_{lidx}_registers"])
+                patches = torch.from_numpy(data[f"layer_{lidx}_patches"])
+                if cls.ndim == 1:
+                    cls = cls.unsqueeze(0)
+                if regs.ndim == 1:
+                    regs = regs.unsqueeze(0)
+                if patches.ndim == 1:
+                    patches = patches.unsqueeze(0)
+                full_sequence = torch.cat([cls, regs, patches], dim=0)
+                result[f"layer_{lidx}"] = full_sequence
+            return result
 
-        # Concatenate along the sequence dimension (dim=0)
-        # Order: CLS (1) + Registers (4) + Patches (251?)
+        # Single layer mode
+        lidx = layer_idx if layer_idx is not None else self.feature_layer_idx
+        cls = torch.from_numpy(data[f"layer_{lidx}_cls"])
+        regs = torch.from_numpy(data[f"layer_{lidx}_registers"])
+        patches = torch.from_numpy(data[f"layer_{lidx}_patches"])
+
+        # Ensure consistent shape
+        if cls.ndim == 1:
+            cls = cls.unsqueeze(0)
+        if regs.ndim == 1:
+            regs = regs.unsqueeze(0)
+        if patches.ndim == 1:
+            patches = patches.unsqueeze(0)
+
+        # Concatenate: CLS (1) + Registers (4) + Patches
         full_sequence = torch.cat([cls, regs, patches], dim=0)
-        
-        return full_sequence # Total length should be 256
+
+        return full_sequence
 
     def _get_2d_bbox(self, case_id: str, label_id: str, axis: str) -> Tuple[int, int, int, int]:
         """
@@ -452,6 +490,30 @@ class TotalSeg2DDataset(Dataset):
             target_img, target_label = self._crop_to_bbox(target_img, target_label, target_bbox)
 
         target_img = self._normalize_image(target_img)
+
+        # Skip context loading if context_size is 0
+        if self.context_size == 0:
+            # Resize if needed
+            if self.image_size is not None:
+                target_img = self._resize(target_img, self.image_size, mode="bilinear")
+                target_label = self._resize(target_label, self.image_size, mode="nearest")
+
+            # Convert to tensors
+            target_in = torch.from_numpy(target_img).unsqueeze(0)  # [1, H, W]
+            target_out = torch.from_numpy(target_label).unsqueeze(0)  # [1, H, W]
+
+            result = {
+                "image": target_in,
+                "label": target_out,
+                "target_case_id": target_case_id,
+                "label_id": label_id,
+                "axis": axis,
+            }
+
+            if self.load_dinov3_features and target_features is not None:
+                result["target_features"] = target_features
+
+            return result
 
         # Get context cases with same label+axis that have non-empty masks (excluding target)
         # Use precomputed valid_contexts if available, otherwise fall back to label_to_cases
@@ -674,17 +736,21 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """Custom collate function for batching.
 
     Handles both single-label (1-channel) and random coloring (3-channel) modes.
+    Also handles context_size=0 case where context_in/context_out are not present.
     """
     result = {
         "image": torch.stack([item["image"] for item in batch]),  # [B, 1, H, W]
         "label": torch.stack([item["label"] for item in batch]),  # [B, C, H, W] C=1 or 3
-        "context_in": torch.stack([item["context_in"] for item in batch]),  # [B, k, 1, H, W]
-        "context_out": torch.stack([item["context_out"] for item in batch]),  # [B, k, C, H, W]
         "target_case_ids": [item["target_case_id"] for item in batch],
-        "context_case_ids": [item["context_case_ids"] for item in batch],
         "label_ids": [item["label_id"] for item in batch],  # str or List[str]
         "axes": [item["axis"] for item in batch],
     }
+
+    # Add context data if present (context_size > 0)
+    if "context_in" in batch[0]:
+        result["context_in"] = torch.stack([item["context_in"] for item in batch])  # [B, k, 1, H, W]
+        result["context_out"] = torch.stack([item["context_out"] for item in batch])  # [B, k, C, H, W]
+        result["context_case_ids"] = [item["context_case_ids"] for item in batch]
 
     # Add color_map if present (random coloring mode)
     if "color_map" in batch[0]:
@@ -717,6 +783,8 @@ def get_dataloader(
     shuffle: bool = True,
     load_dinov3_features: bool = False,
     random_coloring_nb: int = 0,
+    feature_layer_idx: int = 11,
+    feature_layers: Optional[List[int]] = None,
     **dataset_kwargs,
 ) -> DataLoader:
     """
@@ -738,6 +806,8 @@ def get_dataloader(
         random_coloring_nb: Number of labels to sample for random coloring mode.
             If > 0, returns 3-channel RGB masks with random colors per label.
             If 0, uses standard single-label binary masks (default).
+        feature_layer_idx: Which MedDINO layer to load features from (default: 11).
+        feature_layers: If provided, load features from multiple layers.
         **dataset_kwargs: Additional args for TotalSeg2DDataset
 
     Returns:
@@ -754,6 +824,8 @@ def get_dataloader(
         split=split,
         load_dinov3_features=load_dinov3_features,
         random_coloring_nb=random_coloring_nb,
+        feature_layer_idx=feature_layer_idx,
+        feature_layers=feature_layers,
         **dataset_kwargs,
     )
 

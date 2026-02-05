@@ -1,5 +1,96 @@
 # Research Logs
 
+## 2026-02-04: Feature Extraction Experiments Infrastructure
+
+### Overview
+
+Added experiment infrastructure for comparing different feature extraction strategies for PatchICL:
+- Layer comparison: Compare MedDINO layers [2, 5, 8, 11]
+- Multi-layer fusion: Combine features with average, learned_weighted, or concat_proj
+- MedSAM v1 integration: Alternative feature extractor comparison
+
+### New Files Created
+
+**Experiment Package (`Experiments/feature_extraction/`):**
+- `__init__.py`: Package documentation
+- `config.py`: Experiment configurations (LayerComparisonConfig, MultiLayerFusionConfig, MedSAMConfig)
+- `layer_comparison.py`: Compare single-layer features from different MedDINO layers
+- `multilayer_fusion.py`: Test fusion strategies for combining multiple layers
+- `medsam_extractor.py`: MedSAM v1 feature extractor with adapter for MedDINO compatibility
+- `run_experiments.py`: Main runner script for all experiments
+- `analysis.py`: Results visualization and comparison tables
+
+### Core File Modifications
+
+**`src/models/meddino_extractor.py`:**
+- Added `MultiLayerFeatureExtractor` class for fusing features from multiple layers
+- Supports fusion strategies: "average", "learned_weighted", "concat_proj"
+- Added `create_multilayer_extractor()` factory function
+
+**`src/models/patch_icl.py`:**
+- Fixed `feature_grid_size` default: 16 → 14 (correct for MedDINO 14×14 grid at 256×256)
+
+**`src/dataloaders/totalseg2d_dataloader.py`:**
+- Added `feature_layer_idx` parameter to control which MedDINO layer to load
+- Added `feature_layers` parameter for multi-layer loading
+- Updated `_load_features()` to support single-layer and multi-layer modes
+- Updated `get_dataloader()` to pass through new parameters
+
+### Usage
+
+```bash
+# Run layer comparison experiment
+python Experiments/feature_extraction/layer_comparison.py \
+    --checkpoint /path/to/model.pt \
+    --layers 2 5 8 11 \
+    --context-size 3
+
+# Run multi-layer fusion experiment
+python Experiments/feature_extraction/multilayer_fusion.py \
+    --checkpoint /path/to/model.pt \
+    --strategies average learned_weighted concat_proj
+
+# Run MedSAM comparison (requires: pip install git+https://github.com/bowang-lab/MedSAM.git)
+python Experiments/feature_extraction/medsam_extractor.py \
+    --checkpoint /path/to/model.pt
+
+# Run all experiments
+python Experiments/feature_extraction/run_experiments.py \
+    --checkpoint /path/to/model.pt \
+    --output-dir ./results/feature_extraction
+
+# Analyze results and generate plots
+python Experiments/feature_extraction/analysis.py \
+    --results-dir ./results/feature_extraction
+```
+
+### Experiment Details
+
+**Layer Comparison:**
+- Tests features from transformer layers 2, 5, 8, 11
+- Layer 2: Early (edges, textures)
+- Layer 5: Mid (patterns, structures)
+- Layer 8: Late-mid (object parts)
+- Layer 11: Final (semantic features, current default)
+
+**Multi-Layer Fusion:**
+- Average: Simple mean across layers
+- Learned weighted: Trainable softmax weights per layer
+- Concat + projection: Concatenate features + linear projection
+
+**MedSAM v1:**
+- Uses MedSAM ViT-B encoder (pre-trained on 1.5M medical images)
+- Adapts 64×64×256 features to 14×14×768 for compatibility
+- Requires separate installation from HuggingFace
+
+### Files Modified Summary
+
+| File | Changes |
+|------|---------|
+| `src/models/meddino_extractor.py` | Added MultiLayerFeatureExtractor, create_multilayer_extractor |
+| `src/models/patch_icl.py` | Fixed feature_grid_size default (16→14) |
+| `src/dataloaders/totalseg2d_dataloader.py` | Added feature_layer_idx, feature_layers params |
+
 ## 2026-02-03: Refinement Bug Fixes + Sampling Improvements
 
 ### Overview

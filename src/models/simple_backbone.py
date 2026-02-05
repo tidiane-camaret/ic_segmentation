@@ -113,18 +113,20 @@ def apply_rope_2d(
 
 class SimpleCNNEncoder(nn.Module):
     """
-    CNN encoder that processes DINO features through spatial convolutions.
+    CNN encoder that processes feature patches through spatial convolutions.
 
-    Takes [B, K, 49, 1024] DINO features and produces:
+    Takes [B, K, tokens, D] features (tokens = feature_grid_size^2) and produces:
     - encoded: [B, K, embed_dim] - pooled representation for attention
-    - skips: dict of intermediate features at 8x8, 4x4, 2x2 scales
+    - skips: dict of intermediate features at 16x16, 8x8, 4x4, 2x2 scales
+    
+    Supports feature_grid_size of 8 or 16.
     """
 
     def __init__(
         self,
         input_dim: int = 1024,
         embed_dim: int = 128,
-        feature_grid_size: int = 8,
+        feature_grid_size: int = 16,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -133,30 +135,55 @@ class SimpleCNNEncoder(nn.Module):
 
         D = embed_dim
 
-        # Project DINO features to working dimension
+        # Project input features to working dimension
         self.input_proj = nn.Linear(input_dim, D)
 
         # Encoder levels with skip connections
-        # Level 0: 8x8 → 8x8 (preserve resolution)
-        self.enc0 = nn.Sequential(
-            nn.Conv2d(D, D, 3, padding=1),
-            nn.BatchNorm2d(D),
-            nn.GELU(),
-        )
-
-        # Level 1: 8x8 → 4x4 (stride-2 conv, 8→4 with padding)
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(D, D, 3, stride=2, padding=1),
-            nn.BatchNorm2d(D),
-            nn.GELU(),
-        )
-
-        # Level 2: 4x4 → 2x2 (stride-2 conv)
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(D, D, 3, stride=2, padding=1),
-            nn.BatchNorm2d(D),
-            nn.GELU(),
-        )
+        if feature_grid_size == 16:
+            # Level 0: 16x16 → 16x16 (preserve resolution)
+            self.enc0 = nn.Sequential(
+                nn.Conv2d(D, D, 3, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+            # Level 1: 16x16 → 8x8
+            self.enc1 = nn.Sequential(
+                nn.Conv2d(D, D, 3, stride=2, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+            # Level 2: 8x8 → 4x4
+            self.enc2 = nn.Sequential(
+                nn.Conv2d(D, D, 3, stride=2, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+            # Level 3: 4x4 → 2x2
+            self.enc3 = nn.Sequential(
+                nn.Conv2d(D, D, 3, stride=2, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+        else:  # feature_grid_size == 8
+            # Level 0: 8x8 → 8x8 (preserve resolution)
+            self.enc0 = nn.Sequential(
+                nn.Conv2d(D, D, 3, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+            # Level 1: 8x8 → 4x4
+            self.enc1 = nn.Sequential(
+                nn.Conv2d(D, D, 3, stride=2, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+            # Level 2: 4x4 → 2x2
+            self.enc2 = nn.Sequential(
+                nn.Conv2d(D, D, 3, stride=2, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+            self.enc3 = None  # Not used for 8x8
 
         # Final pooling to [B*K, D, 1, 1]
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -166,34 +193,57 @@ class SimpleCNNEncoder(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Args:
-            features: [B, K, 49, 1024] - DINO patch features
+            features: [B, K, tokens, D_in] - patch features (tokens = h*w)
 
         Returns:
             encoded: [B, K, embed_dim] - pooled representation
-            skips: dict with 'skip_8x8', 'skip_4x4', 'skip_2x2' tensors
+            skips: dict with skip tensors at each scale
         """
         B, K, NF, E = features.shape
         D = self.embed_dim
         h = w = self.feature_grid_size
+        
+        if NF != h * w:
+            raise ValueError(
+                f"Expected {h*w} tokens (feature_grid_size={h}), got {NF}. "
+                f"Check that patch_feature_grid_size matches the actual feature extraction."
+            )
 
-        # Project and reshape to spatial: [B*K, D, 8, 8]
-        x = self.input_proj(features.view(-1, E))  # [B*K*49, D]
-        x = x.view(B * K, NF, D).permute(0, 2, 1)  # [B*K, D, 49]
-        x = x.view(B * K, D, h, w)  # [B*K, D, 8, 8]
+        # Project and reshape to spatial: [B*K, D, h, w]
+        x = self.input_proj(features.view(-1, E))  # [B*K*NF, D]
+        x = x.view(B * K, NF, D).permute(0, 2, 1)  # [B*K, D, NF]
+        x = x.view(B * K, D, h, w)  # [B*K, D, h, w]
 
-        # Encode with skip connections
-        skip_8x8 = self.enc0(x)  # [B*K, D, 8, 8]
-        skip_4x4 = self.enc1(skip_8x8)  # [B*K, D, 4, 4]
-        skip_2x2 = self.enc2(skip_4x4)  # [B*K, D, 2, 2]
+        if self.feature_grid_size == 16:
+            # Encode with skip connections: 16→16→8→4→2
+            skip_16x16 = self.enc0(x)      # [B*K, D, 16, 16]
+            skip_8x8 = self.enc1(skip_16x16)  # [B*K, D, 8, 8]
+            skip_4x4 = self.enc2(skip_8x8)    # [B*K, D, 4, 4]
+            skip_2x2 = self.enc3(skip_4x4)    # [B*K, D, 2, 2]
 
-        # Pool to [B, K, D]
-        encoded = self.pool(skip_2x2).view(B, K, D)
+            # Pool to [B, K, D]
+            encoded = self.pool(skip_2x2).view(B, K, D)
 
-        skips = {
-            'skip_8x8': skip_8x8.view(B, K, D, h, w),
-            'skip_4x4': skip_4x4.view(B, K, D, 4, 4),
-            'skip_2x2': skip_2x2.view(B, K, D, 2, 2),
-        }
+            skips = {
+                'skip_16x16': skip_16x16.view(B, K, D, 16, 16),
+                'skip_8x8': skip_8x8.view(B, K, D, 8, 8),
+                'skip_4x4': skip_4x4.view(B, K, D, 4, 4),
+                'skip_2x2': skip_2x2.view(B, K, D, 2, 2),
+            }
+        else:  # 8x8
+            # Encode with skip connections: 8→8→4→2
+            skip_8x8 = self.enc0(x)        # [B*K, D, 8, 8]
+            skip_4x4 = self.enc1(skip_8x8)    # [B*K, D, 4, 4]
+            skip_2x2 = self.enc2(skip_4x4)    # [B*K, D, 2, 2]
+
+            # Pool to [B, K, D]
+            encoded = self.pool(skip_2x2).view(B, K, D)
+
+            skips = {
+                'skip_8x8': skip_8x8.view(B, K, D, 8, 8),
+                'skip_4x4': skip_4x4.view(B, K, D, 4, 4),
+                'skip_2x2': skip_2x2.view(B, K, D, 2, 2),
+            }
 
         return encoded, skips
 
@@ -451,6 +501,8 @@ class SimpleCNNDecoder(nn.Module):
     Takes encoded features and skip connections from encoder,
     progressively upsamples with skip fusion to output resolution.
     Uses bilinear interpolation for final upsampling to handle any patch_size.
+    
+    Supports feature_grid_size of 8 or 16.
     """
 
     def __init__(
@@ -458,7 +510,7 @@ class SimpleCNNDecoder(nn.Module):
         embed_dim: int = 128,
         num_classes: int = 1,
         patch_size: int = 16,
-        feature_grid_size: int = 8,
+        feature_grid_size: int = 16,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -484,12 +536,25 @@ class SimpleCNNDecoder(nn.Module):
             nn.GELU(),
         )
 
-        # 4x4 → 8x8 (interpolate), fuse with skip_8x8
+        # 4x4 → 8x8, fuse with skip_8x8
+        self.up3 = nn.ConvTranspose2d(D, D, 2, stride=2)
         self.fuse3 = nn.Sequential(
             nn.Conv2d(D * 2, D, 3, padding=1),
             nn.BatchNorm2d(D),
             nn.GELU(),
         )
+
+        if feature_grid_size == 16:
+            # 8x8 → 16x16, fuse with skip_16x16
+            self.up4 = nn.ConvTranspose2d(D, D, 2, stride=2)
+            self.fuse4 = nn.Sequential(
+                nn.Conv2d(D * 2, D, 3, padding=1),
+                nn.BatchNorm2d(D),
+                nn.GELU(),
+            )
+        else:
+            self.up4 = None
+            self.fuse4 = None
 
         # Final conv and projection before upsampling
         self.final_conv = nn.Sequential(
@@ -506,7 +571,7 @@ class SimpleCNNDecoder(nn.Module):
         """
         Args:
             encoded: [B, K, D] - attention output
-            skips: dict with 'skip_8x8', 'skip_4x4', 'skip_2x2' from encoder
+            skips: dict with skip tensors from encoder
 
         Returns:
             [B, K, num_classes, patch_size, patch_size]
@@ -520,7 +585,7 @@ class SimpleCNNDecoder(nn.Module):
         # Get skip connections reshaped to [B*K, D, H, W]
         skip_2x2 = skips['skip_2x2'].contiguous().view(B * K, D, 2, 2)
         skip_4x4 = skips['skip_4x4'].contiguous().view(B * K, D, 4, 4)
-        skip_8x8 = skips['skip_8x8'].contiguous().view(B * K, D, h, h)
+        skip_8x8 = skips['skip_8x8'].contiguous().view(B * K, D, 8, 8)
 
         # 1x1 → 2x2 + skip
         x = self.up1(x)  # [B*K, D, 2, 2]
@@ -532,19 +597,27 @@ class SimpleCNNDecoder(nn.Module):
         x = torch.cat([x, skip_4x4], dim=1)
         x = self.fuse2(x)  # [B*K, D, 4, 4]
 
-        # 4x4 → hxh + skip
-        x = F.interpolate(x, size=(h, h), mode='bilinear', align_corners=False)
+        # 4x4 → 8x8 + skip
+        x = self.up3(x)  # [B*K, D, 8, 8]
         x = torch.cat([x, skip_8x8], dim=1)
         x = self.fuse3(x)  # [B*K, D, 8, 8]
 
-        # Final conv to num_classes
-        x = self.final_conv(x)  # [B*K, num_classes, 8, 8]
+        if self.feature_grid_size == 16:
+            # 8x8 → 16x16 + skip
+            skip_16x16 = skips['skip_16x16'].contiguous().view(B * K, D, 16, 16)
+            x = self.up4(x)  # [B*K, D, 16, 16]
+            x = torch.cat([x, skip_16x16], dim=1)
+            x = self.fuse4(x)  # [B*K, D, 16, 16]
 
-        # Upsample to patch_size
-        x = F.interpolate(
-            x, size=(self.patch_size, self.patch_size),
-            mode='bilinear', align_corners=False
-        )
+        # Final conv to num_classes
+        x = self.final_conv(x)  # [B*K, num_classes, h, h]
+
+        # Upsample to patch_size if needed
+        if h != self.patch_size:
+            x = F.interpolate(
+                x, size=(self.patch_size, self.patch_size),
+                mode='bilinear', align_corners=False
+            )
 
         return x.view(B, K, self.num_classes, self.patch_size, self.patch_size)
 
@@ -573,7 +646,7 @@ class SimpleBackbone(nn.Module):
         patch_size: int = 16,
         image_size: int = 224,
         input_dim: int = 1024,
-        feature_grid_size: int = 8,
+        feature_grid_size: int = 16,
         target_self_attention: bool = False,
         dropout: float = 0.0,
         max_seq_len: int = 1024,
@@ -633,7 +706,7 @@ class SimpleBackbone(nn.Module):
         Forward pass: encode → attention → decode.
 
         Args:
-            img_patches: [B, K, 49, 1024] - DINO features per patch
+            img_patches: [B, K, tokens, D] - features per patch
             coords: [B, K, 2] - Patch coordinates (y, x)
             ctx_id_labels: [B, K] - 0 for target, >0 for context
             return_attn_weights: If True, return attention weights and register tokens

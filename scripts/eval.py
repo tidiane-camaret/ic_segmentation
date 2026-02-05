@@ -78,9 +78,9 @@ def main(cfg: DictConfig) -> None:
             crop_to_bbox=cfg.preprocessing.crop_to_bbox,
             bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
-            split="val",
+            split="train",
             shuffle=False,
-            load_dinov3_features=cfg.get("load_dinov3_features", True),
+            load_dinov3_features=cfg.get("load_dinov3_features", False),
             max_ds_len=cfg.get("max_ds_len"),
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
@@ -99,7 +99,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=cfg.training.get("num_workers", 4),
             split="val",
             shuffle=False,
-            load_dinov3_features=cfg.get("load_dinov3_features", True),
+            load_dinov3_features=cfg.get("load_dinov3_features", False),
             max_ds_len=cfg.get("max_ds_len"),
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
@@ -148,10 +148,10 @@ def main(cfg: DictConfig) -> None:
         print(f"Model parameters: {num_params:,}")
 
     # Load checkpoint weights
-    ckpt_path = cfg.paths.ckpts.get(str(cfg.method), None)
+    ckpt_path = cfg.paths.ckpts.get("patch_icl_v2", None)
     if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         if accelerator.is_main_process:
             print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
     else:
@@ -224,7 +224,7 @@ def main(cfg: DictConfig) -> None:
 
     # Validation with optional saving
     save_imgs = cfg.logging.get("save_imgs_masks", False)
-    val_save_dir = Path(cfg.paths.RESULTS_DIR) / f"{cfg.dataset}_{cfg.method}" if save_imgs else None
+    val_save_dir = Path(cfg.paths.RESULTS_DIR) / f"{cfg.dataset}_{cfg.method}_train_split" if save_imgs else None
     if accelerator.is_main_process:
         print(f"save_imgs_masks={save_imgs}, val_save_dir={val_save_dir}")
 
@@ -263,6 +263,7 @@ def main(cfg: DictConfig) -> None:
             case_table.add_data(result["case_id"], result["label_id"], result["axis"], result["dice"])
         wandb.log({"per_case_dice": case_table})
 
+    """
     # Save best (only on main process)
     if val_final_dice > best_dice:
         best_dice = val_final_dice
@@ -279,9 +280,9 @@ def main(cfg: DictConfig) -> None:
                 "best_dice": best_dice,
                 "config": OmegaConf.to_container(cfg, resolve=True),  # checkpoint needs plain dict
             }, ckpt_dir / f"{model_name}_best_model.pt")
-
+    """
     if accelerator.is_main_process:
-        print(f"\nTraining complete! Best Dice: {best_dice:.5f}")
+        print(f"\nVal complete! Best Dice: {best_dice:.5f}")
 
     if cfg.logging.use_wandb and accelerator.is_main_process:
         wandb.finish()
