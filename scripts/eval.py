@@ -65,6 +65,13 @@ def main(cfg: DictConfig) -> None:
             config=OmegaConf.to_container(cfg, resolve=True),  # wandb needs plain dict
         )
     # Build dataloaders
+    # Support separate max_ds_len for train/val, with fallback to single value
+    max_ds_len_cfg = cfg.get("max_ds_len")
+    if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
+        max_ds_len_val = max_ds_len_cfg.get("val")
+    else:
+        max_ds_len_val = max_ds_len_cfg
+
     if cfg.dataset == "totalseg2d":
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
@@ -81,7 +88,7 @@ def main(cfg: DictConfig) -> None:
             split="train",
             shuffle=False,
             load_dinov3_features=cfg.get("load_dinov3_features", False),
-            max_ds_len=cfg.get("max_ds_len"),
+            max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
     elif cfg.dataset == "totalsegmri2d":
@@ -100,7 +107,7 @@ def main(cfg: DictConfig) -> None:
             split="val",
             shuffle=False,
             load_dinov3_features=cfg.get("load_dinov3_features", False),
-            max_ds_len=cfg.get("max_ds_len"),
+            max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
     # Get model (don't move to device yet - accelerator.prepare handles that)
@@ -290,7 +297,7 @@ def main(cfg: DictConfig) -> None:
     val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
         model, val_loader, device,
         save_dir=val_save_dir, max_save_batches=len(val_loader),
-        accelerator=accelerator
+        accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0
     )
     if accelerator.is_main_process:
         print(

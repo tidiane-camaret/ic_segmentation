@@ -5,6 +5,55 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional
 
+class SoftDiceLoss(nn.Module):
+    """Pure PyTorch implementation of Soft Dice Loss.
+    Matches the logic of V3 but without the requirement for custom CUDA extensions.
+    """
+    def __init__(self, p: int = 1, smooth: float = 1.0) -> None:
+        super().__init__()
+        self.p = p
+        self.smooth = smooth
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Standardize shapes to (Batch, Flattened_Pixels)
+        # Assuming predictions are LOGITS
+        probs = torch.sigmoid(predictions)
+        
+        # Flatten
+        probs = probs.view(probs.shape[0], -1)
+        targets = targets.view(targets.shape[0], -1)
+
+        intersection = (probs * targets).sum(dim=1)
+        
+        if self.p == 2:
+            denominator = (probs.pow(2) + targets.pow(2)).sum(dim=1)
+        else:
+            denominator = (probs + targets).sum(dim=1)
+
+        dice_score = (2.0 * intersection + self.smooth) / (denominator + self.smooth)
+        return 1.0 - dice_score.mean()
+
+
+class SoftDiceBCELoss(nn.Module):
+    """Hybrid Loss: Soft Dice + Binary Cross Entropy.
+    Provides the global overlap optimization of Dice and the local pixel 
+    stability of BCE.
+    """
+    def __init__(self, dice_weight: float = 1.0, bce_weight: float = 1.0, smooth: float = 1.0) -> None:
+        super().__init__()
+        self.dice_weight = dice_weight
+        self.bce_weight = bce_weight
+        self.dice = SoftDiceLoss(smooth=smooth)
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Ensure targets are float for BCE
+        targets_float = targets.float()
+        
+        dice_loss = self.dice(predictions, targets_float)
+        bce_loss = self.bce(predictions, targets_float)
+        
+        return (self.dice_weight * dice_loss) + (self.bce_weight * bce_loss)
 
 class CrossEntropyLoss(nn.Module):
     """Cross-entropy loss wrapper for semantic segmentation."""
@@ -234,6 +283,8 @@ def build_loss_fn(loss_type: str, loss_args: Optional[Dict] = None) -> nn.Module
 
     Args:
         loss_type: Type of loss function. Supported types:
+            - "softdice": SoftDiceLoss,        # Pure PyTorch version
+            - "softdiceBCE": SoftDiceBCELoss,  # Combined version
             - 'crossentropy': Cross-entropy loss
             - 'binarycrossentropy': Binary cross-entropy with logits
             - 'dice': Dice loss
@@ -256,6 +307,8 @@ def build_loss_fn(loss_type: str, loss_args: Optional[Dict] = None) -> nn.Module
         ValueError: If loss_type is not supported
     """
     loss_registry = {
+        "softdice": SoftDiceLoss,        # Pure PyTorch version
+        "softdiceBCE": SoftDiceBCELoss,
         "crossentropy": CrossEntropyLoss,
         "binarycrossentropy": BinaryCrossEntropyWithLogits,
         "dice": DiceLoss,

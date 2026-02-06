@@ -46,6 +46,15 @@ def main(cfg: DictConfig) -> None:
     train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
     val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
 
+    # Support separate max_ds_len for train/val, with fallback to single value
+    max_ds_len_cfg = cfg.get("max_ds_len")
+    if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
+        max_ds_len_train = max_ds_len_cfg.get("train")
+        max_ds_len_val = max_ds_len_cfg.get("val")
+    else:
+        max_ds_len_train = max_ds_len_cfg
+        max_ds_len_val = max_ds_len_cfg
+
     train_loader = get_totalseg2d_dataloader(
         root_dir=cfg.paths.totalseg2d,
         stats_path=cfg.paths.totalseg_stats,
@@ -59,7 +68,7 @@ def main(cfg: DictConfig) -> None:
         split="train",
         shuffle=True,
         load_dinov3_features=load_precomputed_features,
-        max_ds_len=cfg.get("max_ds_len"),
+        max_ds_len=max_ds_len_train,
         random_coloring_nb=cfg.get("random_coloring_nb", 0),
     )
     val_loader = get_totalseg2d_dataloader(
@@ -75,7 +84,7 @@ def main(cfg: DictConfig) -> None:
         split="val",
         shuffle=False,
         load_dinov3_features=load_precomputed_features,
-        max_ds_len=cfg.get("max_ds_len"),
+        max_ds_len=max_ds_len_val,
         random_coloring_nb=cfg.get("random_coloring_nb", 0),
     )
 
@@ -189,8 +198,9 @@ def main(cfg: DictConfig) -> None:
             accelerator=accelerator, use_wandb=cfg.logging.use_wandb, log_every=cfg.training.get("log_every", 10)
         )
 
-        val_loss, val_local_dice, val_final_dice, val_context_dice, _ = validate(
-            model, val_loader, device, accelerator=accelerator
+        val_loss, val_local_dice, val_final_dice, val_context_dice, val_detailed = validate(
+            model, val_loader, device, accelerator=accelerator,
+            use_wandb=cfg.logging.use_wandb, epoch=epoch
         )
 
         scheduler.step()
@@ -204,7 +214,7 @@ def main(cfg: DictConfig) -> None:
             )
 
         if cfg.logging.use_wandb and accelerator.is_main_process:
-            wandb.log({
+            log_dict = {
                 "epoch": epoch,
                 "train_loss": train_losses["loss"],
                 "train_local_dice": train_losses["local_dice"],
@@ -219,7 +229,16 @@ def main(cfg: DictConfig) -> None:
                 "val_final_dice": val_final_dice,
                 "val_context_dice": val_context_dice,
                 "lr": scheduler.get_last_lr()[0],
-            })
+            }
+            # Log per-label dice scores for training
+            if "per_label" in train_losses:
+                for label_id, dice_score in train_losses["per_label"].items():
+                    log_dict[f"train_dice/{label_id}"] = dice_score
+            # Log per-label dice scores for validation
+            if val_detailed and "per_label" in val_detailed:
+                for label_id, dice_score in val_detailed["per_label"].items():
+                    log_dict[f"val_dice/{label_id}"] = dice_score
+            wandb.log(log_dict)
 
         # Save best
         if val_final_dice > best_dice:

@@ -1,0 +1,96 @@
+# @package _global_
+# EXP_03_COMBINED: Enable context loss AND use a shallower 2-layer backbone.
+# Based on patch_icl_v2.
+
+dataset: "totalseg2d"
+train_label_ids: ['colon', 'costal_cartilages', 'duodenum', 'iliopsoas_right', 'inferior_vena_cava', 'kidney_left', 'kidney_right', 'lung_middle_lobe_right', 'pancreas', 'scapula_left', 'small_bowel', 'spleen', 'sternum', 'stomach', 'trachea', 'vertebrae_T10', 'vertebrae_T11', 'vertebrae_T12', 'vertebrae_T3', 'vertebrae_T4', 'vertebrae_T5', 'vertebrae_T9']
+val_label_ids: ['aorta', 'autochthon_left', 'autochthon_right', 'esophagus', 'heart', 'iliopsoas_left', 'liver', 'lung_lower_lobe_left', 'lung_lower_lobe_right', 'lung_upper_lobe_left', 'lung_upper_lobe_right', 'scapula_right', 'spinal_cord', 'vertebrae_L1', 'vertebrae_T7', 'vertebrae_T8']
+max_ds_len: null
+context_size: 1
+random_coloring_nb: 0
+
+# Use on-the-fly MedSAM v1 features
+feature_mode: "on_the_fly"
+load_dinov3_features: false
+
+preprocessing:
+  image_size: [256, 256, 256]
+
+training:
+  seed: 42
+  num_epochs: 200
+  print_every: 50
+  grad_accumulate_steps: 1
+  num_workers: 8
+  log_every: 10
+
+optimizer:
+  optimizer_type: "adamw"
+  optimizer_args:
+    lr: 0.0003
+    weight_decay: 0.01
+
+warmup_scheduler:
+  enabled: true
+  warmup_epochs: 10
+
+model:
+  patch_icl:
+    feature_extractor:
+      type: "medsam_v1"
+      checkpoint_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/medsam_vit_b.pth"
+      layer_idx: 11
+      freeze: true
+      target_size: 512
+      output_grid_size: 32
+
+    levels:
+      - resolution: 32
+        patch_size: 16
+        num_patches: 4  # Ignored for sliding_window
+        sampling_temperature: 0.001
+
+    oracle_levels_train: [false]
+    oracle_levels_valid: [false]
+
+    sampler:
+      type: "sliding_window"
+      sliding_window_stride: 16
+      augmentation:
+        enabled: false
+
+    aggregator:
+      type: "average"
+      combine_mode: "average"
+      min_coverage: 1e-6
+
+    backbone:
+      image_size: 256
+      embed_dim: 768
+      embed_proj_dim: 256
+      feature_grid_size: 32
+      patch_feature_grid_size: 16
+      num_heads: 8
+      num_layers: 2
+      num_registers: 8
+      target_self_attention: true
+      dropout: 0.1
+
+    loss:
+      patch_loss:
+        type: "diceCE"
+        args: null
+      aggreg_loss:
+        type: "diceCE"
+        args: null
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 0.5
+          context_aggreg: 0.5
+
+logging:
+  use_wandb: true
+  wandb_project: "patch_icl"
+  save_imgs_masks: false

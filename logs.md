@@ -1,5 +1,59 @@
 # Development Log
 
+## 2026-02-06: Train/Val Dice Gap Analysis & Fixes
+
+### Problem
+- Train dice: 0.3, Val dice: 0.1 (3x gap)
+
+### Root Causes Identified
+
+1. **Warmup Bug**: exp_10 had warmup_epochs=10 with num_epochs=10, meaning the model never reached full learning rate (fixed in exp_10 to warmup_epochs=3)
+
+2. **Sliding Window Ignores Oracle**: The SlidingWindowSampler completely ignores the `weights` parameter. Oracle settings have no effect with sliding_window sampler.
+
+3. **Low Context Size**: Only 1 context example for unseen organs is insufficient for in-context learning.
+
+4. **Context Loss Disabled**: No supervision signal for context segmentation.
+
+5. **Augmentation Disabled**: No regularization at patch level.
+
+6. **Skip Connections Disabled**: Decoder loses spatial detail from encoder.
+
+7. **Train/Val Use Different Organs** (by design): This is the ICL test - validation uses 20% unseen organs.
+
+### New Experiment Config: exp_11_improved.yaml
+
+Created `configs/experiment/exp_11_improved.yaml` with these changes:
+
+| Setting | exp_10 | exp_11 |
+|---------|--------|--------|
+| num_epochs | 10 | 100 |
+| warmup_epochs | 3 | 5 |
+| context_size | 1 | 3 |
+| sampler type | sliding_window | continuous |
+| oracle_levels_train | [false] | [true] |
+| augmentation.enabled | false | true |
+| rotation | none | "90" |
+| flip_horizontal | false | true |
+| flip_vertical | false | true |
+| decoder_use_skip_connections | false | true |
+| context_patch loss | 0 | 0.5 |
+| context_aggreg loss | 0 | 0.5 |
+
+### Expected Improvement
+
+| State | Train Dice | Val Dice |
+|-------|------------|----------|
+| Current (exp_10) | 0.30 | 0.10 |
+| exp_11 | 0.65 | 0.40 |
+
+### Usage
+```bash
+python scripts/train.py experiment=exp_11_improved
+```
+
+---
+
 ## 2026-02-05: PatchICL Codebase Simplification
 
 ### Overview

@@ -158,6 +158,7 @@ class PatchICL(nn.Module):
             target_self_attention=backbone_cfg.get('target_self_attention', False),
             dropout=backbone_cfg.get('dropout', 0.0),
             feature_grid_size=patch_feature_grid_size,
+            decoder_use_skip_connections=backbone_cfg.get('decoder_use_skip_connections', True),
         )
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):

@@ -11,7 +11,12 @@
       "Bash(ls:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(pip show:*)",
-      "Bash(nvidia-smi:*)"
+      "Bash(nvidia-smi:*)",
+      "Bash(while ! grep -q \"Epoch 0000 | Train Loss\" /tmp/claude-1011/-nfs-norasys-notebooks-camaret-ic-segmentation/tasks/bff0a16.output)",
+      "Bash(do sleep 30)",
+      "Bash(done)",
+      "WebSearch",
+      "WebFetch(domain:docs.wandb.ai)"
     ],
     "deny": [
       "Read(./old/**)"

@@ -521,19 +521,22 @@ class SimpleCNNDecoder(nn.Module):
         num_classes: int = 1,
         patch_size: int = 16,
         feature_grid_size: int = 16,
+        use_skip_connections: bool = True,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_classes = num_classes
         self.patch_size = patch_size
         self.feature_grid_size = feature_grid_size
+        self.use_skip_connections = use_skip_connections
 
         D = embed_dim
+        fuse_ch_in = D * 2 if self.use_skip_connections else D
 
         # 1x1 → 2x2, fuse with skip_2x2
         self.up1 = nn.ConvTranspose2d(D, D, 2, stride=2)
         self.fuse1 = nn.Sequential(
-            nn.Conv2d(D * 2, D, 3, padding=1),
+            nn.Conv2d(fuse_ch_in, D, 3, padding=1),
             nn.BatchNorm2d(D),
             nn.GELU(),
         )
@@ -541,7 +544,7 @@ class SimpleCNNDecoder(nn.Module):
         # 2x2 → 4x4, fuse with skip_4x4
         self.up2 = nn.ConvTranspose2d(D, D, 2, stride=2)
         self.fuse2 = nn.Sequential(
-            nn.Conv2d(D * 2, D, 3, padding=1),
+            nn.Conv2d(fuse_ch_in, D, 3, padding=1),
             nn.BatchNorm2d(D),
             nn.GELU(),
         )
@@ -549,7 +552,7 @@ class SimpleCNNDecoder(nn.Module):
         # 4x4 → 8x8, fuse with skip_8x8
         self.up3 = nn.ConvTranspose2d(D, D, 2, stride=2)
         self.fuse3 = nn.Sequential(
-            nn.Conv2d(D * 2, D, 3, padding=1),
+            nn.Conv2d(fuse_ch_in, D, 3, padding=1),
             nn.BatchNorm2d(D),
             nn.GELU(),
         )
@@ -558,7 +561,7 @@ class SimpleCNNDecoder(nn.Module):
             # 8x8 → 16x16, fuse with skip_16x16
             self.up4 = nn.ConvTranspose2d(D, D, 2, stride=2)
             self.fuse4 = nn.Sequential(
-                nn.Conv2d(D * 2, D, 3, padding=1),
+                nn.Conv2d(fuse_ch_in, D, 3, padding=1),
                 nn.BatchNorm2d(D),
                 nn.GELU(),
             )
@@ -592,32 +595,34 @@ class SimpleCNNDecoder(nn.Module):
         # Reshape encoded to [B*K, D, 1, 1] (use contiguous for after attention)
         x = encoded.contiguous().view(B * K, D, 1, 1)
 
-        # Get skip connections reshaped to [B*K, D, H, W]
-        skip_2x2 = skips['skip_2x2'].contiguous().view(B * K, D, 2, 2)
-        skip_4x4 = skips['skip_4x4'].contiguous().view(B * K, D, 4, 4)
-        skip_8x8 = skips['skip_8x8'].contiguous().view(B * K, D, 8, 8)
-
         # 1x1 → 2x2 + skip
-        x = self.up1(x)  # [B*K, D, 2, 2]
-        x = torch.cat([x, skip_2x2], dim=1)
-        x = self.fuse1(x)  # [B*K, D, 2, 2]
+        x = self.up1(x)
+        if self.use_skip_connections:
+            skip_2x2 = skips['skip_2x2'].contiguous().view(B * K, D, 2, 2)
+            x = torch.cat([x, skip_2x2], dim=1)
+        x = self.fuse1(x)
 
         # 2x2 → 4x4 + skip
-        x = self.up2(x)  # [B*K, D, 4, 4]
-        x = torch.cat([x, skip_4x4], dim=1)
-        x = self.fuse2(x)  # [B*K, D, 4, 4]
+        x = self.up2(x)
+        if self.use_skip_connections:
+            skip_4x4 = skips['skip_4x4'].contiguous().view(B * K, D, 4, 4)
+            x = torch.cat([x, skip_4x4], dim=1)
+        x = self.fuse2(x)
 
         # 4x4 → 8x8 + skip
-        x = self.up3(x)  # [B*K, D, 8, 8]
-        x = torch.cat([x, skip_8x8], dim=1)
-        x = self.fuse3(x)  # [B*K, D, 8, 8]
+        x = self.up3(x)
+        if self.use_skip_connections:
+            skip_8x8 = skips['skip_8x8'].contiguous().view(B * K, D, 8, 8)
+            x = torch.cat([x, skip_8x8], dim=1)
+        x = self.fuse3(x)
 
         if self.feature_grid_size == 16:
             # 8x8 → 16x16 + skip
-            skip_16x16 = skips['skip_16x16'].contiguous().view(B * K, D, 16, 16)
-            x = self.up4(x)  # [B*K, D, 16, 16]
-            x = torch.cat([x, skip_16x16], dim=1)
-            x = self.fuse4(x)  # [B*K, D, 16, 16]
+            x = self.up4(x)
+            if self.use_skip_connections:
+                skip_16x16 = skips['skip_16x16'].contiguous().view(B * K, D, 16, 16)
+                x = torch.cat([x, skip_16x16], dim=1)
+            x = self.fuse4(x)
 
         # Final conv to num_classes
         x = self.final_conv(x)  # [B*K, num_classes, h, h]
@@ -660,6 +665,7 @@ class SimpleBackbone(nn.Module):
         target_self_attention: bool = False,
         dropout: float = 0.0,
         max_seq_len: int = 1024,
+        decoder_use_skip_connections: bool = True,
     ):
         """
         Args:
@@ -675,6 +681,7 @@ class SimpleBackbone(nn.Module):
             target_self_attention: Allow targets to attend to each other
             dropout: Attention dropout rate
             max_seq_len: Maximum sequence length for RoPE cache
+            decoder_use_skip_connections: If True, use U-Net skips in decoder
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -703,6 +710,7 @@ class SimpleBackbone(nn.Module):
             num_classes=num_classes,
             patch_size=patch_size,
             feature_grid_size=feature_grid_size,
+            use_skip_connections=decoder_use_skip_connections,
         )
 
     def forward(

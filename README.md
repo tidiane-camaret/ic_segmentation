@@ -51,6 +51,24 @@ MedSAM2 features (256-dim) and iterative refinement
 python scripts/train.py experiment=patch_icl_v2
 ```
 
+### `exp_11_improved` - Optimized for Train/Val Gap
+
+Addresses train/val dice gap with optimized settings:
+
+| Setting | exp_10 | exp_11_improved |
+|---------|--------|-----------------|
+| Epochs | 10 | 100 |
+| Context size | 1 | 3 |
+| Sampler | sliding_window | continuous |
+| Oracle (train) | false | true |
+| Augmentation | disabled | rotation + flips |
+| Skip connections | disabled | enabled |
+| Context loss | 0 | 0.5 |
+
+```bash
+python scripts/train.py experiment=exp_11_improved
+```
+
 ## Refinement
 
 The refinement mechanism iteratively improves predictions by re-sampling uncertain regions:

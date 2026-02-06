@@ -187,6 +187,9 @@ class TotalSeg2DDataset(Dataset):
                                 self.valid_contexts.setdefault(key, []).append(case_id)
 
         print(f"Created {len(self.samples)} samples")
+        if self.max_ds_len is not None and len(self.samples) > self.max_ds_len:
+            random.shuffle(self.samples)
+            print(f"Shuffled samples")
 
     def _filter_by_split(self, split: str):
         """Filter cases by train/val/test split using meta.csv."""
