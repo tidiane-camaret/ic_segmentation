@@ -15,7 +15,7 @@ max_ds_len:  # Can be null, int, or dict with train/val keys
   train: 100000
   val: 5000
 
-context_size: 3  # Increased from 1
+context_size: 1  # Increased from 1
 random_coloring_nb: 0
 
 # Use on-the-fly MedSAM v1 features
@@ -55,7 +55,7 @@ model:
 
     levels:
       - resolution: 32
-        patch_size: 16
+        patch_size: 8
         num_patches: 16  # Used by continuous sampler
         sampling_temperature: 0.1
 
