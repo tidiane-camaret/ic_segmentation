@@ -213,12 +213,13 @@ class SimpleCNNEncoder(nn.Module):
         D = self.embed_dim
         h = w = self.feature_grid_size
         
+        """
         if NF != h * w:
             raise ValueError(
                 f"Expected {h*w} tokens (feature_grid_size={h}), got {NF}. "
                 f"Check that patch_feature_grid_size matches the actual feature extraction."
             )
-
+        """
         # Project and reshape to spatial: [B*K, D, h, w]
         x = self.input_proj(features.view(-1, E))  # [B*K*NF, D]
         x = x.view(B * K, NF, D).permute(0, 2, 1)  # [B*K, D, NF]

@@ -12,12 +12,65 @@ import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import albumentations as A
 import nibabel as nib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from data.label_ids_totalseg import get_label_ids
+
+
+def create_augmentation_transforms(
+    rotation_limit: float = 15.0,
+    scale_limit: float = 0.1,
+    elastic_alpha: float = 50.0,
+    elastic_sigma: float = 5.0,
+    brightness_limit: float = 0.1,
+    contrast_limit: float = 0.1,
+    gamma_limit: Tuple[float, float] = (80, 120),
+    noise_std_range: Tuple[float, float] = (0.02, 0.05),
+) -> Tuple[A.Compose, A.Compose]:
+    """
+    Create augmentation transforms for CT images.
+
+    Returns:
+        spatial_transform: Applied to both image and mask
+        intensity_transform: Applied to image only
+    """
+    spatial_transform = A.Compose([
+        A.Rotate(limit=rotation_limit, border_mode=0, fill=0, fill_mask=0, p=0.5),
+        A.Affine(
+            scale=(1.0 - scale_limit, 1.0 + scale_limit),
+            translate_percent=None,
+            rotate=0,
+            shear=0,
+            border_mode=0,  # cv2.BORDER_CONSTANT
+            fill=0,
+            fill_mask=0,
+            p=0.5,
+        ),
+        A.ElasticTransform(
+            alpha=elastic_alpha,
+            sigma=elastic_sigma,
+            border_mode=0,
+            fill=0,
+            fill_mask=0,
+            p=0.3,
+        ),
+    ])
+
+    intensity_transform = A.Compose([
+        A.RandomBrightnessContrast(
+            brightness_limit=brightness_limit,
+            contrast_limit=contrast_limit,
+            p=0.5,
+        ),
+        A.RandomGamma(gamma_limit=gamma_limit, p=0.3),
+        A.GaussNoise(std_range=noise_std_range, p=0.3),
+    ])
+
+    return spatial_transform, intensity_transform
 
 def define_colors_by_mean_sep(num_colors=133, channelsep=7):
     num_sep_per_channel = channelsep
@@ -88,6 +141,8 @@ class TotalSeg2DDataset(Dataset):
         random_coloring_nb: int = 0,
         feature_layer_idx: int = 11,
         feature_layers: Optional[List[int]] = None,
+        augment: bool = False,
+        augment_config: Optional[Dict] = None,
     ):
         """
         Args:
@@ -100,6 +155,16 @@ class TotalSeg2DDataset(Dataset):
                 Only used when load_dinov3_features=True.
             feature_layers: If provided, load features from multiple layers as a list.
                 Overrides feature_layer_idx. Returns dict with features from each layer.
+            augment: If True, apply data augmentation (rotation, scale, elastic, intensity).
+            augment_config: Optional dict with augmentation parameters:
+                - rotation_limit: Max rotation angle in degrees (default: 15)
+                - scale_limit: Max scale factor deviation (default: 0.1)
+                - elastic_alpha: Elastic deformation intensity (default: 50)
+                - elastic_sigma: Elastic deformation smoothness (default: 5)
+                - brightness_limit: Max brightness shift (default: 0.1)
+                - contrast_limit: Max contrast change (default: 0.1)
+                - gamma_limit: Gamma range as tuple (default: (80, 120))
+                - noise_std_range: Gaussian noise std dev range (default: (0.02, 0.05))
         """
         self.root_dir = Path(root_dir)
 
@@ -121,6 +186,26 @@ class TotalSeg2DDataset(Dataset):
         self.random_coloring_nb = random_coloring_nb
         self.feature_layer_idx = feature_layer_idx
         self.feature_layers = feature_layers
+
+        # Setup augmentation
+        self.augment = augment
+        if augment:
+            aug_cfg = augment_config or {}
+            self.spatial_transform, self.intensity_transform = create_augmentation_transforms(
+                rotation_limit=aug_cfg.get('rotation_limit', 15.0),
+                scale_limit=aug_cfg.get('scale_limit', 0.1),
+                elastic_alpha=aug_cfg.get('elastic_alpha', 50.0),
+                elastic_sigma=aug_cfg.get('elastic_sigma', 5.0),
+                brightness_limit=aug_cfg.get('brightness_limit', 0.1),
+                contrast_limit=aug_cfg.get('contrast_limit', 0.1),
+                gamma_limit=aug_cfg.get('gamma_limit', (80, 120)),
+                noise_std_range=aug_cfg.get('noise_std_range', (0.02, 0.05)),
+            )
+            print(f"Augmentation enabled: rotation=±{aug_cfg.get('rotation_limit', 15)}°, "
+                  f"scale=±{aug_cfg.get('scale_limit', 0.1)*100:.0f}%, elastic, intensity")
+        else:
+            self.spatial_transform = None
+            self.intensity_transform = None
 
         # Load stats dict
         with open(stats_path, "rb") as f:
@@ -449,6 +534,44 @@ class TotalSeg2DDataset(Dataset):
             resized = torch.nn.functional.interpolate(tensor, size=size, mode="nearest")
         return resized.squeeze(0).numpy()  # [C, H, W]
 
+    def _apply_augmentation(
+        self,
+        img: np.ndarray,
+        mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply augmentation to image and mask.
+
+        Args:
+            img: [H, W] normalized image in [0, 1]
+            mask: [H, W] binary mask
+
+        Returns:
+            Augmented image and mask
+        """
+        if not self.augment or self.spatial_transform is None:
+            return img, mask
+
+        # Convert image to uint8 for albumentations (expects 0-255)
+        img_uint8 = (img * 255).astype(np.uint8)
+        mask_uint8 = (mask * 255).astype(np.uint8)
+
+        # Apply spatial transforms (same to image and mask)
+        spatial_result = self.spatial_transform(image=img_uint8, mask=mask_uint8)
+        img_aug = spatial_result['image']
+        mask_aug = spatial_result['mask']
+
+        # Apply intensity transforms (image only)
+        if self.intensity_transform is not None:
+            intensity_result = self.intensity_transform(image=img_aug)
+            img_aug = intensity_result['image']
+
+        # Convert back to float [0, 1]
+        img_aug = img_aug.astype(np.float32) / 255.0
+        mask_aug = (mask_aug > 127).astype(np.float32)  # Binarize mask
+
+        return img_aug, mask_aug
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a sample with context examples.
@@ -501,9 +624,13 @@ class TotalSeg2DDataset(Dataset):
                 target_img = self._resize(target_img, self.image_size, mode="bilinear")
                 target_label = self._resize(target_label, self.image_size, mode="nearest")
 
+            # Apply augmentation
+            if self.augment:
+                target_img, target_label = self._apply_augmentation(target_img, target_label)
+
             # Convert to tensors
-            target_in = torch.from_numpy(target_img).unsqueeze(0)  # [1, H, W]
-            target_out = torch.from_numpy(target_label).unsqueeze(0)  # [1, H, W]
+            target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()  # [1, H, W]
+            target_out = torch.from_numpy(target_label.copy()).unsqueeze(0).float()  # [1, H, W]
 
             result = {
                 "image": target_in,
@@ -581,11 +708,23 @@ class TotalSeg2DDataset(Dataset):
             context_imgs = [self._resize(c, self.image_size, mode="bilinear") for c in context_imgs]
             context_labels = [self._resize(c, self.image_size, mode="nearest") for c in context_labels]
 
+        # Apply augmentation (different random transform for target and each context)
+        if self.augment:
+            target_img, target_label = self._apply_augmentation(target_img, target_label)
+            aug_context_imgs = []
+            aug_context_labels = []
+            for ctx_img, ctx_label in zip(context_imgs, context_labels):
+                ctx_img_aug, ctx_label_aug = self._apply_augmentation(ctx_img, ctx_label)
+                aug_context_imgs.append(ctx_img_aug)
+                aug_context_labels.append(ctx_label_aug)
+            context_imgs = aug_context_imgs
+            context_labels = aug_context_labels
+
         # Convert to tensors
-        target_in = torch.from_numpy(target_img).unsqueeze(0)  # [1, H, W]
-        target_out = torch.from_numpy(target_label).unsqueeze(0)  # [1, H, W]
-        context_in = torch.stack([torch.from_numpy(c).unsqueeze(0) for c in context_imgs])  # [k, 1, H, W]
-        context_out = torch.stack([torch.from_numpy(c).unsqueeze(0) for c in context_labels])  # [k, 1, H, W]
+        target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()  # [1, H, W]
+        target_out = torch.from_numpy(target_label.copy()).unsqueeze(0).float()  # [1, H, W]
+        context_in = torch.stack([torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_imgs])  # [k, 1, H, W]
+        context_out = torch.stack([torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_labels])  # [k, 1, H, W]
 
         result = {
             "image": target_in,

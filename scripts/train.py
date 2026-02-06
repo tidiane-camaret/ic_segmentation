@@ -55,6 +55,11 @@ def main(cfg: DictConfig) -> None:
         max_ds_len_train = max_ds_len_cfg
         max_ds_len_val = max_ds_len_cfg
 
+    # Image augmentation config (only for training)
+    img_aug_cfg = cfg.get("image_augmentation", {})
+    use_image_augmentation = img_aug_cfg.get("enabled", False)
+    augment_config = OmegaConf.to_container(img_aug_cfg, resolve=True) if use_image_augmentation else None
+
     train_loader = get_totalseg2d_dataloader(
         root_dir=cfg.paths.totalseg2d,
         stats_path=cfg.paths.totalseg_stats,
@@ -70,6 +75,8 @@ def main(cfg: DictConfig) -> None:
         load_dinov3_features=load_precomputed_features,
         max_ds_len=max_ds_len_train,
         random_coloring_nb=cfg.get("random_coloring_nb", 0),
+        augment=use_image_augmentation,
+        augment_config=augment_config,
     )
     val_loader = get_totalseg2d_dataloader(
         root_dir=cfg.paths.totalseg2d,
@@ -86,6 +93,7 @@ def main(cfg: DictConfig) -> None:
         load_dinov3_features=load_precomputed_features,
         max_ds_len=max_ds_len_val,
         random_coloring_nb=cfg.get("random_coloring_nb", 0),
+        augment=False,  # No augmentation for validation
     )
 
     # Model (PatchICL v2)
@@ -191,16 +199,27 @@ def main(cfg: DictConfig) -> None:
 
     # Training loop
     best_dice = 0.0
+    save_imgs = cfg.logging.get("save_imgs_masks", False)
+    save_every_n_epochs = cfg.logging.get("save_every_n_epochs", 5)
+    train_save_dir = ckpt_dir / "train_images" if save_imgs else None
+    val_save_dir = ckpt_dir / "val_images" if save_imgs else None
+
+    if save_imgs and accelerator.is_main_process:
+        print(f"Saving images: train every {save_every_n_epochs} epochs to {train_save_dir}")
+        print(f"Saving images: val every epoch to {val_save_dir}")
+
     for epoch in tqdm(range(cfg.training.num_epochs), desc="Training", disable=not accelerator.is_main_process):
         train_losses = train_epoch(
             model, train_loader, optimizer, device, epoch, cfg.training.print_every,
             cfg.training.get("grad_accumulate_steps", 1),
-            accelerator=accelerator, use_wandb=cfg.logging.use_wandb, log_every=cfg.training.get("log_every", 10)
+            accelerator=accelerator, use_wandb=cfg.logging.use_wandb, log_every=cfg.training.get("log_every", 10),
+            save_dir=train_save_dir, save_every_n_epochs=save_every_n_epochs
         )
 
         val_loss, val_local_dice, val_final_dice, val_context_dice, val_detailed = validate(
             model, val_loader, device, accelerator=accelerator,
-            use_wandb=cfg.logging.use_wandb, epoch=epoch
+            use_wandb=cfg.logging.use_wandb, epoch=epoch,
+            save_dir=val_save_dir
         )
 
         scheduler.step()

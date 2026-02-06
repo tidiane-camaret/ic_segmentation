@@ -394,6 +394,8 @@ class PatchICL(nn.Module):
                 'context_labels': context_out_ds,
                 'attn_weights': backbone_out.get('attn_weights'),
                 'register_tokens': backbone_out.get('register_tokens'),
+                'patch_size': self.patch_size,
+                'level_res': self.resolution,
             }],
             'patches': patches,
             'patch_labels': patch_labels,

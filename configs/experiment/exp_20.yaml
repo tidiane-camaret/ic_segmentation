@@ -25,6 +25,18 @@ load_dinov3_features: false
 preprocessing:
   image_size: [256, 256, 256]
 
+# Image-level augmentation (applied in dataloader, training only)
+image_augmentation:
+  enabled: true
+  rotation_limit: 15.0        # Max rotation angle in degrees
+  scale_limit: 0.1            # Max scale factor deviation (0.9-1.1x)
+  elastic_alpha: 50.0         # Elastic deformation intensity
+  elastic_sigma: 5.0          # Elastic deformation smoothness
+  brightness_limit: 0.1       # Max brightness shift
+  contrast_limit: 0.1         # Max contrast change
+  gamma_limit: [80, 120]      # Gamma correction range
+  noise_std_range: [0.02, 0.05]  # Gaussian noise std dev range
+
 training:
   seed: 42
   num_epochs: 10  # Increased from 10
@@ -77,12 +89,12 @@ model:
       min_coverage: 1e-6
 
     backbone:
-      decoder_use_skip_connections: true  # Enabled skip connections
+      decoder_use_skip_connections: false
       image_size: 256
       embed_dim: 768
       embed_proj_dim: 256
       feature_grid_size: 32
-      patch_feature_grid_size: 16
+      patch_feature_grid_size: 8  # Must match patch_size
       num_heads: 8
       num_layers: 4
       num_registers: 8
@@ -107,3 +119,4 @@ logging:
   use_wandb: true
   wandb_project: "patch_icl"
   save_imgs_masks: true
+  save_every_n_epochs: 5  # Save train images every N epochs

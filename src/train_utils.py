@@ -74,6 +74,106 @@ def _log_sample_images(label_samples: dict, epoch: int, prefix: str = "train") -
         wandb.log({f"{prefix}/samples": wandb_images, "epoch": epoch})
 
 
+def _save_sample_images(
+    label_samples: dict,
+    save_dir: Path,
+    epoch: int,
+    prefix: str = "train",
+    max_samples: int = 20,
+) -> None:
+    """Save sample images with patches to disk."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    epoch_dir = save_dir / f"{prefix}_epoch_{epoch:04d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    def draw_patch_boxes(ax, img, coords, patch_size, level_res, color='red'):
+        """Draw patch bounding boxes on image."""
+        if coords is None or level_res is None:
+            return
+        H, W = img.shape[:2]
+        scale_h, scale_w = H / level_res, W / level_res
+        scaled_patch_h = int(patch_size * scale_h)
+        scaled_patch_w = int(patch_size * scale_w)
+
+        for k in range(coords.shape[0]):
+            r, c = coords[k].numpy()
+            r_start = int(r * scale_h)
+            c_start = int(c * scale_w)
+            rect = Rectangle((c_start, r_start), scaled_patch_w, scaled_patch_h,
+                              linewidth=1, edgecolor=color, facecolor='none')
+            ax.add_patch(rect)
+
+    for label_id, sample in list(label_samples.items())[:max_samples]:
+        img = sample["image"].squeeze().numpy()
+        gt = sample["label"].squeeze().numpy()
+        pred = sample["pred"].squeeze().numpy()
+        dice = sample["dice"]
+        ctx_in = sample.get("context_in")
+        ctx_out = sample.get("context_out")
+        target_coords = sample.get("target_coords")
+        context_coords = sample.get("context_coords")
+        patch_size = sample.get("patch_size", 16)
+        level_res = sample.get("level_res", 32)
+
+        # Determine number of context examples
+        n_ctx = ctx_in.shape[0] if ctx_in is not None else 0
+        n_rows = 1 + (1 if n_ctx > 0 else 0)
+
+        fig, axes = plt.subplots(n_rows, 3, figsize=(12, 4 * n_rows))
+        if n_rows == 1:
+            axes = [axes]
+
+        # Row 1: Target image with patches, GT, prediction
+        axes[0][0].imshow(img, cmap='gray')
+        if target_coords is not None and level_res is not None:
+            draw_patch_boxes(axes[0][0], img, target_coords, patch_size, level_res, color='red')
+        axes[0][0].set_title('Target + Patches')
+        axes[0][0].axis('off')
+
+        axes[0][1].imshow(gt, cmap='gray')
+        axes[0][1].set_title('Ground Truth')
+        axes[0][1].axis('off')
+
+        axes[0][2].imshow(pred, cmap='gray')
+        axes[0][2].set_title(f'Prediction (dice={dice:.3f})')
+        axes[0][2].axis('off')
+
+        # Row 2: Context images with patches and masks
+        if n_ctx > 0 and n_rows > 1:
+            ctx_img = ctx_in[0].squeeze().numpy()
+            ctx_mask = ctx_out[0].squeeze().numpy()
+            axes[1][0].imshow(ctx_img, cmap='gray')
+            if context_coords is not None and level_res is not None:
+                draw_patch_boxes(axes[1][0], ctx_img, context_coords[0], patch_size, level_res, color='cyan')
+            axes[1][0].set_title('Context 1 + Patches')
+            axes[1][0].axis('off')
+
+            axes[1][1].imshow(ctx_mask, cmap='gray')
+            axes[1][1].set_title('Context 1 Mask')
+            axes[1][1].axis('off')
+
+            if n_ctx > 1:
+                ctx_img2 = ctx_in[1].squeeze().numpy()
+                ctx_mask2 = ctx_out[1].squeeze().numpy()
+                axes[1][2].imshow(ctx_img2, cmap='gray')
+                axes[1][2].imshow(ctx_mask2, cmap='Reds', alpha=0.4)
+                if context_coords is not None and context_coords.shape[0] > 1:
+                    draw_patch_boxes(axes[1][2], ctx_img2, context_coords[1], patch_size, level_res, color='cyan')
+                axes[1][2].set_title('Context 2 + Mask')
+                axes[1][2].axis('off')
+            else:
+                axes[1][2].axis('off')
+
+        fig.tight_layout()
+        safe_label = label_id.replace('/', '_')
+        fig.savefig(epoch_dir / f"{safe_label}.png", dpi=100, bbox_inches='tight')
+        plt.close(fig)
+
+
 def train_epoch(
     model,
     train_loader,
@@ -85,6 +185,8 @@ def train_epoch(
     accelerator=None,
     use_wandb=False,
     log_every=10,
+    save_dir: Optional[Path] = None,
+    save_every_n_epochs: int = 5,
 ):
     """Run one training epoch."""
     model.train()
@@ -207,14 +309,37 @@ def train_epoch(
                 if label_id not in label_dice_scores:
                     label_dice_scores[label_id] = []
                 label_dice_scores[label_id].append(dice_val)
-                # Store one sample per label for wandb image logging
-                if use_wandb and is_main and label_id not in label_samples:
+                # Store one sample per label for image logging (wandb or disk)
+                should_save = (use_wandb or save_dir is not None) and is_main
+                if should_save and label_id not in label_samples:
+                    # Get patch coordinates and info from level_outputs
+                    target_coords = None
+                    context_coords = None
+                    patch_size = None
+                    level_res = None
+                    if level_outputs:
+                        level_out = level_outputs[-1]
+                        target_coords = level_out.get("coords")
+                        if target_coords is not None:
+                            target_coords = target_coords[i].detach().cpu()
+                        context_coords = level_out.get("context_coords")
+                        if context_coords is not None:
+                            context_coords = context_coords[i].detach().cpu()
+                        patch_size = level_out.get("patch_size", 16)
+                        level_res = level_out.get("level_res", 32)
+
                     label_samples[label_id] = {
                         "image": images[i].detach().cpu(),
                         "label": labels[i].detach().cpu(),
                         "pred": pred_binary[i].detach().cpu(),
                         "pred_probs": pred_probs[i].detach().cpu(),
                         "dice": dice_val,
+                        "context_in": context_in[i].detach().cpu() if context_in is not None else None,
+                        "context_out": context_out[i].detach().cpu() if context_out is not None else None,
+                        "target_coords": target_coords,
+                        "context_coords": context_coords,
+                        "patch_size": patch_size,
+                        "level_res": level_res,
                     }
 
             # Context dice
@@ -307,6 +432,10 @@ def train_epoch(
     # Log one image per label to wandb
     if use_wandb and is_main and label_samples:
         _log_sample_images(label_samples, epoch, prefix="train")
+
+    # Save train images to disk periodically
+    if save_dir is not None and is_main and label_samples and (epoch % save_every_n_epochs == 0):
+        _save_sample_images(label_samples, save_dir, epoch, prefix="train")
 
     return {
         "loss": total_loss / n,
@@ -456,12 +585,34 @@ def validate(
             label_dice_scores[label_id].append(dice_val)
             # Store one sample per label for wandb image logging
             if is_main and label_id not in label_samples:
+                # Get patch coordinates and info from level_outputs
+                target_coords = None
+                context_coords = None
+                patch_size = None
+                level_res = None
+                if level_outputs:
+                    level_out = level_outputs[-1]
+                    target_coords = level_out.get("coords")
+                    if target_coords is not None:
+                        target_coords = target_coords[i].detach().cpu()
+                    context_coords = level_out.get("context_coords")
+                    if context_coords is not None:
+                        context_coords = context_coords[i].detach().cpu()
+                    patch_size = level_out.get("patch_size", 16)
+                    level_res = level_out.get("level_res", 32)
+
                 label_samples[label_id] = {
                     "image": images[i].detach().cpu(),
                     "label": labels[i].detach().cpu(),
                     "pred": pred_binary[i].detach().cpu(),
                     "pred_probs": pred_probs[i].detach().cpu(),
                     "dice": dice_val,
+                    "context_in": context_in[i].detach().cpu() if context_in is not None else None,
+                    "context_out": context_out[i].detach().cpu() if context_out is not None else None,
+                    "target_coords": target_coords,
+                    "context_coords": context_coords,
+                    "patch_size": patch_size,
+                    "level_res": level_res,
                 }
 
         # Context dice
@@ -501,6 +652,10 @@ def validate(
     # Log one image per label to wandb
     if use_wandb and is_main and label_samples:
         _log_sample_images(label_samples, epoch, prefix="val")
+
+    # Save images to disk if save_dir is provided
+    if save_dir is not None and is_main and label_samples:
+        _save_sample_images(label_samples, save_dir, epoch, prefix="val", max_samples=max_save_batches * 4)
 
     detailed_results = {
         "per_case": case_results,
