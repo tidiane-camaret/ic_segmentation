@@ -2,9 +2,41 @@
 dataset: medsegbench
 
 medsegbench:
-  datasets: null  # Shared dataset list (used when train/val_datasets not set), null for all
-  train_datasets: [busi]  # Train-only datasets (overrides 'datasets')
-  val_datasets: [busi]    # Val-only datasets (overrides 'datasets')
+  datasets: null  # Shared fallback (used when train/val_datasets not set), null for all
+  train_datasets:  # 24 datasets, ~39K train-split images
+    - fhpsaop            # Ultrasound - fetal head (3-class)
+    - ultrasoundnerve    # Ultrasound - brachial plexus nerves
+    - usforkidney        # Ultrasound - kidney
+    - chasedb1           # Fundus - retinal vessels
+    - chuac              # Fundus - retinal vessels
+    - dca1               # Fundus - optic discs
+    - covid19radio       # Chest X-Ray - lung
+    - pandental          # X-Ray - mandible
+    - isic2018           # Dermoscopy - skin lesions
+    - uwaterlooskincancer # Dermoscopy - skin cancer
+    - polypgen           # Endoscopy - colon polyps
+    - m2caiseg           # Endoscopy - surgical tools (19-class)
+    - robotool           # Endoscopy - surgical tools
+    - bbbc010            # Microscopy - C. elegans
+    - brifiseg           # Microscopy - fibers (3-class)
+    - deepbacs           # Microscopy - bacteria
+    - yeaz               # Microscopy - yeast cells
+    - dynamicnuclear     # Nuclear - nuclear cells
+    - nuset              # Nuclear - nuclear cells
+    - mosmedplus         # CT - lung
+    - promise12          # MRI - prostate
+    - cystoidfluid       # OCT - macular edema
+    - monusac            # Pathology - multi-organ (5-class)
+    - tnbcnuclei         # Pathology - histopathology nuclei
+  val_datasets:  # 8 datasets, ~4.5K val-split images
+    - busi               # Ultrasound - breast lesions
+    - covidquex          # Chest X-Ray - lung
+    - isic2016           # Dermoscopy - skin lesions
+    - kvasir             # Endoscopy - GI polyps
+    - cellnuclei         # Microscopy - cell nuclei
+    - wbc                # Microscopy - WBC (3-class)
+    - drive              # Fundus - retinal vessels
+    - nuclei             # Pathology - cell nuclei
   max_samples_per_dataset: null  # Limit per dataset (for debugging)
 
 
