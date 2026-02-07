@@ -118,6 +118,13 @@ def _save_sample_images(
                               linewidth=1, edgecolor=color, facecolor='none')
             ax.add_patch(rect)
 
+    wandb_images = []
+    try:
+        import wandb
+        wandb_available = True
+    except ImportError:
+        wandb_available = False
+
     for label_id, sample in list(label_samples.items())[:max_samples]:
         img = sample["image"].squeeze().numpy()
         gt = sample["label"].squeeze().numpy()
@@ -125,7 +132,6 @@ def _save_sample_images(
         pred_probs = sample.get("pred_probs")
         if pred_probs is not None:
             pred_probs = pred_probs.squeeze().numpy()
-            # Normalize to [0,1] (should already be in range, but ensure)
             pred_heatmap = (pred_probs - pred_probs.min()) / (pred_probs.max() - pred_probs.min() + 1e-8)
         else:
             pred_heatmap = None
@@ -137,7 +143,6 @@ def _save_sample_images(
         patch_size = sample.get("patch_size", 16)
         level_res = sample.get("level_res", 32)
 
-        # Determine number of context examples
         n_ctx = ctx_in.shape[0] if ctx_in is not None else 0
         n_rows = 1 + (1 if n_ctx > 0 else 0)
 
@@ -145,7 +150,6 @@ def _save_sample_images(
         if n_rows == 1:
             axes = [axes]
 
-        # Row 1: Target image with patches, GT, prediction, heatmap
         axes[0][0].imshow(img, cmap='gray')
         if target_coords is not None and level_res is not None:
             draw_patch_boxes(axes[0][0], img, target_coords, patch_size, level_res, color='red')
@@ -166,20 +170,18 @@ def _save_sample_images(
             plt.colorbar(im, ax=axes[0][3], fraction=0.046, pad=0.04)
         axes[0][3].axis('off')
 
-        # Row 2: Context images with patches and masks
         if n_ctx > 0 and n_rows > 1:
             ctx_img = ctx_in[0].squeeze().numpy()
             ctx_mask = ctx_out[0].squeeze().numpy()
             axes[1][0].imshow(ctx_img, cmap='gray')
-            # context_coords is [k*K, 2] (all contexts concatenated), need to split by K patches per context
             if context_coords is not None and level_res is not None and context_coords.ndim == 2:
                 try:
                     total_patches = context_coords.shape[0]
-                    K_per_ctx = total_patches // n_ctx  # patches per context
-                    ctx1_coords = context_coords[:K_per_ctx]  # First context's patches
+                    K_per_ctx = total_patches // n_ctx
+                    ctx1_coords = context_coords[:K_per_ctx]
                     draw_patch_boxes(axes[1][0], ctx_img, ctx1_coords, patch_size, level_res, color='cyan')
                 except (IndexError, TypeError, ZeroDivisionError):
-                    pass  # Skip if coords structure is unexpected
+                    pass
             axes[1][0].set_title('Context 1 + Patches')
             axes[1][0].axis('off')
 
@@ -196,10 +198,10 @@ def _save_sample_images(
                     try:
                         total_patches = context_coords.shape[0]
                         K_per_ctx = total_patches // n_ctx
-                        ctx2_coords = context_coords[K_per_ctx:2*K_per_ctx]  # Second context's patches
+                        ctx2_coords = context_coords[K_per_ctx:2*K_per_ctx]
                         draw_patch_boxes(axes[1][2], ctx_img2, ctx2_coords, patch_size, level_res, color='cyan')
                     except (IndexError, TypeError, ZeroDivisionError):
-                        pass  # Skip if coords structure is unexpected
+                        pass
                 axes[1][2].set_title('Context 2 + Mask')
                 axes[1][2].axis('off')
             else:
@@ -208,8 +210,18 @@ def _save_sample_images(
 
         fig.tight_layout()
         safe_label = label_id.replace('/', '_')
-        fig.savefig(epoch_dir / f"{safe_label}.png", dpi=100, bbox_inches='tight')
+        save_path = epoch_dir / f"{safe_label}.png"
+        fig.savefig(save_path, dpi=100, bbox_inches='tight')
         plt.close(fig)
+
+        # Log the saved image to wandb
+        if wandb_available:
+            wandb_img = wandb.Image(str(save_path), caption=f"{label_id} (dice={dice:.3f})")
+            wandb_images.append(wandb_img)
+
+    # Log all images at once to wandb
+    if wandb_images and wandb_available:
+        wandb.log({f"{prefix}/saved_samples": wandb_images, "epoch": epoch})
 
 
 def train_epoch(

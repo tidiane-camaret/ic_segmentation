@@ -16,11 +16,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-try:
-    from src.dataloaders.augmentations import create_augmentation_transforms
-    HAS_AUGMENTATIONS = True
-except ImportError:
-    HAS_AUGMENTATIONS = False
+
+from src.dataloaders.augmentations import create_augmentation_transforms
+
 
 
 def _find_keys(keys: List[str], split: str) -> Tuple[Optional[str], Optional[str]]:
@@ -65,7 +63,7 @@ class MedSegBenchDataset(Dataset):
         self.augment = augment
 
         # Setup augmentation
-        if augment and HAS_AUGMENTATIONS:
+        if augment:
             cfg = augment_config or {}
             self.spatial_transform, self.intensity_transform = create_augmentation_transforms(
                 rotation_limit=cfg.get("rotation_limit", 15.0),
@@ -78,8 +76,6 @@ class MedSegBenchDataset(Dataset):
                 noise_std_range=cfg.get("noise_std_range", (0.02, 0.05)),
             )
         else:
-            if augment and not HAS_AUGMENTATIONS:
-                print("Warning: augmentations requested but not available")
             self.augment = False
             self.spatial_transform = None
             self.intensity_transform = None
@@ -260,8 +256,9 @@ class MedSegBenchDataset(Dataset):
             - 'label': [1, H, W] target binary mask
             - 'context_in': [k, 1, H, W] context images
             - 'context_out': [k, 1, H, W] context masks
-            - 'dataset': str
-            - 'label_value': int
+            - 'target_case_id': str, e.g. "datasetname_42"
+            - 'context_case_ids': List[str], e.g. ["datasetname_10", ...]
+            - 'label_id': str, e.g. "datasetname_3"
         """
         ds_name, sample_idx = self.samples[idx]
         images = self.data[ds_name]["images"]
@@ -322,11 +319,17 @@ class MedSegBenchDataset(Dataset):
         target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()
         target_out = torch.from_numpy(target_binary.copy()).unsqueeze(0).float()
 
+        # Build case/label IDs
+        target_case_id = f"{ds_name}_{sample_idx}"
+        label_id = f"{ds_name}_{label_value}"
+        context_case_ids = [f"{ctx_ds}_{ctx_idx}" for ctx_ds, ctx_idx in context_samples]
+
         result = {
             "image": target_in,
             "label": target_out,
-            "dataset": ds_name,
-            "label_value": label_value,
+            "target_case_id": target_case_id,
+            "context_case_ids": context_case_ids,
+            "label_id": label_id,
         }
 
         if context_imgs:
@@ -347,8 +350,9 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     result = {
         "image": torch.stack([item["image"] for item in batch]),
         "label": torch.stack([item["label"] for item in batch]),
-        "datasets": [item["dataset"] for item in batch],
-        "label_values": [item["label_value"] for item in batch],
+        "target_case_ids": [item["target_case_id"] for item in batch],
+        "context_case_ids": [item["context_case_ids"] for item in batch],
+        "label_ids": [item["label_id"] for item in batch],
     }
 
     if "context_in" in batch[0]:

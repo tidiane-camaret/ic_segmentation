@@ -6,7 +6,7 @@ paths:
   DATA_DIR: ${.root}/data
   RESULTS_DIR: ${.root}/ic_segmentation/results
   totalseg: ${.DATA_DIR}/TotalSeg
-  medsegbench: ${.DATA_DIR}/MedSegBench
+  medsegbench: ${.DATA_DIR}/medsegbench
   totalseg2d: ${.DATA_DIR}/TotalSeg2D
   totalseg_stats: ${.totalseg}/totalseg_stats.pkl
   ckpts:
@@ -19,8 +19,8 @@ paths:
     patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
 
 # Cluster-specific training settings
-train_batch_size: 32
-val_batch_size: 32
+train_batch_size: 64
+val_batch_size: 64
 training:
   num_workers: 16
 

@@ -39,78 +39,117 @@ def main(cfg: DictConfig) -> None:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # Dataloader (TotalSeg2D only)
-    from src.dataloaders.totalseg2d_dataloader import get_dataloader as get_totalseg2d_dataloader
-
-    feature_mode = cfg.get("feature_mode", "precomputed")
-    load_precomputed_features = (feature_mode == "precomputed") and cfg.get("load_dinov3_features", True)
-
-    train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
-    val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
-
-    # Support separate max_ds_len for train/val, with fallback to single value
-    max_ds_len_cfg = cfg.get("max_ds_len")
-    if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
-        max_ds_len_train = max_ds_len_cfg.get("train")
-        max_ds_len_val = max_ds_len_cfg.get("val")
-    else:
-        max_ds_len_train = max_ds_len_cfg
-        max_ds_len_val = max_ds_len_cfg
-
     # Image augmentation config (only for training)
     img_aug_cfg = cfg.get("image_augmentation", {})
     use_image_augmentation = img_aug_cfg.get("enabled", False)
     augment_config = OmegaConf.to_container(img_aug_cfg, resolve=True) if use_image_augmentation else None
 
-    # CarveMix config (only for training)
-    carve_mix_cfg = cfg.get("carve_mix", {})
-    use_carve_mix = carve_mix_cfg.get("enabled", False)
-    carve_mix_config = OmegaConf.to_container(carve_mix_cfg, resolve=True) if use_carve_mix else None
+    # Dataloader
+    dataset_type = cfg.get("dataset", "totalseg2d")
+    feature_mode = cfg.get("feature_mode", "precomputed")
 
-    # Advanced augmentation config (only for training)
-    adv_aug_cfg = cfg.get("advanced_augmentation", {})
-    use_adv_aug = adv_aug_cfg.get("enabled", False)
-    adv_aug_config = OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
+    if dataset_type == "medsegbench":
+        from src.dataloaders.medsegbench_dataloader import get_dataloader as get_medsegbench_dataloader
 
-    train_loader = get_totalseg2d_dataloader(
-        root_dir=cfg.paths.totalseg2d,
-        stats_path=cfg.paths.totalseg_stats,
-        label_id_list=train_labels,
-        context_size=cfg.context_size,
-        batch_size=cfg.train_batch_size,
-        image_size=tuple(cfg.preprocessing.image_size[:2]),
-        crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-        bbox_padding=cfg.preprocessing.bbox_padding,
-        num_workers=cfg.training.get("num_workers", 4),
-        split="train",
-        shuffle=True,
-        load_dinov3_features=load_precomputed_features,
-        max_ds_len=max_ds_len_train,
-        random_coloring_nb=cfg.get("random_coloring_nb", 0),
-        augment=use_image_augmentation,
-        augment_config=augment_config,
-        carve_mix=use_carve_mix,
-        carve_mix_config=carve_mix_config,
-        advanced_augmentation=use_adv_aug,
-        advanced_augmentation_config=adv_aug_config,
-    )
-    val_loader = get_totalseg2d_dataloader(
-        root_dir=cfg.paths.totalseg2d,
-        stats_path=cfg.paths.totalseg_stats,
-        label_id_list=val_labels,
-        context_size=cfg.context_size,
-        batch_size=cfg.val_batch_size,
-        image_size=tuple(cfg.preprocessing.image_size[:2]),
-        crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-        bbox_padding=cfg.preprocessing.bbox_padding,
-        num_workers=cfg.training.get("num_workers", 4),
-        split="val",
-        shuffle=False,
-        load_dinov3_features=load_precomputed_features,
-        max_ds_len=max_ds_len_val,
-        random_coloring_nb=cfg.get("random_coloring_nb", 0),
-        augment=False,  # No augmentation for validation
-    )
+        msb_cfg = cfg.get("medsegbench", {})
+        msb_datasets = msb_cfg.get("datasets", None)
+        if msb_datasets is not None:
+            msb_datasets = list(msb_datasets)
+        max_samples = msb_cfg.get("max_samples_per_dataset", None)
+
+        train_loader = get_medsegbench_dataloader(
+            data_root=cfg.paths.medsegbench,
+            datasets=msb_datasets,
+            split="train",
+            context_size=cfg.context_size,
+            batch_size=cfg.train_batch_size,
+            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            num_workers=cfg.training.get("num_workers", 4),
+            shuffle=True,
+            augment=use_image_augmentation,
+            augment_config=augment_config,
+            max_samples_per_dataset=max_samples,
+        )
+        val_loader = get_medsegbench_dataloader(
+            data_root=cfg.paths.medsegbench,
+            datasets=msb_datasets,
+            split="val",
+            context_size=cfg.context_size,
+            batch_size=cfg.val_batch_size,
+            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            num_workers=cfg.training.get("num_workers", 4),
+            shuffle=False,
+            augment=False,
+            max_samples_per_dataset=max_samples,
+        )
+
+    else:
+        # TotalSeg2D dataloader
+        from src.dataloaders.totalseg2d_dataloader import get_dataloader as get_totalseg2d_dataloader
+
+        load_precomputed_features = (feature_mode == "precomputed") and cfg.get("load_dinov3_features", True)
+
+        train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
+        val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
+
+        # Support separate max_ds_len for train/val, with fallback to single value
+        max_ds_len_cfg = cfg.get("max_ds_len")
+        if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
+            max_ds_len_train = max_ds_len_cfg.get("train")
+            max_ds_len_val = max_ds_len_cfg.get("val")
+        else:
+            max_ds_len_train = max_ds_len_cfg
+            max_ds_len_val = max_ds_len_cfg
+
+        # CarveMix config (only for training)
+        carve_mix_cfg = cfg.get("carve_mix", {})
+        use_carve_mix = carve_mix_cfg.get("enabled", False)
+        carve_mix_config = OmegaConf.to_container(carve_mix_cfg, resolve=True) if use_carve_mix else None
+
+        # Advanced augmentation config (only for training)
+        adv_aug_cfg = cfg.get("advanced_augmentation", {})
+        use_adv_aug = adv_aug_cfg.get("enabled", False)
+        adv_aug_config = OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
+
+        train_loader = get_totalseg2d_dataloader(
+            root_dir=cfg.paths.totalseg2d,
+            stats_path=cfg.paths.totalseg_stats,
+            label_id_list=train_labels,
+            context_size=cfg.context_size,
+            batch_size=cfg.train_batch_size,
+            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+            bbox_padding=cfg.preprocessing.bbox_padding,
+            num_workers=cfg.training.get("num_workers", 4),
+            split="train",
+            shuffle=True,
+            load_dinov3_features=load_precomputed_features,
+            max_ds_len=max_ds_len_train,
+            random_coloring_nb=cfg.get("random_coloring_nb", 0),
+            augment=use_image_augmentation,
+            augment_config=augment_config,
+            carve_mix=use_carve_mix,
+            carve_mix_config=carve_mix_config,
+            advanced_augmentation=use_adv_aug,
+            advanced_augmentation_config=adv_aug_config,
+        )
+        val_loader = get_totalseg2d_dataloader(
+            root_dir=cfg.paths.totalseg2d,
+            stats_path=cfg.paths.totalseg_stats,
+            label_id_list=val_labels,
+            context_size=cfg.context_size,
+            batch_size=cfg.val_batch_size,
+            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+            bbox_padding=cfg.preprocessing.bbox_padding,
+            num_workers=cfg.training.get("num_workers", 4),
+            split="val",
+            shuffle=False,
+            load_dinov3_features=load_precomputed_features,
+            max_ds_len=max_ds_len_val,
+            random_coloring_nb=cfg.get("random_coloring_nb", 0),
+            augment=False,  # No augmentation for validation
+        )
 
     # Model (PatchICL v2)
     from src.models.patch_icl_v2 import PatchICL
@@ -168,6 +207,20 @@ def main(cfg: DictConfig) -> None:
             if accelerator.is_main_process:
                 info = feature_extractor.get_feature_info()
                 print(f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, grid={info['output_grid_size']})")
+        elif extractor_type == "universeg":
+            from src.models.universeg_extractor import UniverSegExtractor
+            if accelerator.is_main_process:
+                print("Initializing UniverSeg for on-the-fly feature extraction...")
+            feature_extractor = UniverSegExtractor(
+                layer_idx=fe_cfg.get("layer_idx", 3) if fe_cfg else 3,
+                device=device,
+                pretrained=fe_cfg.get("pretrained", True) if fe_cfg else True,
+                freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+            )
+            if accelerator.is_main_process:
+                info = feature_extractor.get_feature_info()
+                print(f"Feature mode: on_the_fly (UniverSeg layer {info['layer_idx']}, grid={info['output_grid_size']})")
         else:
             raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
     else:

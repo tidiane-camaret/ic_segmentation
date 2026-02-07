@@ -7,7 +7,7 @@ defaults:
   - experiment: null
   - cluster: nfs
 
-# Dataset (TotalSeg2D only)
+# Dataset: "totalseg2d" or "medsegbench"
 dataset: totalseg2d
 download: false
 load_dinov3_features: true
@@ -16,6 +16,11 @@ random_coloring_nb: 0
 method: "patch_icl"
 train_label_ids: "train"
 val_label_ids: "val"
+
+# MedSegBench-specific settings (used when dataset=medsegbench)
+medsegbench:
+  datasets: null  # List of dataset names to load, null for all
+  max_samples_per_dataset: null  # Limit per dataset (for debugging)
 
 # Feature extraction mode: "precomputed" or "on_the_fly"
 feature_mode: "precomputed"

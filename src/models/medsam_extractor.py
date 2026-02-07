@@ -402,8 +402,12 @@ def create_feature_extractor(
     elif extractor_type in ("medsam_v1", "medsam_v1_layer"):
         return MedSAMv1LayerExtractor(**kwargs)
 
+    elif extractor_type == "universeg":
+        from src.models.universeg_extractor import UniverSegExtractor
+        return UniverSegExtractor(**kwargs)
+
     else:
         raise ValueError(
             f"Unknown extractor type: {extractor_type}. "
-            f"Supported: 'meddino', 'medsam_v1', 'medsam_v1_layer'"
+            f"Supported: 'meddino', 'medsam_v1', 'medsam_v1_layer', 'universeg'"
         )
