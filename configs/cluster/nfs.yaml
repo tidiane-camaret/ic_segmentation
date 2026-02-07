@@ -20,9 +20,8 @@ paths:
     meddino_vit: ${..root}/checkpoints/med_dino_v3model.pth
     medsam2: null  # Set to local path or null to download from HuggingFace (wanglab/MedSAM2)
     patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
-    patch_icl_v2: ${..RESULTS_DIR}/checkpoints/best_model_05_02_26.pt
 # Cluster-specific training settings
-train_batch_size: 64
-val_batch_size: 64
+train_batch_size: 32
+val_batch_size: 32
 training:
   num_workers: 16

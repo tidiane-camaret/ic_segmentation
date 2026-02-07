@@ -19,58 +19,15 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from data.label_ids_totalseg import get_label_ids
+from src.dataloaders.augmentations import (
+    create_augmentation_transforms,
+    carve_mix_2d,
+    foreground_random_crop,
+    perturb_mask,
+    degrade_resolution,
+    random_intensity_shift,
+)
 
-
-def create_augmentation_transforms(
-    rotation_limit: float = 15.0,
-    scale_limit: float = 0.1,
-    elastic_alpha: float = 50.0,
-    elastic_sigma: float = 5.0,
-    brightness_limit: float = 0.1,
-    contrast_limit: float = 0.1,
-    gamma_limit: Tuple[float, float] = (80, 120),
-    noise_std_range: Tuple[float, float] = (0.02, 0.05),
-) -> Tuple[A.Compose, A.Compose]:
-    """
-    Create augmentation transforms for CT images.
-
-    Returns:
-        spatial_transform: Applied to both image and mask
-        intensity_transform: Applied to image only
-    """
-    spatial_transform = A.Compose([
-        A.Rotate(limit=rotation_limit, border_mode=0, fill=0, fill_mask=0, p=0.5),
-        A.Affine(
-            scale=(1.0 - scale_limit, 1.0 + scale_limit),
-            translate_percent=None,
-            rotate=0,
-            shear=0,
-            border_mode=0,  # cv2.BORDER_CONSTANT
-            fill=0,
-            fill_mask=0,
-            p=0.5,
-        ),
-        A.ElasticTransform(
-            alpha=elastic_alpha,
-            sigma=elastic_sigma,
-            border_mode=0,
-            fill=0,
-            fill_mask=0,
-            p=0.3,
-        ),
-    ])
-
-    intensity_transform = A.Compose([
-        A.RandomBrightnessContrast(
-            brightness_limit=brightness_limit,
-            contrast_limit=contrast_limit,
-            p=0.5,
-        ),
-        A.RandomGamma(gamma_limit=gamma_limit, p=0.3),
-        A.GaussNoise(std_range=noise_std_range, p=0.3),
-    ])
-
-    return spatial_transform, intensity_transform
 
 def define_colors_by_mean_sep(num_colors=133, channelsep=7):
     num_sep_per_channel = channelsep
@@ -143,6 +100,10 @@ class TotalSeg2DDataset(Dataset):
         feature_layers: Optional[List[int]] = None,
         augment: bool = False,
         augment_config: Optional[Dict] = None,
+        carve_mix: bool = False,
+        carve_mix_config: Optional[Dict] = None,
+        advanced_augmentation: bool = False,
+        advanced_augmentation_config: Optional[Dict] = None,
     ):
         """
         Args:
@@ -206,6 +167,40 @@ class TotalSeg2DDataset(Dataset):
         else:
             self.spatial_transform = None
             self.intensity_transform = None
+
+        # Setup CarveMix (only for single-label binary masks)
+        self.carve_mix = carve_mix and self.random_coloring_nb == 0
+        cm_cfg = carve_mix_config or {}
+        self.carve_mix_p = cm_cfg.get("probability", 0.5)
+        self.carve_mix_margin_range = tuple(cm_cfg.get("margin_range", [0.1, 0.5]))
+        self.carve_mix_harmonize = cm_cfg.get("harmonize", True)
+        self.carve_mix_harmonize_sigma = cm_cfg.get("harmonize_sigma", 5.0)
+        if self.carve_mix:
+            print(f"CarveMix enabled: p={self.carve_mix_p}, margin={self.carve_mix_margin_range}, "
+                  f"harmonize={self.carve_mix_harmonize}, sigma={self.carve_mix_harmonize_sigma}")
+
+        # Setup advanced augmentation (only for single-label binary masks)
+        self.advanced_augmentation = advanced_augmentation and self.random_coloring_nb == 0
+        adv = advanced_augmentation_config or {}
+        self.adv_windowing_jitter = adv.get("windowing_jitter", 0)
+        fg = adv.get("foreground_crop", {})
+        self.adv_fg_crop_p = fg.get("probability", 0.3)
+        self.adv_fg_crop_min = fg.get("min_crop_frac", 0.5)
+        mp = adv.get("mask_perturbation", {})
+        self.adv_mask_perturb_p = mp.get("probability", 0.3)
+        self.adv_mask_perturb_kernel = mp.get("max_kernel", 5)
+        rd = adv.get("resolution_degradation", {})
+        self.adv_degrade_p = rd.get("probability", 0.2)
+        self.adv_degrade_min_scale = rd.get("min_scale", 0.25)
+        ai = adv.get("asymmetric_intensity", {})
+        self.adv_asym_p = ai.get("probability", 0.5)
+        self.adv_asym_brightness = ai.get("brightness_shift", 0.15)
+        self.adv_asym_contrast = ai.get("contrast_scale", 0.15)
+        self.adv_asym_gamma = tuple(ai.get("gamma_range", [0.7, 1.5]))
+        if self.advanced_augmentation:
+            print(f"Advanced augmentation enabled: windowing_jitter={self.adv_windowing_jitter}, "
+                  f"fg_crop_p={self.adv_fg_crop_p}, mask_perturb_p={self.adv_mask_perturb_p}, "
+                  f"degrade_p={self.adv_degrade_p}, asym_intensity_p={self.adv_asym_p}")
 
         # Load stats dict
         with open(stats_path, "rb") as f:
@@ -505,8 +500,13 @@ class TotalSeg2DDataset(Dataset):
         
         return img[row_min:row_max, col_min:col_max], label[row_min:row_max, col_min:col_max]
 
-    def _normalize_image(self, img: np.ndarray, a_min: float = -200, a_max: float = 300) -> np.ndarray:
-        """Normalize CT image to [0, 1] range."""
+    def _normalize_image(self, img: np.ndarray, a_min: float = -200, a_max: float = 300, jitter: float = 0) -> np.ndarray:
+        """Normalize CT image to [0, 1] range with optional windowing jitter."""
+        if jitter > 0:
+            a_min = a_min + random.uniform(-jitter, jitter)
+            a_max = a_max + random.uniform(-jitter, jitter)
+            if a_max - a_min < 200:  # minimum window width for label visibility
+                a_max = a_min + 200
         img = np.clip(img, a_min, a_max)
         img = (img - a_min) / (a_max - a_min)
         return img
@@ -572,6 +572,103 @@ class TotalSeg2DDataset(Dataset):
 
         return img_aug, mask_aug
 
+    def _load_carve_mix_donor(
+        self, label_id: str, axis: str, exclude_case_ids: List[str]
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Load a random donor image/mask for CarveMix, excluding specified cases."""
+        context_key = (label_id, axis)
+        candidates = self.valid_contexts.get(context_key, [])
+        exclude_set = set(exclude_case_ids)
+        candidates = [c for c in candidates if c not in exclude_set]
+        if not candidates:
+            return None
+
+        random.shuffle(candidates)
+        for donor_case_id in candidates[:3]:  # retry up to 3 times
+            try:
+                donor_img, donor_mask = self._load_slice(donor_case_id, label_id, axis)
+                if donor_mask.max() == 0:
+                    continue
+                if self.crop_to_bbox:
+                    bbox = self._get_2d_bbox(donor_case_id, label_id, axis)
+                    donor_img, donor_mask = self._crop_to_bbox(donor_img, donor_mask, bbox)
+                donor_img = self._normalize_image(donor_img)
+                if self.image_size is not None:
+                    donor_img = self._resize(donor_img, self.image_size, mode="bilinear")
+                    donor_mask = self._resize(donor_mask, self.image_size, mode="nearest")
+                return donor_img, donor_mask
+            except Exception:
+                continue
+        return None
+
+    def _apply_carve_mix(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        label_id: str,
+        axis: str,
+        exclude_case_ids: List[str],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Conditionally apply CarveMix to target based on probability."""
+        if not self.carve_mix or random.random() > self.carve_mix_p:
+            return target_img, target_mask
+
+        donor = self._load_carve_mix_donor(label_id, axis, exclude_case_ids)
+        if donor is None:
+            return target_img, target_mask
+
+        donor_img, donor_mask = donor
+        return carve_mix_2d(
+            target_img, target_mask, donor_img, donor_mask,
+            margin_range=self.carve_mix_margin_range,
+            harmonize=self.carve_mix_harmonize,
+            harmonize_sigma=self.carve_mix_harmonize_sigma,
+        )
+
+    def _apply_advanced_augmentation(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        context_imgs: Optional[List[np.ndarray]] = None,
+        context_masks: Optional[List[np.ndarray]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[List[np.ndarray]], Optional[List[np.ndarray]]]:
+        """Apply post-resize advanced augmentations for generalization.
+
+        Asymmetric intensity and resolution degradation are applied independently
+        per image so target/context see different appearance. Context masks get
+        morphological perturbation to simulate annotation noise.
+        """
+        if not self.advanced_augmentation:
+            return target_img, target_mask, context_imgs, context_masks
+
+        # Asymmetric intensity (different random params per image)
+        if random.random() < self.adv_asym_p:
+            target_img = random_intensity_shift(
+                target_img, self.adv_asym_brightness, self.adv_asym_contrast, self.adv_asym_gamma
+            )
+        if context_imgs:
+            for i in range(len(context_imgs)):
+                if random.random() < self.adv_asym_p:
+                    context_imgs[i] = random_intensity_shift(
+                        context_imgs[i], self.adv_asym_brightness, self.adv_asym_contrast, self.adv_asym_gamma
+                    )
+
+        # Resolution degradation (independent per image)
+        if random.random() < self.adv_degrade_p:
+            target_img = degrade_resolution(target_img, self.adv_degrade_min_scale)
+        if context_imgs:
+            for i in range(len(context_imgs)):
+                if random.random() < self.adv_degrade_p:
+                    context_imgs[i] = degrade_resolution(context_imgs[i], self.adv_degrade_min_scale)
+
+        # Context mask perturbation (context only — target mask is GT)
+        if context_masks:
+            for i in range(len(context_masks)):
+                if random.random() < self.adv_mask_perturb_p:
+                    context_masks[i] = perturb_mask(context_masks[i], self.adv_mask_perturb_kernel)
+
+        return target_img, target_mask, context_imgs, context_masks
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a sample with context examples.
@@ -615,7 +712,14 @@ class TotalSeg2DDataset(Dataset):
             target_bbox = self._get_2d_bbox(target_case_id, label_id, axis)
             target_img, target_label = self._crop_to_bbox(target_img, target_label, target_bbox)
 
-        target_img = self._normalize_image(target_img)
+        jitter = self.adv_windowing_jitter if self.advanced_augmentation else 0
+        target_img = self._normalize_image(target_img, jitter=jitter)
+
+        # Foreground random crop (before resize, ensures FG stays visible)
+        if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
+            target_img, target_label = foreground_random_crop(
+                target_img, target_label, self.adv_fg_crop_min
+            )
 
         # Skip context loading if context_size is 0
         if self.context_size == 0:
@@ -623,6 +727,16 @@ class TotalSeg2DDataset(Dataset):
             if self.image_size is not None:
                 target_img = self._resize(target_img, self.image_size, mode="bilinear")
                 target_label = self._resize(target_label, self.image_size, mode="nearest")
+
+            # CarveMix on target (after resize, before augmentation)
+            target_img, target_label = self._apply_carve_mix(
+                target_img, target_label, label_id, axis, [target_case_id]
+            )
+
+            # Advanced augmentation (asymmetric intensity, resolution degradation)
+            target_img, target_label, _, _ = self._apply_advanced_augmentation(
+                target_img, target_label
+            )
 
             # Apply augmentation
             if self.augment:
@@ -688,7 +802,14 @@ class TotalSeg2DDataset(Dataset):
                     ctx_bbox = self._get_2d_bbox(ctx_case_id, label_id, axis)
                     ctx_img, ctx_label = self._crop_to_bbox(ctx_img, ctx_label, ctx_bbox)
 
-                ctx_img = self._normalize_image(ctx_img)
+                ctx_img = self._normalize_image(ctx_img, jitter=jitter)
+
+                # Foreground random crop (independent per context)
+                if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
+                    ctx_img, ctx_label = foreground_random_crop(
+                        ctx_img, ctx_label, self.adv_fg_crop_min
+                    )
+
                 context_imgs.append(ctx_img)
                 context_labels.append(ctx_label)
                 if ctx_features is not None:
@@ -707,6 +828,17 @@ class TotalSeg2DDataset(Dataset):
             target_label = self._resize(target_label, self.image_size, mode="nearest")
             context_imgs = [self._resize(c, self.image_size, mode="bilinear") for c in context_imgs]
             context_labels = [self._resize(c, self.image_size, mode="nearest") for c in context_labels]
+
+        # CarveMix on target only (after resize, before augmentation)
+        exclude_ids = [target_case_id] + valid_context_ids
+        target_img, target_label = self._apply_carve_mix(
+            target_img, target_label, label_id, axis, exclude_ids
+        )
+
+        # Advanced augmentation (asymmetric intensity, resolution degradation, mask perturbation)
+        target_img, target_label, context_imgs, context_labels = self._apply_advanced_augmentation(  # type: ignore[assignment]
+            target_img, target_label, context_imgs, context_labels
+        )
 
         # Apply augmentation (different random transform for target and each context)
         if self.augment:

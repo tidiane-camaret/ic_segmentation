@@ -94,13 +94,24 @@ def _save_sample_images(
         """Draw patch bounding boxes on image."""
         if coords is None or level_res is None:
             return
+        # Handle edge cases with coords shape
+        if coords.ndim == 0 or coords.numel() == 0:
+            return
+        if coords.ndim == 1:
+            coords = coords.unsqueeze(0)  # [2] -> [1, 2]
+        if coords.shape[-1] != 2:
+            return
+
         H, W = img.shape[:2]
         scale_h, scale_w = H / level_res, W / level_res
         scaled_patch_h = int(patch_size * scale_h)
         scaled_patch_w = int(patch_size * scale_w)
 
         for k in range(coords.shape[0]):
-            r, c = coords[k].numpy()
+            coord = coords[k]
+            if coord.ndim == 0:
+                continue
+            r, c = coord[0].item(), coord[1].item()
             r_start = int(r * scale_h)
             c_start = int(c * scale_w)
             rect = Rectangle((c_start, r_start), scaled_patch_w, scaled_patch_h,
@@ -111,6 +122,13 @@ def _save_sample_images(
         img = sample["image"].squeeze().numpy()
         gt = sample["label"].squeeze().numpy()
         pred = sample["pred"].squeeze().numpy()
+        pred_probs = sample.get("pred_probs")
+        if pred_probs is not None:
+            pred_probs = pred_probs.squeeze().numpy()
+            # Normalize to [0,1] (should already be in range, but ensure)
+            pred_heatmap = (pred_probs - pred_probs.min()) / (pred_probs.max() - pred_probs.min() + 1e-8)
+        else:
+            pred_heatmap = None
         dice = sample["dice"]
         ctx_in = sample.get("context_in")
         ctx_out = sample.get("context_out")
@@ -123,11 +141,11 @@ def _save_sample_images(
         n_ctx = ctx_in.shape[0] if ctx_in is not None else 0
         n_rows = 1 + (1 if n_ctx > 0 else 0)
 
-        fig, axes = plt.subplots(n_rows, 3, figsize=(12, 4 * n_rows))
+        fig, axes = plt.subplots(n_rows, 4, figsize=(16, 4 * n_rows))
         if n_rows == 1:
             axes = [axes]
 
-        # Row 1: Target image with patches, GT, prediction
+        # Row 1: Target image with patches, GT, prediction, heatmap
         axes[0][0].imshow(img, cmap='gray')
         if target_coords is not None and level_res is not None:
             draw_patch_boxes(axes[0][0], img, target_coords, patch_size, level_res, color='red')
@@ -142,13 +160,26 @@ def _save_sample_images(
         axes[0][2].set_title(f'Prediction (dice={dice:.3f})')
         axes[0][2].axis('off')
 
+        if pred_heatmap is not None:
+            im = axes[0][3].imshow(pred_heatmap, cmap='hot', vmin=0, vmax=1)
+            axes[0][3].set_title('Prediction Heatmap')
+            plt.colorbar(im, ax=axes[0][3], fraction=0.046, pad=0.04)
+        axes[0][3].axis('off')
+
         # Row 2: Context images with patches and masks
         if n_ctx > 0 and n_rows > 1:
             ctx_img = ctx_in[0].squeeze().numpy()
             ctx_mask = ctx_out[0].squeeze().numpy()
             axes[1][0].imshow(ctx_img, cmap='gray')
-            if context_coords is not None and level_res is not None:
-                draw_patch_boxes(axes[1][0], ctx_img, context_coords[0], patch_size, level_res, color='cyan')
+            # context_coords is [k*K, 2] (all contexts concatenated), need to split by K patches per context
+            if context_coords is not None and level_res is not None and context_coords.ndim == 2:
+                try:
+                    total_patches = context_coords.shape[0]
+                    K_per_ctx = total_patches // n_ctx  # patches per context
+                    ctx1_coords = context_coords[:K_per_ctx]  # First context's patches
+                    draw_patch_boxes(axes[1][0], ctx_img, ctx1_coords, patch_size, level_res, color='cyan')
+                except (IndexError, TypeError, ZeroDivisionError):
+                    pass  # Skip if coords structure is unexpected
             axes[1][0].set_title('Context 1 + Patches')
             axes[1][0].axis('off')
 
@@ -161,12 +192,19 @@ def _save_sample_images(
                 ctx_mask2 = ctx_out[1].squeeze().numpy()
                 axes[1][2].imshow(ctx_img2, cmap='gray')
                 axes[1][2].imshow(ctx_mask2, cmap='Reds', alpha=0.4)
-                if context_coords is not None and context_coords.shape[0] > 1:
-                    draw_patch_boxes(axes[1][2], ctx_img2, context_coords[1], patch_size, level_res, color='cyan')
+                if context_coords is not None and context_coords.ndim == 2:
+                    try:
+                        total_patches = context_coords.shape[0]
+                        K_per_ctx = total_patches // n_ctx
+                        ctx2_coords = context_coords[K_per_ctx:2*K_per_ctx]  # Second context's patches
+                        draw_patch_boxes(axes[1][2], ctx_img2, ctx2_coords, patch_size, level_res, color='cyan')
+                    except (IndexError, TypeError, ZeroDivisionError):
+                        pass  # Skip if coords structure is unexpected
                 axes[1][2].set_title('Context 2 + Mask')
                 axes[1][2].axis('off')
             else:
                 axes[1][2].axis('off')
+            axes[1][3].axis('off')
 
         fig.tight_layout()
         safe_label = label_id.replace('/', '_')

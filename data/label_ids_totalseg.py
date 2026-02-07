@@ -4,6 +4,7 @@ TotalSegmentator label IDs with train/val split.
 The split is created with a fixed random seed (42) for reproducibility.
 Train: 80% of labels, Val: 20% of labels
 """
+"""
 import random
 
 label_ids = [
@@ -126,6 +127,58 @@ label_ids = [
     "kidney_right",
 ]
 
+# Top 50 labels by total volume (occurrences * avg_volume) from totalseg_2d.ipynb
+label_ids = ['liver',
+ 'lung_upper_lobe_left',
+ 'lung_lower_lobe_right',
+ 'lung_lower_lobe_left',
+ 'lung_upper_lobe_right',
+ 'small_bowel',
+ 'colon',
+ 'heart',
+ 'autochthon_left',
+ 'autochthon_right',
+ 'lung_middle_lobe_right',
+ 'gluteus_maximus_right',
+ 'gluteus_maximus_left',
+ 'stomach',
+ 'hip_left',
+ 'hip_right',
+ 'aorta',
+ 'spleen',
+ 'brain',
+ 'iliopsoas_left',
+ 'iliopsoas_right',
+ 'gluteus_medius_left',
+ 'gluteus_medius_right',
+ 'skull',
+ 'costal_cartilages',
+ 'urinary_bladder',
+ 'femur_left',
+ 'femur_right',
+ 'sacrum',
+ 'kidney_left',
+ 'kidney_right',
+ 'spinal_cord',
+ 'scapula_left',
+ 'scapula_right',
+ 'inferior_vena_cava',
+ 'pancreas',
+ 'sternum',
+ 'vertebrae_L4',
+ 'vertebrae_L3',
+ 'vertebrae_L1',
+ 'vertebrae_T12',
+ 'vertebrae_L5',
+ 'vertebrae_L2',
+ 'vertebrae_T11',
+ 'duodenum',
+ 'gluteus_minimus_right',
+ 'humerus_right',
+ 'gluteus_minimus_left',
+ 'humerus_left',
+ 'vertebrae_T10']
+
 
 # Train/Val split (80/20 split with fixed random seed for reproducibility)
 _rng = random.Random(42)
@@ -138,7 +191,44 @@ label_ids_val = _shuffled[_split_idx:]
 
 # Clean up temporary variables
 del _rng, _shuffled, _split_idx
+"""
 
+label_ids_train = [
+    'liver',
+    #'lung_upper_lobe_left',
+    #'lung_lower_lobe_left',
+    'lung_upper_lobe_right',
+    'lung_lower_lobe_right',
+    'lung_middle_lobe_right',
+    'heart',
+    'aorta',
+    'spleen',
+    'brain',
+    'skull',
+    #'kidney_left',
+    'kidney_right',
+    'urinary_bladder',
+    'sacrum',
+    'costal_cartilages'
+]
+
+label_ids_val = [
+    'small_bowel',
+    'colon',
+    'stomach',
+    'autochthon_left',
+    #'autochthon_right',
+    'gluteus_maximus_left',
+    #'gluteus_maximus_right',
+    'gluteus_medius_left',
+    #'gluteus_medius_right',
+    'iliopsoas_left',
+    #'iliopsoas_right',
+    'hip_left',
+    #'hip_right',
+    'femur_left',
+    #'femur_right'
+]
 
 def get_label_ids(split="all"):
     """

@@ -7,7 +7,6 @@ for each case in val set:
 import datetime
 import sys
 from pathlib import Path
-from turtle import st
 
 import hydra
 import torch
@@ -112,7 +111,7 @@ def main(cfg: DictConfig) -> None:
         )
     # Get model (don't move to device yet - accelerator.prepare handles that)
     if cfg.method == "patch_icl":
-        from src.models.patch_icl import PatchICL
+        from src.models.patch_icl_v2 import PatchICL
 
         # Set num_mask_channels based on random_coloring_nb
         patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
@@ -290,9 +289,13 @@ def main(cfg: DictConfig) -> None:
 
     # Validation with optional saving
     save_imgs = cfg.logging.get("save_imgs_masks", False)
-    val_save_dir = Path(cfg.paths.RESULTS_DIR) / f"{cfg.dataset}_{cfg.method}_train_split" if save_imgs else None
-    if accelerator.is_main_process:
-        print(f"save_imgs_masks={save_imgs}, val_save_dir={val_save_dir}")
+    if save_imgs:
+        results_dir = Path(cfg.paths.get("RESULTS_DIR", ckpt_dir / "eval_results"))
+        val_save_dir = results_dir / f"{cfg.dataset}_{cfg.method}_eval"
+        if accelerator.is_main_process:
+            print(f"Saving evaluation images to: {val_save_dir}")
+    else:
+        val_save_dir = None
 
     val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
         model, val_loader, device,

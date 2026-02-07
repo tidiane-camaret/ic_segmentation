@@ -26,16 +26,18 @@ def main(cfg: DictConfig) -> None:
     if accelerator.is_main_process:
         print(f"Using device: {device}, num_processes: {accelerator.num_processes}")
 
-    # Create checkpoint dir
-    ckpt_dir = Path(cfg.paths.ckpts.save_dir)
-    if accelerator.is_main_process:
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-    accelerator.wait_for_everyone()
 
     # Wandb logging
     if cfg.logging.use_wandb and accelerator.is_main_process:
         import wandb
         wandb.init(project=cfg.logging.wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
+
+    run_name = wandb.run.name if cfg.logging.use_wandb else f"run_{accelerator.process_index}"
+    # Create checkpoint dir
+    ckpt_dir = Path(cfg.paths.ckpts.save_dir) / run_name
+    if accelerator.is_main_process:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     # Dataloader (TotalSeg2D only)
     from src.dataloaders.totalseg2d_dataloader import get_dataloader as get_totalseg2d_dataloader
@@ -60,6 +62,16 @@ def main(cfg: DictConfig) -> None:
     use_image_augmentation = img_aug_cfg.get("enabled", False)
     augment_config = OmegaConf.to_container(img_aug_cfg, resolve=True) if use_image_augmentation else None
 
+    # CarveMix config (only for training)
+    carve_mix_cfg = cfg.get("carve_mix", {})
+    use_carve_mix = carve_mix_cfg.get("enabled", False)
+    carve_mix_config = OmegaConf.to_container(carve_mix_cfg, resolve=True) if use_carve_mix else None
+
+    # Advanced augmentation config (only for training)
+    adv_aug_cfg = cfg.get("advanced_augmentation", {})
+    use_adv_aug = adv_aug_cfg.get("enabled", False)
+    adv_aug_config = OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
+
     train_loader = get_totalseg2d_dataloader(
         root_dir=cfg.paths.totalseg2d,
         stats_path=cfg.paths.totalseg_stats,
@@ -77,6 +89,10 @@ def main(cfg: DictConfig) -> None:
         random_coloring_nb=cfg.get("random_coloring_nb", 0),
         augment=use_image_augmentation,
         augment_config=augment_config,
+        carve_mix=use_carve_mix,
+        carve_mix_config=carve_mix_config,
+        advanced_augmentation=use_adv_aug,
+        advanced_augmentation_config=adv_aug_config,
     )
     val_loader = get_totalseg2d_dataloader(
         root_dir=cfg.paths.totalseg2d,
@@ -168,6 +184,16 @@ def main(cfg: DictConfig) -> None:
     aggreg_criterion = build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args"))
     model.set_loss_functions(patch_criterion, aggreg_criterion)
 
+    # Optionally load model weights from checkpoint (like eval.py)
+    ckpt_path = cfg.paths.ckpts.get("patch_icl_v2", None)
+    if ckpt_path:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if accelerator.is_main_process:
+            print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
+    else:
+        if accelerator.is_main_process:
+            print("Warning: No checkpoint loaded, using random weights")
     if accelerator.is_main_process:
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model parameters: {num_params:,}")

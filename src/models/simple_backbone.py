@@ -9,10 +9,11 @@ Architecture:
     [B,K,49,1024]        [B,K,D]              [B,K,D] + skips
          │                  │                      │
          ▼                  ▼                      ▼
-    Linear(1024→D)      + type_embed          TransConv + skips
-    Reshape [B*K,D,8,8] + 2D RoPE             Upsample
-    Conv layers         + registers            → [B,K,C,ps,ps]
-    Pool [B,K,D]        Masked attention
+    Linear(1024→D)      + registers           TransConv + skips
+    Reshape [B*K,D,8,8] Per-layer:             Upsample
+    Conv layers           + type_embed         → [B,K,C,ps,ps]
+    Pool [B,K,D]          + RoPE on Q,K
+                          Masked attention
 
 Config example:
     backbone:
@@ -260,7 +261,7 @@ class SimpleCNNEncoder(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Single attention + MLP block with pre-norm and residuals."""
+    """Single attention + MLP block with pre-norm, residuals, and per-layer embeddings."""
 
     def __init__(
         self,
@@ -272,6 +273,11 @@ class AttentionBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.embed_dim = embed_dim
+
+        # Per-layer type embeddings
+        self.target_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.context_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
 
         self.norm1 = nn.LayerNorm(embed_dim)
         self.q_proj = nn.Linear(embed_dim, embed_dim)
@@ -294,30 +300,67 @@ class AttentionBlock(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor,
+        is_context: torch.Tensor,
+        coords: torch.Tensor | None = None,
+        rope_cache: torch.Tensor | None = None,
+        image_size: int = 224,
+        num_registers: int = 0,
         return_attn_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
-            x: [B, K, D] - tokens (including registers)
-            attn_mask: [B, H, K, K] - float attention mask (-inf for blocked)
+            x: [B, K_total, D] - tokens (including registers)
+            attn_mask: [B, H, K_total, K_total] - float attention mask (-inf for blocked)
+            is_context: [B, K_total] - True for context/register tokens
+            coords: [B, K, 2] - patch coordinates (y, x), without registers
+            rope_cache: [max_pos, dim/4, 2] - precomputed RoPE sin/cos
+            image_size: image size for RoPE coordinate normalization
+            num_registers: number of register tokens prepended to sequence
             return_attn_weights: If True, compute and return attention weights
 
         Returns:
-            x: [B, K, D] - updated tokens
-            attn_weights: [B, H, K, K] or None - attention weights if requested
+            x: [B, K_total, D] - updated tokens
+            attn_weights: [B, H, K_total, K_total] or None
         """
-        B, K, D = x.shape
+        B, K_total, D = x.shape
         H = self.num_heads
 
-        # Pre-norm attention
+        # Pre-norm
         x_normed = self.norm1(x)
-        q = self.q_proj(x_normed).view(B, K, H, -1).transpose(1, 2)
-        k = self.k_proj(x_normed).view(B, K, H, -1).transpose(1, 2)
-        v = self.v_proj(x_normed).view(B, K, H, -1).transpose(1, 2)
+
+        # Add per-layer type embeddings to normed input
+        type_embed = torch.where(
+            is_context.unsqueeze(-1),
+            self.context_embed.expand(B, K_total, -1),
+            self.target_embed.expand(B, K_total, -1),
+        )
+        x_normed = x_normed + type_embed
+
+        # Project Q, K, V
+        q = self.q_proj(x_normed)  # [B, K_total, D]
+        k = self.k_proj(x_normed)  # [B, K_total, D]
+        v = self.v_proj(x_normed)
+
+        # Apply 2D RoPE to Q and K (non-register tokens only)
+        if rope_cache is not None and coords is not None:
+            if num_registers > 0:
+                q_reg, q_patch = q[:, :num_registers], q[:, num_registers:]
+                k_reg, k_patch = k[:, :num_registers], k[:, num_registers:]
+                q_patch = apply_rope_2d(q_patch, coords, rope_cache, image_size)
+                k_patch = apply_rope_2d(k_patch, coords, rope_cache, image_size)
+                q = torch.cat([q_reg, q_patch], dim=1)
+                k = torch.cat([k_reg, k_patch], dim=1)
+            else:
+                q = apply_rope_2d(q, coords, rope_cache, image_size)
+                k = apply_rope_2d(k, coords, rope_cache, image_size)
+
+        # Reshape for multi-head attention
+        q = q.view(B, K_total, H, -1).transpose(1, 2)
+        k = k.view(B, K_total, H, -1).transpose(1, 2)
+        v = v.view(B, K_total, H, -1).transpose(1, 2)
 
         attn_weights = None
         if return_attn_weights:
-            # Manual attention computation to get weights
             scale = 1.0 / math.sqrt(q.shape[-1])
             attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
             attn_scores = attn_scores + attn_mask
@@ -332,7 +375,7 @@ class AttentionBlock(nn.Module):
                 dropout_p=self.dropout.p if self.training else 0.0,
             )
 
-        out = out.transpose(1, 2).reshape(B, K, D)
+        out = out.transpose(1, 2).reshape(B, K_total, D)
         out = self.out_proj(out)
         x = x + out
 
@@ -371,10 +414,6 @@ class CrossPatchAttention(nn.Module):
         self.num_registers = num_registers
         self.image_size = image_size
         self.target_self_attention = target_self_attention
-
-        # Type embeddings (applied once at input)
-        self.target_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
-        self.context_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
 
         # Register tokens for global context
         if num_registers > 0:
@@ -448,21 +487,9 @@ class CrossPatchAttention(nn.Module):
         B, K, D = x.shape
         device = x.device
 
-        # Add type embeddings (once at input)
-        type_embed = torch.where(
-            is_context.unsqueeze(-1),
-            self.context_embed.expand(B, K, -1),
-            self.target_embed.expand(B, K, -1),
-        )
-        x = x + type_embed
-
-        # Apply 2D RoPE (once at input)
-        x = apply_rope_2d(x, coords, self.rope_cache, self.image_size)
-
         # Add registers
         if self.register_tokens is not None:
             registers = self.register_tokens.expand(B, -1, -1)
-            registers = registers + self.context_embed.expand(B, self.num_registers, -1)
             x = torch.cat([registers, x], dim=1)  # [B, R+K, D]
             reg_mask = torch.ones(B, self.num_registers, dtype=torch.bool, device=device)
             is_context_with_reg = torch.cat([reg_mask, is_context], dim=1)
@@ -476,10 +503,20 @@ class CrossPatchAttention(nn.Module):
         float_mask.masked_fill_(~attn_mask, float('-inf'))
         float_mask = float_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
 
-        # Run through attention layers
+        num_reg = self.num_registers if self.register_tokens is not None else 0
+
+        # Run through attention layers (per-layer type embed + RoPE)
         all_attn_weights = []
         for layer in self.layers:
-            x, attn_w = layer(x, float_mask, return_attn_weights=return_attn_weights)
+            x, attn_w = layer(
+                x, float_mask,
+                is_context=is_context_with_reg,
+                coords=coords,
+                rope_cache=self.rope_cache,
+                image_size=self.image_size,
+                num_registers=num_reg,
+                return_attn_weights=return_attn_weights,
+            )
             if attn_w is not None:
                 all_attn_weights.append(attn_w)
 
