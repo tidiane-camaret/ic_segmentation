@@ -14,17 +14,21 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
-
-
 from src.dataloaders.augmentations import create_augmentation_transforms
-
+from torch.utils.data import DataLoader, Dataset
 
 
 def _find_keys(keys: List[str], split: str) -> Tuple[Optional[str], Optional[str]]:
     """Find image and label keys in npz file."""
     img_candidates = [f"{split}_images", f"{split}_img", "images", "img"]
-    lbl_candidates = [f"{split}_labels", f"{split}_label", f"{split}_mask", "labels", "masks", "label"]
+    lbl_candidates = [
+        f"{split}_labels",
+        f"{split}_label",
+        f"{split}_mask",
+        "labels",
+        "masks",
+        "label",
+    ]
     img_key = next((k for k in img_candidates if k in keys), None)
     lbl_key = next((k for k in lbl_candidates if k in keys), None)
     return img_key, lbl_key
@@ -65,15 +69,17 @@ class MedSegBenchDataset(Dataset):
         # Setup augmentation
         if augment:
             cfg = augment_config or {}
-            self.spatial_transform, self.intensity_transform = create_augmentation_transforms(
-                rotation_limit=cfg.get("rotation_limit", 15.0),
-                scale_limit=cfg.get("scale_limit", 0.1),
-                elastic_alpha=cfg.get("elastic_alpha", 50.0),
-                elastic_sigma=cfg.get("elastic_sigma", 5.0),
-                brightness_limit=cfg.get("brightness_limit", 0.1),
-                contrast_limit=cfg.get("contrast_limit", 0.1),
-                gamma_limit=cfg.get("gamma_limit", (80, 120)),
-                noise_std_range=cfg.get("noise_std_range", (0.02, 0.05)),
+            self.spatial_transform, self.intensity_transform = (
+                create_augmentation_transforms(
+                    rotation_limit=cfg.get("rotation_limit", 15.0),
+                    scale_limit=cfg.get("scale_limit", 0.1),
+                    elastic_alpha=cfg.get("elastic_alpha", 50.0),
+                    elastic_sigma=cfg.get("elastic_sigma", 5.0),
+                    brightness_limit=cfg.get("brightness_limit", 0.1),
+                    contrast_limit=cfg.get("contrast_limit", 0.1),
+                    gamma_limit=cfg.get("gamma_limit", (80, 120)),
+                    noise_std_range=cfg.get("noise_std_range", (0.02, 0.05)),
+                )
             )
         else:
             self.augment = False
@@ -126,12 +132,17 @@ class MedSegBenchDataset(Dataset):
                     used_split = split
                     if not any(k.startswith(f"{split}_label_C") for k in keys):
                         used_split = next(
-                            (s for s in ["train", "val", "test"]
-                             if any(k.startswith(f"{s}_label_C") for k in keys)),
+                            (
+                                s
+                                for s in ["train", "val", "test"]
+                                if any(k.startswith(f"{s}_label_C") for k in keys)
+                            ),
                             None,
                         )
                     if used_split:
-                        class_keys = sorted(k for k in keys if k.startswith(f"{used_split}_label_C"))
+                        class_keys = sorted(
+                            k for k in keys if k.startswith(f"{used_split}_label_C")
+                        )
                         # Stack per-class binary masks into a single multi-class label array
                         class_masks = [data[k] for k in class_keys]
                         labels = np.zeros_like(class_masks[0], dtype=np.uint8)
@@ -145,7 +156,9 @@ class MedSegBenchDataset(Dataset):
 
                 # Limit samples if requested
                 if max_samples_per_dataset and len(images) > max_samples_per_dataset:
-                    indices = np.random.choice(len(images), max_samples_per_dataset, replace=False)
+                    indices = np.random.choice(
+                        len(images), max_samples_per_dataset, replace=False
+                    )
                     images = images[indices]
                     labels = labels[indices]
 
@@ -161,23 +174,38 @@ class MedSegBenchDataset(Dataset):
                         if lbl != 0:
                             self.label_to_samples[int(lbl)].append((ds_name, i))
 
-                print(f"  [OK] {ds_name}: {len(images)} samples, {len(np.unique(labels))} labels")
+                print(
+                    f"  [OK] {ds_name}: {len(images)} samples, {len(np.unique(labels))} labels"
+                )
 
             except Exception as e:
                 print(f"  [Error] {ds_name}: {e}")
                 continue
 
-        print(f"Loaded {len(self.samples)} total samples from {len(self.data)} datasets")
+        print(
+            f"Loaded {len(self.samples)} total samples from {len(self.data)} datasets"
+        )
         print(f"Found {len(self.label_to_samples)} unique label values")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def _normalize_image(self, img: np.ndarray) -> np.ndarray:
-        """Normalize image to [0, 1] float32."""
+        """Robust normalization: clip to [1st, 99th] percentile and scale to [0, 1]."""
         img = img.astype(np.float32)
-        if img.max() > 1:
-            img = img / 255.0
+        p_low = np.percentile(img, 1)
+        p_high = np.percentile(img, 99)
+        if p_high > p_low:
+            img = np.clip(img, p_low, p_high)
+            img = (img - p_low) / (p_high - p_low)
+        else:
+            # fallback: min-max over full range
+            img_min = img.min()
+            img_max = img.max()
+            if img_max > img_min:
+                img = (img - img_min) / (img_max - img_min)
+            else:
+                img = np.zeros_like(img)
         return img
 
     def _to_grayscale(self, img: np.ndarray) -> np.ndarray:
@@ -206,14 +234,18 @@ class MedSegBenchDataset(Dataset):
                 tensor, size=self.image_size, mode="bilinear", align_corners=False
             )
         else:
-            resized = torch.nn.functional.interpolate(tensor, size=self.image_size, mode="nearest")
+            resized = torch.nn.functional.interpolate(
+                tensor, size=self.image_size, mode="nearest"
+            )
         return resized.squeeze().numpy()
 
     def _create_binary_mask(self, mask: np.ndarray, label: int) -> np.ndarray:
         """Create binary mask for specific label."""
         return (mask == label).astype(np.float32)
 
-    def _apply_augmentation(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _apply_augmentation(
+        self, img: np.ndarray, mask: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Apply augmentation to image and mask."""
         if not self.augment or self.spatial_transform is None:
             return img, mask
@@ -239,7 +271,11 @@ class MedSegBenchDataset(Dataset):
         """Get k context samples with same label, excluding target."""
         candidates = self.label_to_samples.get(label, [])
         # Filter out target
-        candidates = [(ds, idx) for ds, idx in candidates if not (ds == target_ds and idx == target_idx)]
+        candidates = [
+            (ds, idx)
+            for ds, idx in candidates
+            if not (ds == target_ds and idx == target_idx)
+        ]
         if len(candidates) == 0:
             return []
         # Random sample
@@ -289,7 +325,9 @@ class MedSegBenchDataset(Dataset):
         target_binary = self._resize(target_binary, mode="nearest")
 
         # Get context samples
-        context_samples = self._get_context_samples(ds_name, sample_idx, label_value, self.context_size)
+        context_samples = self._get_context_samples(
+            ds_name, sample_idx, label_value, self.context_size
+        )
 
         context_imgs = []
         context_masks = []
@@ -313,7 +351,9 @@ class MedSegBenchDataset(Dataset):
 
         # Apply augmentation to target
         if self.augment:
-            target_img, target_binary = self._apply_augmentation(target_img, target_binary)
+            target_img, target_binary = self._apply_augmentation(
+                target_img, target_binary
+            )
 
         # Convert to tensors
         target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()
@@ -322,7 +362,9 @@ class MedSegBenchDataset(Dataset):
         # Build case/label IDs
         target_case_id = f"{ds_name}_{sample_idx}"
         label_id = f"{ds_name}_{label_value}"
-        context_case_ids = [f"{ctx_ds}_{ctx_idx}" for ctx_ds, ctx_idx in context_samples]
+        context_case_ids = [
+            f"{ctx_ds}_{ctx_idx}" for ctx_ds, ctx_idx in context_samples
+        ]
 
         result = {
             "image": target_in,
@@ -369,7 +411,9 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
                 pad_in = torch.zeros(max_k - k, 1, h, w)
                 pad_out = torch.zeros(max_k - k, 1, h, w)
                 context_in_list.append(torch.cat([item["context_in"], pad_in], dim=0))
-                context_out_list.append(torch.cat([item["context_out"], pad_out], dim=0))
+                context_out_list.append(
+                    torch.cat([item["context_out"], pad_out], dim=0)
+                )
             else:
                 context_in_list.append(item["context_in"])
                 context_out_list.append(item["context_out"])

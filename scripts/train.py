@@ -55,11 +55,27 @@ def main(cfg: DictConfig) -> None:
         msb_datasets = msb_cfg.get("datasets", None)
         if msb_datasets is not None:
             msb_datasets = list(msb_datasets)
+
+        # Support separate train/val datasets, falling back to shared 'datasets'
+        msb_train_datasets = msb_cfg.get("train_datasets", None)
+        msb_val_datasets = msb_cfg.get("val_datasets", None)
+        if msb_train_datasets is not None:
+            msb_train_datasets = list(msb_train_datasets)
+        else:
+            msb_train_datasets = msb_datasets
+        if msb_val_datasets is not None:
+            msb_val_datasets = list(msb_val_datasets)
+        else:
+            msb_val_datasets = msb_datasets
+
         max_samples = msb_cfg.get("max_samples_per_dataset", None)
+
+        if accelerator.is_main_process:
+            print(f"MedSegBench train datasets: {msb_train_datasets}, val datasets: {msb_val_datasets}")
 
         train_loader = get_medsegbench_dataloader(
             data_root=cfg.paths.medsegbench,
-            datasets=msb_datasets,
+            datasets=msb_train_datasets,
             split="train",
             context_size=cfg.context_size,
             batch_size=cfg.train_batch_size,
@@ -72,7 +88,7 @@ def main(cfg: DictConfig) -> None:
         )
         val_loader = get_medsegbench_dataloader(
             data_root=cfg.paths.medsegbench,
-            datasets=msb_datasets,
+            datasets=msb_val_datasets,
             split="val",
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,

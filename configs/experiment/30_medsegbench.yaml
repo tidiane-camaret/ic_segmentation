@@ -2,7 +2,9 @@
 dataset: medsegbench
 
 medsegbench:
-  datasets: null # [busi, covid_qu_ex]  # List of dataset names to load, null for all
+  datasets: null  # Shared dataset list (used when train/val_datasets not set), null for all
+  train_datasets: [busi]  # Train-only datasets (overrides 'datasets')
+  val_datasets: [busi]    # Val-only datasets (overrides 'datasets')
   max_samples_per_dataset: null  # Limit per dataset (for debugging)
 
 

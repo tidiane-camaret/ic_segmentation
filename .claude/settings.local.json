@@ -17,7 +17,8 @@
       "Bash(done)",
       "WebSearch",
       "WebFetch(domain:docs.wandb.ai)",
-      "WebFetch(domain:arxiv.org)"
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:www.nature.com)"
     ],
     "deny": [
       "Read(./old/**)"

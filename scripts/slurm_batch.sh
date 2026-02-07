@@ -8,5 +8,5 @@
 # run with sbatch scripts/slurm_batch.sh
 # uv run scripts/totalseg_3d_to_2d.py cluster=dlclarge
 # uv run scripts/extract_dinov3_features.py cluster=dlclarge
-uv run accelerate launch --mixed_precision=fp16 scripts/train.py experiment=exp_20 cluster=dlclarge
+uv run accelerate launch --mixed_precision fp16 --multi_gpu scripts/train.py experiment=30_medsegbench cluster=dlclarge
 
