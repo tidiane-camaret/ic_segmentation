@@ -383,13 +383,15 @@ def train_epoch(
                 level_pred = level_outputs[-1]["pred"]
                 level_res = level_pred.shape[-1]
                 scale_factor = labels.shape[-1] // level_res
-                labels_ds = F.max_pool2d(
+                # avg_pool2d gives fractional coverage per patch (avoids
+                # inflating sparse masks the way max_pool2d does)
+                labels_ds = F.avg_pool2d(
                     labels.float(), kernel_size=scale_factor, stride=scale_factor
                 )
                 pred_probs = torch.sigmoid(level_pred)
                 pred_binary = (pred_probs > 0.5).float()
-                labels_float = labels_ds
-                labels_binary = (labels_ds > 0).float()
+                labels_float = labels_ds  # soft target for soft dice
+                labels_binary = (labels_ds > 0.25).float()  # area threshold for hard dice
             else:
                 pred_probs = torch.sigmoid(outputs["final_logit"])
                 pred_binary = (pred_probs > 0.5).float()
@@ -499,6 +501,11 @@ def train_epoch(
             scaled_loss.backward()
 
         if (idx + 1) % grad_accumulate_steps == 0:
+            # Clip gradients to prevent NaN from extreme BCE gradients
+            if accelerator is not None:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         # Track metrics
@@ -727,13 +734,15 @@ def validate(
             level_pred = level_outputs[-1]["pred"]
             level_res = level_pred.shape[-1]
             scale_factor = labels.shape[-1] // level_res
-            labels_ds = F.max_pool2d(
+            # avg_pool2d gives fractional coverage per patch (avoids
+            # inflating sparse masks the way max_pool2d does)
+            labels_ds = F.avg_pool2d(
                 labels.float(), kernel_size=scale_factor, stride=scale_factor
             )
             pred_probs = torch.sigmoid(level_pred)
             pred_binary = (pred_probs > 0.5).float()
-            labels_float = labels_ds
-            labels_binary = (labels_ds > 0).float()
+            labels_float = labels_ds  # soft target for soft dice
+            labels_binary = (labels_ds > 0.25).float()  # area threshold for hard dice
         else:
             pred_probs = torch.sigmoid(predictions)
             pred_binary = (pred_probs > 0.5).float()

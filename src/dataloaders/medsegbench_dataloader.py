@@ -268,13 +268,13 @@ class MedSegBenchDataset(Dataset):
     def _get_context_samples(
         self, target_ds: str, target_idx: int, label: int, k: int
     ) -> List[Tuple[str, int]]:
-        """Get k context samples with same label, excluding target."""
+        """Get k context samples with same label from same dataset, excluding target."""
         candidates = self.label_to_samples.get(label, [])
-        # Filter out target
+        # Filter to same dataset and exclude target
         candidates = [
             (ds, idx)
             for ds, idx in candidates
-            if not (ds == target_ds and idx == target_idx)
+            if ds == target_ds and idx != target_idx
         ]
         if len(candidates) == 0:
             return []

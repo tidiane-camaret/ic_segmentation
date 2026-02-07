@@ -174,9 +174,9 @@ class PatchAggregator(nn.Module):
             )
             aggregated = self._combine_with_prev(aggregated, prev_resized, counts)
         elif self.fill_uncovered == "zero":
-            # Fill uncovered regions with large negative logit -> sigmoid ≈ 0
-            # -10 gives sigmoid(-10) ≈ 4.5e-5 ≈ 0
-            aggregated = torch.where(covered, aggregated, torch.full_like(aggregated, -10.0))
+            # Fill uncovered regions with negative logit -> sigmoid ≈ 0.047
+            # Using -3.0 instead of -10.0 to avoid extreme BCE gradients that cause NaN
+            aggregated = torch.where(covered, aggregated, torch.full_like(aggregated, -3.0))
         # else fill_uncovered="prev" but no prev_pred - leave as is (logit=0 means prob=0.5)
 
         return aggregated

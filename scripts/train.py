@@ -31,8 +31,9 @@ def main(cfg: DictConfig) -> None:
     if cfg.logging.use_wandb and accelerator.is_main_process:
         import wandb
         wandb.init(project=cfg.logging.wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
-
-    run_name = wandb.run.name if cfg.logging.use_wandb else f"run_{accelerator.process_index}"
+        run_name = wandb.run.name
+    else:
+        run_name = f"run_{accelerator.process_index}_{accelerator.num_processes}"
     # Create checkpoint dir
     ckpt_dir = Path(cfg.paths.ckpts.save_dir) / run_name
     if accelerator.is_main_process:

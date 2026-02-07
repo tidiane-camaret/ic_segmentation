@@ -50,6 +50,10 @@ class SoftDiceBCELoss(nn.Module):
         # Ensure targets are float for BCE
         targets_float = targets.float()
         
+        # Clamp logits to prevent extreme values (e.g. -10.0 from aggregator
+        # uncovered fill) from producing huge BCE gradients that cause NaN
+        predictions = predictions.clamp(-6.0, 6.0)
+        
         dice_loss = self.dice(predictions, targets_float)
         bce_loss = self.bce(predictions, targets_float)
         
