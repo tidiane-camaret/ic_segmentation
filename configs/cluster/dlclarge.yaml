@@ -14,12 +14,15 @@ paths:
     medverse: ${..root}/checkpoints/Medverse.ckpt
     dino_vit: "facebook/dinov3-vitl16-pretrain-lvd1689m"
     dino_convnext: ${..root}/checkpoints/dinov3-convnext-large
+    meddino_vit: ${..root}/checkpoints/med_dino_v3model.pth
+    medsam2: null  # Set to local path or null to download from HuggingFace (wanglab/MedSAM2)
+    patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
 
 # Cluster-specific training settings
 train_batch_size: 32
 val_batch_size: 32
 training:
-  num_workers: 4
+  num_workers: 16
 
 logging:
   save_imgs_masks: false
