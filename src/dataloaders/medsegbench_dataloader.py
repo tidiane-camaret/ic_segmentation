@@ -1,305 +1,411 @@
-"""Simple dataloader for MedSegBench datasets."""
+"""
+MedSegBench DataLoader
 
+Fast dataloader for MedSegBench .npz datasets.
+Loads entire datasets to RAM for speed.
+Samples target, then k context examples with the same label.
+"""
+
+import glob
+import os
 import random
-import warnings
-from typing import List, Optional
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import medsegbench
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    from src.dataloaders.augmentations import create_augmentation_transforms
+    HAS_AUGMENTATIONS = True
+except ImportError:
+    HAS_AUGMENTATIONS = False
 
 
-# Available MedSegBench dataset classes
-DATASET_CLASSES = {
-    "medsegbench_abdomenus": medsegbench.AbdomenUSMSBench,
-    "medsegbench_dca1": medsegbench.Dca1MSBench,
-    "medsegbench_covid19radio": medsegbench.Covid19RadioMSBench
-}
+def _find_keys(keys: List[str], split: str) -> Tuple[Optional[str], Optional[str]]:
+    """Find image and label keys in npz file."""
+    img_candidates = [f"{split}_images", f"{split}_img", "images", "img"]
+    lbl_candidates = [f"{split}_labels", f"{split}_label", f"{split}_mask", "labels", "masks", "label"]
+    img_key = next((k for k in img_candidates if k in keys), None)
+    lbl_key = next((k for k in lbl_candidates if k in keys), None)
+    return img_key, lbl_key
 
-"""
-"busi": medsegbench.BUSIMSBench,
-"camus": medsegbench.CAMUSMSBench,
-"chasedb1": medsegbench.CHASEDB1MSBench,
-"covid_qu_ex": medsegbench.CovidQUExMSBench,
-"cvc_clinicdb": medsegbench.CVCClinicDBMSBench,
-"dca1": medsegbench.DCA1MSBench,
-"drive": medsegbench.DRIVEMSBench,
-"drishti_gs": medsegbench.DrishtiGSMSBench,
-"fetal_head": medsegbench.FetalHeadMSBench,
-"glas": medsegbench.GLASMSBench,
-"hc18": medsegbench.HC18MSBench,
-"idrid": medsegbench.IDRiDMSBench,
-"isic2018": medsegbench.ISIC2018MSBench,
-"kvasir_seg": medsegbench.KvasirSEGMSBench,
-"nci_isbi2013": medsegbench.NCIISBI2013MSBench,
-"nucseg": medsegbench.NuCSegMSBench,
-"pannuke": medsegbench.PanNukeMSBench,
-"promise12": medsegbench.Promise12MSBench,
-"refuge": medsegbench.REFUGEMSBench,
-"siim_acr": medsegbench.SIIMACRMSBench,
-"stare": medsegbench.STAREMSBench,
-"tn3k": medsegbench.TN3KMSBench,
-"tnbc": medsegbench.TNBCMSBench,
-"""
+
 class MedSegBenchDataset(Dataset):
-    """Wrapper for MedSegBench datasets with configurable transforms."""
+    """
+    Fast MedSegBench dataset that loads everything to RAM.
+
+    Args:
+        data_root: Path to medsegbench directory containing .npz files
+        datasets: List of dataset names (without .npz) to load, or None for all
+        split: Which split to use ('train', 'val', 'test')
+        context_size: Number of context examples per sample
+        image_size: Target size (H, W) for resizing
+        augment: Whether to apply augmentation
+        augment_config: Augmentation parameters
+        max_samples_per_dataset: Limit samples per dataset (for debugging)
+    """
 
     def __init__(
         self,
-        dataset_name: str,
+        data_root: str,
+        datasets: Optional[List[str]] = None,
         split: str = "train",
-        root: Optional[str] = None,
-        image_size: int = 224,
-        download: bool = False,
-        context_size: int = 0,
-        label_ids: Optional[List[int]] = None,
+        context_size: int = 3,
+        image_size: Tuple[int, int] = (256, 256),
+        augment: bool = False,
+        augment_config: Optional[Dict] = None,
+        max_samples_per_dataset: Optional[int] = None,
     ):
-        """
-        Args:
-            dataset_name: Name of the dataset (e.g., 'abdomenus', 'busi')
-            split: 'train', 'val', or 'test'
-            root: Root directory for dataset storage
-            image_size: Target size for images (default 224 for ViT)
-            download: Whether to download the dataset if not present
-            context_size: Number of context examples to sample (0 = no context)
-            label_ids: List of label IDs to use for binary segmentation.
-                       If None, uses all non-zero labels found in masks.
-        """
-        if dataset_name.lower() not in DATASET_CLASSES:
-            raise ValueError(
-                f"Unknown dataset: {dataset_name}. "
-                f"Available: {list(DATASET_CLASSES.keys())}"
-            )
-
-        self.dataset_name = dataset_name
+        self.data_root = data_root
         self.split = split
-        self.image_size = image_size
         self.context_size = context_size
-        self.label_ids = label_ids
+        self.image_size = image_size
+        self.augment = augment
 
-        # Image transform: resize and convert to tensor
-        self.image_transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-        ])
-
-        # Load the underlying medsegbench dataset
-        dataset_cls = DATASET_CLASSES[dataset_name.lower()]
-        self.dataset = dataset_cls(
-            split=split,
-            root=root,
-            download=download,
-            transform=self.image_transform,
-        )
-
-        # Build label_to_cases mapping for efficient context sampling
-        self.label_to_cases = self._build_label_to_cases_mapping()
-
-    def _build_label_to_cases_mapping(self) -> dict:
-        """Scan all masks and build mapping: label_id -> list of case indices."""
-        label_to_cases = {}
-        print(f"Building label-to-cases mapping for {len(self.dataset)} samples...")
-
-        for idx in range(len(self.dataset)):
-            _, mask = self.dataset[idx]
-            if not isinstance(mask, torch.Tensor):
-                mask = torch.tensor(mask)
-
-            # Get unique labels in this mask
-            unique_labels = mask.unique().tolist()
-            for label in unique_labels:
-                if label not in label_to_cases:
-                    label_to_cases[label] = []
-                label_to_cases[label].append(idx)
-
-        print(f"Found {len(label_to_cases)} unique labels: {sorted(label_to_cases.keys())}")
-        return label_to_cases
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def _process_sample(self, idx, label_id=None):
-        """Load and process a single sample.
-
-        Args:
-            idx: Sample index
-            label_id: If provided, create binary mask for this label only.
-                      If None, binarize the full mask (any label > 0).
-        """
-        image, mask = self.dataset[idx]
-
-        # mask is already a tensor from medsegbench, resize it
-        if not isinstance(mask, torch.Tensor):
-            mask = torch.tensor(mask)
-
-        # Resize mask to match image size
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)  # Add channel dim for interpolation
-        mask = torch.nn.functional.interpolate(
-            mask.unsqueeze(0).float(),
-            size=(self.image_size, self.image_size),
-            mode="nearest"
-        ).squeeze(0).squeeze(0).long()
-
-        # Create binary mask for specific label_id or binarize all
-        if label_id is not None:
-            binary_mask = (mask == label_id).long()
+        # Setup augmentation
+        if augment and HAS_AUGMENTATIONS:
+            cfg = augment_config or {}
+            self.spatial_transform, self.intensity_transform = create_augmentation_transforms(
+                rotation_limit=cfg.get("rotation_limit", 15.0),
+                scale_limit=cfg.get("scale_limit", 0.1),
+                elastic_alpha=cfg.get("elastic_alpha", 50.0),
+                elastic_sigma=cfg.get("elastic_sigma", 5.0),
+                brightness_limit=cfg.get("brightness_limit", 0.1),
+                contrast_limit=cfg.get("contrast_limit", 0.1),
+                gamma_limit=cfg.get("gamma_limit", (80, 120)),
+                noise_std_range=cfg.get("noise_std_range", (0.02, 0.05)),
+            )
         else:
-            binary_mask = (mask > 0).long()
+            if augment and not HAS_AUGMENTATIONS:
+                print("Warning: augmentations requested but not available")
+            self.augment = False
+            self.spatial_transform = None
+            self.intensity_transform = None
 
-        return image, binary_mask
+        # Find dataset files
+        if datasets is None:
+            npz_files = glob.glob(os.path.join(data_root, "*.npz"))
+            datasets = [os.path.basename(f).replace(".npz", "") for f in npz_files]
 
-    def __getitem__(self, idx):
-        """Returns dict with image, mask, case_id, and optionally context examples."""
-        # Sample a label_id that exists in this target sample (exclude 0 = background)
-        if self.label_ids is not None and len(self.label_ids) > 0:
-            # Find which of the configured label_ids exist in this sample (exclude 0)
-            available_labels = [
-                lid for lid in self.label_ids
-                if lid != 0 and lid in self.label_to_cases and idx in self.label_to_cases[lid]
-            ]
-            if len(available_labels) > 0:
-                label_id = random.choice(available_labels)
-            else:
-                # Fallback: use any non-zero label present in this sample
-                sample_labels = [
-                    lid for lid, cases in self.label_to_cases.items()
-                    if idx in cases and lid != 0  # exclude background
-                ]
-                if sample_labels:
-                    label_id = random.choice(sample_labels)
+        # Load all data to RAM
+        # Structure: self.data[dataset_name] = {"images": np.array, "labels": np.array}
+        self.data: Dict[str, Dict[str, np.ndarray]] = {}
+        # Index: (dataset_name, sample_idx) for all samples
+        self.samples: List[Tuple[str, int]] = []
+        # Label index: label_value -> [(dataset_name, sample_idx), ...]
+        self.label_to_samples: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
+
+        print(f"Loading {len(datasets)} datasets to RAM...")
+        for ds_name in datasets:
+            npz_path = os.path.join(data_root, f"{ds_name}.npz")
+            if not os.path.exists(npz_path):
+                # Try with _256 suffix
+                npz_path = os.path.join(data_root, f"{ds_name}_256.npz")
+            if not os.path.exists(npz_path):
+                print(f"  [Skip] {ds_name}: file not found")
+                continue
+
+            try:
+                data = np.load(npz_path)
+                keys = list(data.keys())
+
+                # Find keys for requested split, fallback to other splits
+                img_key, lbl_key = _find_keys(keys, split)
+                if not img_key:
+                    for fallback in ["train", "val", "test"]:
+                        img_key, lbl_key = _find_keys(keys, fallback)
+                        if img_key:
+                            break
+
+                if not img_key:
+                    print(f"  [Skip] {ds_name}: no valid keys found")
+                    continue
+
+                images = data[img_key]
+
+                # Handle per-class label keys (e.g. idrib: train_label_C1, train_label_C2, ...)
+                if not lbl_key:
+                    used_split = split
+                    if not any(k.startswith(f"{split}_label_C") for k in keys):
+                        used_split = next(
+                            (s for s in ["train", "val", "test"]
+                             if any(k.startswith(f"{s}_label_C") for k in keys)),
+                            None,
+                        )
+                    if used_split:
+                        class_keys = sorted(k for k in keys if k.startswith(f"{used_split}_label_C"))
+                        # Stack per-class binary masks into a single multi-class label array
+                        class_masks = [data[k] for k in class_keys]
+                        labels = np.zeros_like(class_masks[0], dtype=np.uint8)
+                        for ci, cm in enumerate(class_masks, start=1):
+                            labels[cm > 0] = ci
+                    else:
+                        print(f"  [Skip] {ds_name}: no valid keys found")
+                        continue
                 else:
-                    label_id = None  # Will binarize full mask
-        else:
-            label_id = None  # Will binarize full mask
+                    labels = data[lbl_key]
 
-        image, mask = self._process_sample(idx, label_id=label_id)
+                # Limit samples if requested
+                if max_samples_per_dataset and len(images) > max_samples_per_dataset:
+                    indices = np.random.choice(len(images), max_samples_per_dataset, replace=False)
+                    images = images[indices]
+                    labels = labels[indices]
+
+                # Store in RAM
+                self.data[ds_name] = {"images": images, "labels": labels}
+
+                # Build sample index
+                for i in range(len(images)):
+                    self.samples.append((ds_name, i))
+                    # Get unique labels in this mask (excluding background 0)
+                    unique_labels = np.unique(labels[i])
+                    for lbl in unique_labels:
+                        if lbl != 0:
+                            self.label_to_samples[int(lbl)].append((ds_name, i))
+
+                print(f"  [OK] {ds_name}: {len(images)} samples, {len(np.unique(labels))} labels")
+
+            except Exception as e:
+                print(f"  [Error] {ds_name}: {e}")
+                continue
+
+        print(f"Loaded {len(self.samples)} total samples from {len(self.data)} datasets")
+        print(f"Found {len(self.label_to_samples)} unique label values")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _normalize_image(self, img: np.ndarray) -> np.ndarray:
+        """Normalize image to [0, 1] float32."""
+        img = img.astype(np.float32)
+        if img.max() > 1:
+            img = img / 255.0
+        return img
+
+    def _to_grayscale(self, img: np.ndarray) -> np.ndarray:
+        """Convert image to single-channel grayscale [H, W]."""
+        if img.ndim == 2:
+            return img
+        # Channels first (C, H, W)
+        if img.ndim == 3 and img.shape[0] in [1, 3]:
+            if img.shape[0] == 1:
+                return img[0]
+            return np.mean(img, axis=0)
+        # Channels last (H, W, C)
+        if img.ndim == 3 and img.shape[-1] in [1, 3]:
+            if img.shape[-1] == 1:
+                return img[..., 0]
+            return np.mean(img, axis=-1)
+        return img
+
+    def _resize(self, arr: np.ndarray, mode: str = "bilinear") -> np.ndarray:
+        """Resize 2D array to self.image_size."""
+        if arr.shape == self.image_size:
+            return arr
+        tensor = torch.from_numpy(arr.copy()).unsqueeze(0).unsqueeze(0).float()
+        if mode == "bilinear":
+            resized = torch.nn.functional.interpolate(
+                tensor, size=self.image_size, mode="bilinear", align_corners=False
+            )
+        else:
+            resized = torch.nn.functional.interpolate(tensor, size=self.image_size, mode="nearest")
+        return resized.squeeze().numpy()
+
+    def _create_binary_mask(self, mask: np.ndarray, label: int) -> np.ndarray:
+        """Create binary mask for specific label."""
+        return (mask == label).astype(np.float32)
+
+    def _apply_augmentation(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply augmentation to image and mask."""
+        if not self.augment or self.spatial_transform is None:
+            return img, mask
+
+        img_uint8 = (img * 255).astype(np.uint8)
+        mask_uint8 = (mask * 255).astype(np.uint8)
+
+        spatial_result = self.spatial_transform(image=img_uint8, mask=mask_uint8)
+        img_aug = spatial_result["image"]
+        mask_aug = spatial_result["mask"]
+
+        if self.intensity_transform is not None:
+            intensity_result = self.intensity_transform(image=img_aug)
+            img_aug = intensity_result["image"]
+
+        img_aug = img_aug.astype(np.float32) / 255.0
+        mask_aug = (mask_aug > 127).astype(np.float32)
+        return img_aug, mask_aug
+
+    def _get_context_samples(
+        self, target_ds: str, target_idx: int, label: int, k: int
+    ) -> List[Tuple[str, int]]:
+        """Get k context samples with same label, excluding target."""
+        candidates = self.label_to_samples.get(label, [])
+        # Filter out target
+        candidates = [(ds, idx) for ds, idx in candidates if not (ds == target_ds and idx == target_idx)]
+        if len(candidates) == 0:
+            return []
+        # Random sample
+        k = min(k, len(candidates))
+        return random.sample(candidates, k)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a sample with context examples.
+
+        Returns:
+            Dictionary with:
+            - 'image': [1, H, W] target image
+            - 'label': [1, H, W] target binary mask
+            - 'context_in': [k, 1, H, W] context images
+            - 'context_out': [k, 1, H, W] context masks
+            - 'dataset': str
+            - 'label_value': int
+        """
+        ds_name, sample_idx = self.samples[idx]
+        images = self.data[ds_name]["images"]
+        labels = self.data[ds_name]["labels"]
+
+        # Get target image and mask
+        target_img = images[sample_idx]
+        target_mask = labels[sample_idx]
+
+        # Convert to grayscale and normalize
+        target_img = self._to_grayscale(target_img)
+        target_img = self._normalize_image(target_img)
+
+        # Sample a random label from this mask (excluding background)
+        unique_labels = np.unique(target_mask)
+        fg_labels = [l for l in unique_labels if l != 0]
+        if len(fg_labels) == 0:
+            # Fallback: return empty mask
+            label_value = 1
+        else:
+            label_value = random.choice(fg_labels)
+
+        # Create binary mask for sampled label
+        target_binary = self._create_binary_mask(target_mask, label_value)
+
+        # Resize
+        target_img = self._resize(target_img, mode="bilinear")
+        target_binary = self._resize(target_binary, mode="nearest")
+
+        # Get context samples
+        context_samples = self._get_context_samples(ds_name, sample_idx, label_value, self.context_size)
+
+        context_imgs = []
+        context_masks = []
+        for ctx_ds, ctx_idx in context_samples:
+            ctx_img = self.data[ctx_ds]["images"][ctx_idx]
+            ctx_mask = self.data[ctx_ds]["labels"][ctx_idx]
+
+            ctx_img = self._to_grayscale(ctx_img)
+            ctx_img = self._normalize_image(ctx_img)
+            ctx_binary = self._create_binary_mask(ctx_mask, label_value)
+
+            ctx_img = self._resize(ctx_img, mode="bilinear")
+            ctx_binary = self._resize(ctx_binary, mode="nearest")
+
+            # Apply augmentation (independent per context)
+            if self.augment:
+                ctx_img, ctx_binary = self._apply_augmentation(ctx_img, ctx_binary)
+
+            context_imgs.append(ctx_img)
+            context_masks.append(ctx_binary)
+
+        # Apply augmentation to target
+        if self.augment:
+            target_img, target_binary = self._apply_augmentation(target_img, target_binary)
+
+        # Convert to tensors
+        target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()
+        target_out = torch.from_numpy(target_binary.copy()).unsqueeze(0).float()
 
         result = {
-            "image": image,
-            "label": mask,
-            "case_id": f"s{idx:04d}",
-            "label_id": label_id,
+            "image": target_in,
+            "label": target_out,
+            "dataset": ds_name,
+            "label_value": label_value,
         }
 
-        # Sample context examples if context_size > 0
-        if self.context_size > 0:
-            # Get cases that have this label (exclude current sample)
-            if label_id is not None and label_id in self.label_to_cases:
-                available_indices = [i for i in self.label_to_cases[label_id] if i != idx]
-            else:
-                # Fallback: all indices except current
-                available_indices = [i for i in range(len(self)) if i != idx]
-
-            # Sample context indices
-            n_context = min(self.context_size, len(available_indices))
-            if n_context < self.context_size:
-                warnings.warn(
-                    f"Only {n_context}/{self.context_size} cases have label {label_id}"
-                )
-
-            context_indices = random.sample(available_indices, n_context) if n_context > 0 else []
-
-            context_images = []
-            context_labels = []
-
-            for ctx_idx in context_indices:
-                ctx_image, ctx_mask = self._process_sample(ctx_idx, label_id=label_id)
-                context_images.append(ctx_image)
-                context_labels.append(ctx_mask)
-
-            if len(context_images) > 0:
-                # Stack context examples: [k, C, H, W]
-                result["context_in"] = torch.stack(context_images, dim=0)
-                result["context_out"] = torch.stack(
-                    [m.unsqueeze(0).float() for m in context_labels], dim=0
-                )
-                result["context_case_ids"] = [f"s{i:04d}" for i in context_indices]
+        if context_imgs:
+            context_in = torch.stack(
+                [torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_imgs]
+            )
+            context_out = torch.stack(
+                [torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_masks]
+            )
+            result["context_in"] = context_in
+            result["context_out"] = context_out
 
         return result
 
-    @property
-    def num_classes(self):
-        """Returns number of segmentation classes."""
-        if hasattr(self.dataset, 'num_classes'):
-            return self.dataset.num_classes
-        # Use precomputed label_to_cases mapping
-        return len(self.label_to_cases)
 
-
-def collate_fn(batch):
-    """Collate function that handles optional context examples."""
-    has_context = "context_in" in batch[0]
-
+def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+    """Collate function for batching."""
     result = {
-        "image": torch.stack([item["image"] for item in batch], dim=0),
-        "label": torch.stack([item["label"] for item in batch], dim=0),
-        "case_id": [item["case_id"] for item in batch],
-        "label_id": [item["label_id"] for item in batch],
+        "image": torch.stack([item["image"] for item in batch]),
+        "label": torch.stack([item["label"] for item in batch]),
+        "datasets": [item["dataset"] for item in batch],
+        "label_values": [item["label_value"] for item in batch],
     }
 
-    if has_context:
-        result["context_in"] = torch.stack([item["context_in"] for item in batch], dim=0)
-        result["context_out"] = torch.stack([item["context_out"] for item in batch], dim=0)
-        result["context_case_ids"] = [item["context_case_ids"] for item in batch]
+    if "context_in" in batch[0]:
+        # Pad context to same size across batch
+        max_k = max(item["context_in"].shape[0] for item in batch)
+        h, w = batch[0]["image"].shape[1:]
+
+        context_in_list = []
+        context_out_list = []
+        for item in batch:
+            k = item["context_in"].shape[0]
+            if k < max_k:
+                # Pad with zeros
+                pad_in = torch.zeros(max_k - k, 1, h, w)
+                pad_out = torch.zeros(max_k - k, 1, h, w)
+                context_in_list.append(torch.cat([item["context_in"], pad_in], dim=0))
+                context_out_list.append(torch.cat([item["context_out"], pad_out], dim=0))
+            else:
+                context_in_list.append(item["context_in"])
+                context_out_list.append(item["context_out"])
+
+        result["context_in"] = torch.stack(context_in_list)
+        result["context_out"] = torch.stack(context_out_list)
 
     return result
 
 
 def get_dataloader(
-    dataset_name: str,
+    data_root: str,
+    datasets: Optional[List[str]] = None,
     split: str = "train",
-    root: Optional[str] = None,
+    context_size: int = 3,
     batch_size: int = 8,
-    image_size: int = 224,
-    shuffle: Optional[bool] = None,
-    num_workers: int = 4,
-    download: bool = False,
-    context_size: int = 0,
-    label_ids: Optional[List[int]] = None,
+    image_size: Tuple[int, int] = (256, 256),
+    num_workers: int = 0,
+    shuffle: bool = True,
+    augment: bool = False,
+    augment_config: Optional[Dict] = None,
+    **kwargs,
 ) -> DataLoader:
-    """
-    Get a DataLoader for a MedSegBench dataset.
-
-    Args:
-        dataset_name: Name of the dataset
-        split: 'train', 'val', or 'test'
-        root: Root directory for dataset storage
-        batch_size: Batch size
-        image_size: Target image size
-        shuffle: Whether to shuffle (defaults to True for train)
-        num_workers: Number of data loading workers
-        download: Whether to download if not present
-        context_size: Number of context examples (0 = no context)
-        label_ids: List of label IDs for binary segmentation
-
-    Returns:
-        DataLoader instance
-    """
+    """Create a DataLoader for MedSegBench."""
     dataset = MedSegBenchDataset(
-        dataset_name=dataset_name,
+        data_root=data_root,
+        datasets=datasets,
         split=split,
-        root=root,
-        image_size=image_size,
-        download=download,
         context_size=context_size,
-        label_ids=label_ids,
+        image_size=image_size,
+        augment=augment,
+        augment_config=augment_config,
+        **kwargs,
     )
-
-    if shuffle is None:
-        shuffle = (split == "train")
 
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
         collate_fn=collate_fn,
+        pin_memory=True,
     )
-
-
-def list_datasets():
-    """List available MedSegBench datasets."""
-    return list(DATASET_CLASSES.keys())
