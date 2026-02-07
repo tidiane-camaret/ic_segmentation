@@ -1,4 +1,5 @@
 """Training and validation utilities for PatchICL."""
+
 import os
 import random
 from pathlib import Path
@@ -43,16 +44,24 @@ def _log_sample_images(label_samples: dict, epoch: int, prefix: str = "train") -
             img_np = img.permute(1, 2, 0).numpy()
         else:
             # Take first 3 channels or first channel
-            img_np = img[:3].permute(1, 2, 0).numpy() if img.shape[0] >= 3 else img[0].numpy()
+            img_np = (
+                img[:3].permute(1, 2, 0).numpy()
+                if img.shape[0] >= 3
+                else img[0].numpy()
+            )
             if img_np.ndim == 2:
                 img_np = np.stack([img_np, img_np, img_np], axis=-1)
 
         # Normalize to [0, 255]
-        img_np = ((img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8) * 255).astype(np.uint8)
+        img_np = (
+            (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8) * 255
+        ).astype(np.uint8)
 
         # Get mask data (take first channel if multi-channel)
         gt_mask = (label[0].numpy() > 0).astype(np.uint8)
-        pred_mask = (pred[0].numpy() > 0).astype(np.uint8) * 2  # Use 2 for pred to distinguish
+        pred_mask = (pred[0].numpy() > 0).astype(
+            np.uint8
+        ) * 2  # Use 2 for pred to distinguish
 
         wandb_img = wandb.Image(
             img_np,
@@ -90,7 +99,7 @@ def _save_sample_images(
     epoch_dir = save_dir / f"{prefix}_epoch_{epoch:04d}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
 
-    def draw_patch_boxes(ax, img, coords, patch_size, level_res, color='red'):
+    def draw_patch_boxes(ax, img, coords, patch_size, level_res, color="red"):
         """Draw patch bounding boxes on image."""
         if coords is None or level_res is None:
             return
@@ -114,13 +123,20 @@ def _save_sample_images(
             r, c = coord[0].item(), coord[1].item()
             r_start = int(r * scale_h)
             c_start = int(c * scale_w)
-            rect = Rectangle((c_start, r_start), scaled_patch_w, scaled_patch_h,
-                              linewidth=1, edgecolor=color, facecolor='none')
+            rect = Rectangle(
+                (c_start, r_start),
+                scaled_patch_w,
+                scaled_patch_h,
+                linewidth=1,
+                edgecolor=color,
+                facecolor="none",
+            )
             ax.add_patch(rect)
 
     wandb_images = []
     try:
         import wandb
+
         wandb_available = True
     except ImportError:
         wandb_available = False
@@ -132,7 +148,9 @@ def _save_sample_images(
         pred_probs = sample.get("pred_probs")
         if pred_probs is not None:
             pred_probs = pred_probs.squeeze().numpy()
-            pred_heatmap = (pred_probs - pred_probs.min()) / (pred_probs.max() - pred_probs.min() + 1e-8)
+            pred_heatmap = (pred_probs - pred_probs.min()) / (
+                pred_probs.max() - pred_probs.min() + 1e-8
+            )
         else:
             pred_heatmap = None
         dice = sample["dice"]
@@ -150,73 +168,95 @@ def _save_sample_images(
         if n_rows == 1:
             axes = [axes]
 
-        axes[0][0].imshow(img, cmap='gray')
+        axes[0][0].imshow(img, cmap="gray")
         if target_coords is not None and level_res is not None:
-            draw_patch_boxes(axes[0][0], img, target_coords, patch_size, level_res, color='red')
-        axes[0][0].set_title('Target + Patches')
-        axes[0][0].axis('off')
+            draw_patch_boxes(
+                axes[0][0], img, target_coords, patch_size, level_res, color="red"
+            )
+        axes[0][0].set_title("Target + Patches")
+        axes[0][0].axis("off")
 
-        axes[0][1].imshow(gt, cmap='gray')
-        axes[0][1].set_title('Ground Truth')
-        axes[0][1].axis('off')
+        axes[0][1].imshow(gt, cmap="gray")
+        axes[0][1].set_title("Ground Truth")
+        axes[0][1].axis("off")
 
-        axes[0][2].imshow(pred, cmap='gray')
-        axes[0][2].set_title(f'Prediction (dice={dice:.3f})')
-        axes[0][2].axis('off')
+        axes[0][2].imshow(pred, cmap="gray")
+        axes[0][2].set_title(f"Prediction (dice={dice:.3f})")
+        axes[0][2].axis("off")
 
         if pred_heatmap is not None:
-            im = axes[0][3].imshow(pred_heatmap, cmap='hot', vmin=0, vmax=1)
-            axes[0][3].set_title('Prediction Heatmap')
+            im = axes[0][3].imshow(pred_heatmap, cmap="hot", vmin=0, vmax=1)
+            axes[0][3].set_title("Prediction Heatmap")
             plt.colorbar(im, ax=axes[0][3], fraction=0.046, pad=0.04)
-        axes[0][3].axis('off')
+        axes[0][3].axis("off")
 
         if n_ctx > 0 and n_rows > 1:
             ctx_img = ctx_in[0].squeeze().numpy()
             ctx_mask = ctx_out[0].squeeze().numpy()
-            axes[1][0].imshow(ctx_img, cmap='gray')
-            if context_coords is not None and level_res is not None and context_coords.ndim == 2:
+            axes[1][0].imshow(ctx_img, cmap="gray")
+            if (
+                context_coords is not None
+                and level_res is not None
+                and context_coords.ndim == 2
+            ):
                 try:
                     total_patches = context_coords.shape[0]
                     K_per_ctx = total_patches // n_ctx
                     ctx1_coords = context_coords[:K_per_ctx]
-                    draw_patch_boxes(axes[1][0], ctx_img, ctx1_coords, patch_size, level_res, color='cyan')
+                    draw_patch_boxes(
+                        axes[1][0],
+                        ctx_img,
+                        ctx1_coords,
+                        patch_size,
+                        level_res,
+                        color="cyan",
+                    )
                 except (IndexError, TypeError, ZeroDivisionError):
                     pass
-            axes[1][0].set_title('Context 1 + Patches')
-            axes[1][0].axis('off')
+            axes[1][0].set_title("Context 1 + Patches")
+            axes[1][0].axis("off")
 
-            axes[1][1].imshow(ctx_mask, cmap='gray')
-            axes[1][1].set_title('Context 1 Mask')
-            axes[1][1].axis('off')
+            axes[1][1].imshow(ctx_mask, cmap="gray")
+            axes[1][1].set_title("Context 1 Mask")
+            axes[1][1].axis("off")
 
             if n_ctx > 1:
                 ctx_img2 = ctx_in[1].squeeze().numpy()
                 ctx_mask2 = ctx_out[1].squeeze().numpy()
-                axes[1][2].imshow(ctx_img2, cmap='gray')
-                axes[1][2].imshow(ctx_mask2, cmap='Reds', alpha=0.4)
+                axes[1][2].imshow(ctx_img2, cmap="gray")
+                axes[1][2].imshow(ctx_mask2, cmap="Reds", alpha=0.4)
                 if context_coords is not None and context_coords.ndim == 2:
                     try:
                         total_patches = context_coords.shape[0]
                         K_per_ctx = total_patches // n_ctx
-                        ctx2_coords = context_coords[K_per_ctx:2*K_per_ctx]
-                        draw_patch_boxes(axes[1][2], ctx_img2, ctx2_coords, patch_size, level_res, color='cyan')
+                        ctx2_coords = context_coords[K_per_ctx : 2 * K_per_ctx]
+                        draw_patch_boxes(
+                            axes[1][2],
+                            ctx_img2,
+                            ctx2_coords,
+                            patch_size,
+                            level_res,
+                            color="cyan",
+                        )
                     except (IndexError, TypeError, ZeroDivisionError):
                         pass
-                axes[1][2].set_title('Context 2 + Mask')
-                axes[1][2].axis('off')
+                axes[1][2].set_title("Context 2 + Mask")
+                axes[1][2].axis("off")
             else:
-                axes[1][2].axis('off')
-            axes[1][3].axis('off')
+                axes[1][2].axis("off")
+            axes[1][3].axis("off")
 
         fig.tight_layout()
-        safe_label = label_id.replace('/', '_')
+        safe_label = label_id.replace("/", "_")
         save_path = epoch_dir / f"{safe_label}.png"
-        fig.savefig(save_path, dpi=100, bbox_inches='tight')
+        fig.savefig(save_path, dpi=100, bbox_inches="tight")
         plt.close(fig)
 
         # Log the saved image to wandb
         if wandb_available:
-            wandb_img = wandb.Image(str(save_path), caption=f"{label_id} (dice={dice:.3f})")
+            wandb_img = wandb.Image(
+                str(save_path), caption=f"{label_id} (dice={dice:.3f})"
+            )
             wandb_images.append(wandb_img)
 
     # Log all images at once to wandb
@@ -241,7 +281,9 @@ def train_epoch(
     """Run one training epoch."""
     model.train()
     is_main = accelerator is None or accelerator.is_main_process
-    unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
+    unwrapped_model = (
+        accelerator.unwrap_model(model) if accelerator is not None else model
+    )
 
     if use_wandb and is_main:
         try:
@@ -265,7 +307,13 @@ def train_epoch(
     label_dice_scores = {}  # Per-label tracking
     label_samples = {}  # Store one sample per label for wandb image logging
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=not is_main, unit="batch", dynamic_ncols=True)
+    pbar = tqdm(
+        train_loader,
+        desc=f"Epoch {epoch}",
+        disable=not is_main,
+        unit="batch",
+        dynamic_ncols=True,
+    )
 
     for idx, batch in enumerate(pbar):
         images = batch["image"].to(device)
@@ -313,13 +361,19 @@ def train_epoch(
             patch_labels_float = patch_labels.float()
             patch_labels_binary = (patch_labels > 0).float()
             # Hard dice
-            patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(1, 2, 3, 4))
-            patch_union = patch_pred_binary.sum(dim=(1, 2, 3, 4)) + patch_labels_binary.sum(dim=(1, 2, 3, 4))
+            patch_intersection = (patch_pred_binary * patch_labels_binary).sum(
+                dim=(1, 2, 3, 4)
+            )
+            patch_union = patch_pred_binary.sum(
+                dim=(1, 2, 3, 4)
+            ) + patch_labels_binary.sum(dim=(1, 2, 3, 4))
             local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
             total_local_dice += local_dice.mean().item()
             # Soft dice
             soft_intersection = (patch_probs * patch_labels_float).sum(dim=(1, 2, 3, 4))
-            soft_denom = patch_probs.sum(dim=(1, 2, 3, 4)) + patch_labels_float.sum(dim=(1, 2, 3, 4))
+            soft_denom = patch_probs.sum(dim=(1, 2, 3, 4)) + patch_labels_float.sum(
+                dim=(1, 2, 3, 4)
+            )
             local_softdice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
             total_local_softdice += local_softdice.mean().item()
 
@@ -329,7 +383,9 @@ def train_epoch(
                 level_pred = level_outputs[-1]["pred"]
                 level_res = level_pred.shape[-1]
                 scale_factor = labels.shape[-1] // level_res
-                labels_ds = F.max_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
+                labels_ds = F.max_pool2d(
+                    labels.float(), kernel_size=scale_factor, stride=scale_factor
+                )
                 pred_probs = torch.sigmoid(level_pred)
                 pred_binary = (pred_probs > 0.5).float()
                 labels_float = labels_ds
@@ -342,20 +398,28 @@ def train_epoch(
             spatial_dims = tuple(range(2, pred_binary.dim()))
             # Hard dice
             intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
-            union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
+            union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(
+                dim=spatial_dims
+            )
             final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
             total_final_dice += final_dice.mean().item()
             # Soft dice
             soft_inter = (pred_probs * labels_float).sum(dim=spatial_dims)
-            soft_denom = pred_probs.sum(dim=spatial_dims) + labels_float.sum(dim=spatial_dims)
+            soft_denom = pred_probs.sum(dim=spatial_dims) + labels_float.sum(
+                dim=spatial_dims
+            )
             final_softdice = (2 * soft_inter + 1e-6) / (soft_denom + 1e-6)
             total_final_softdice += final_softdice.mean().item()
 
             # Per-label tracking
-            batch_label_ids = batch.get("label_ids") or batch.get("label_id", [None] * images.shape[0])
+            batch_label_ids = batch.get("label_ids") or batch.get(
+                "label_id", [None] * images.shape[0]
+            )
             for i in range(images.shape[0]):
                 label_id = batch_label_ids[i] if batch_label_ids else "unknown"
-                dice_val = final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
+                dice_val = (
+                    final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
+                )
                 if label_id not in label_dice_scores:
                     label_dice_scores[label_id] = []
                 label_dice_scores[label_id].append(dice_val)
@@ -384,8 +448,16 @@ def train_epoch(
                         "pred": pred_binary[i].detach().cpu(),
                         "pred_probs": pred_probs[i].detach().cpu(),
                         "dice": dice_val,
-                        "context_in": context_in[i].detach().cpu() if context_in is not None else None,
-                        "context_out": context_out[i].detach().cpu() if context_out is not None else None,
+                        "context_in": (
+                            context_in[i].detach().cpu()
+                            if context_in is not None
+                            else None
+                        ),
+                        "context_out": (
+                            context_out[i].detach().cpu()
+                            if context_out is not None
+                            else None
+                        ),
                         "target_coords": target_coords,
                         "context_coords": context_coords,
                         "patch_size": patch_size,
@@ -402,13 +474,19 @@ def train_epoch(
                     ctx_labels_float = context_labels.float()
                     ctx_labels_binary = (context_labels > 0).float()
                     # Hard dice
-                    ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(dim=(2, 3, 4))
-                    ctx_union = ctx_pred_binary.sum(dim=(2, 3, 4)) + ctx_labels_binary.sum(dim=(2, 3, 4))
+                    ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(
+                        dim=(2, 3, 4)
+                    )
+                    ctx_union = ctx_pred_binary.sum(
+                        dim=(2, 3, 4)
+                    ) + ctx_labels_binary.sum(dim=(2, 3, 4))
                     ctx_dice = (2 * ctx_intersection + 1e-6) / (ctx_union + 1e-6)
                     total_context_dice += ctx_dice.mean().item()
                     # Soft dice
                     ctx_soft_inter = (ctx_probs * ctx_labels_float).sum(dim=(2, 3, 4))
-                    ctx_soft_denom = ctx_probs.sum(dim=(2, 3, 4)) + ctx_labels_float.sum(dim=(2, 3, 4))
+                    ctx_soft_denom = ctx_probs.sum(
+                        dim=(2, 3, 4)
+                    ) + ctx_labels_float.sum(dim=(2, 3, 4))
                     ctx_softdice = (2 * ctx_soft_inter + 1e-6) / (ctx_soft_denom + 1e-6)
                     total_context_softdice += ctx_softdice.mean().item()
                     context_dice_count += 1
@@ -426,41 +504,64 @@ def train_epoch(
         # Track metrics
         total_loss += loss.item()
         total_target_patch += losses.get("target_patch_loss", torch.tensor(0.0)).item()
-        total_target_aggreg += losses.get("target_aggreg_loss", torch.tensor(0.0)).item()
-        total_context_patch += losses.get("context_patch_loss", torch.tensor(0.0)).item()
-        total_context_aggreg += losses.get("context_aggreg_loss", torch.tensor(0.0)).item()
+        total_target_aggreg += losses.get(
+            "target_aggreg_loss", torch.tensor(0.0)
+        ).item()
+        total_context_patch += losses.get(
+            "context_patch_loss", torch.tensor(0.0)
+        ).item()
+        total_context_aggreg += losses.get(
+            "context_aggreg_loss", torch.tensor(0.0)
+        ).item()
 
         # Update progress bar
         n_batches = idx + 1
-        pbar.set_postfix({
-            "loss": f"{total_loss / n_batches:.4f}",
-            "dice": f"{total_final_dice / n_batches:.4f}",
-            "sdice": f"{total_final_softdice / n_batches:.4f}",
-        })
+        pbar.set_postfix(
+            {
+                "loss": f"{total_loss / n_batches:.4f}",
+                "dice": f"{total_final_dice / n_batches:.4f}",
+                "sdice": f"{total_final_softdice / n_batches:.4f}",
+            }
+        )
 
         # Log to wandb
         if use_wandb and is_main and idx % log_every == 0:
             global_step = epoch * len(train_loader) + idx
-            ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
-            ctx_softdice_avg = total_context_softdice / context_dice_count if context_dice_count > 0 else 0.0
-            wandb.log({
-                "train_batch/loss": total_loss / n_batches,
-                "train_batch/local_dice": total_local_dice / n_batches,
-                "train_batch/final_dice": total_final_dice / n_batches,
-                "train_batch/context_dice": ctx_dice_avg,
-                "train_batch/local_softdice": total_local_softdice / n_batches,
-                "train_batch/final_softdice": total_final_softdice / n_batches,
-                "train_batch/context_softdice": ctx_softdice_avg,
-                "train_batch/target_patch_loss": total_target_patch / n_batches,
-                "train_batch/target_aggreg_loss": total_target_aggreg / n_batches,
-                "train_batch/context_patch_loss": total_context_patch / n_batches,
-                "train_batch/context_aggreg_loss": total_context_aggreg / n_batches,
-                "global_step": global_step,
-            }, step=global_step)
+            ctx_dice_avg = (
+                total_context_dice / context_dice_count
+                if context_dice_count > 0
+                else 0.0
+            )
+            ctx_softdice_avg = (
+                total_context_softdice / context_dice_count
+                if context_dice_count > 0
+                else 0.0
+            )
+            wandb.log(
+                {
+                    "train_batch/loss": total_loss / n_batches,
+                    "train_batch/local_dice": total_local_dice / n_batches,
+                    "train_batch/final_dice": total_final_dice / n_batches,
+                    "train_batch/context_dice": ctx_dice_avg,
+                    "train_batch/local_softdice": total_local_softdice / n_batches,
+                    "train_batch/final_softdice": total_final_softdice / n_batches,
+                    "train_batch/context_softdice": ctx_softdice_avg,
+                    "train_batch/target_patch_loss": total_target_patch / n_batches,
+                    "train_batch/target_aggreg_loss": total_target_aggreg / n_batches,
+                    "train_batch/context_patch_loss": total_context_patch / n_batches,
+                    "train_batch/context_aggreg_loss": total_context_aggreg / n_batches,
+                    "global_step": global_step,
+                },
+                step=global_step,
+            )
 
         # Print progress
         if print_every and idx % print_every == 0 and is_main:
-            ctx_dice_avg = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
+            ctx_dice_avg = (
+                total_context_dice / context_dice_count
+                if context_dice_count > 0
+                else 0.0
+            )
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
                 f"Loss: {total_loss / n_batches:.5f} | "
@@ -475,16 +576,28 @@ def train_epoch(
             torch.cuda.empty_cache()
 
     n = len(train_loader)
-    ctx_dice_final = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
-    ctx_softdice_final = total_context_softdice / context_dice_count if context_dice_count > 0 else 0.0
-    label_avg_dice = {label_id: sum(scores) / len(scores) for label_id, scores in label_dice_scores.items()}
+    ctx_dice_final = (
+        total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
+    )
+    ctx_softdice_final = (
+        total_context_softdice / context_dice_count if context_dice_count > 0 else 0.0
+    )
+    label_avg_dice = {
+        label_id: sum(scores) / len(scores)
+        for label_id, scores in label_dice_scores.items()
+    }
 
     # Log one image per label to wandb
     if use_wandb and is_main and label_samples:
         _log_sample_images(label_samples, epoch, prefix="train")
 
     # Save train images to disk periodically
-    if save_dir is not None and is_main and label_samples and (epoch % save_every_n_epochs == 0):
+    if (
+        save_dir is not None
+        and is_main
+        and label_samples
+        and (epoch % save_every_n_epochs == 0)
+    ):
         _save_sample_images(label_samples, save_dir, epoch, prefix="train")
 
     return {
@@ -524,7 +637,9 @@ def validate(
     """Run validation."""
     model.eval()  # Keep train mode for BatchNorm consistency
     is_main = accelerator is None or accelerator.is_main_process
-    unwrapped_model = accelerator.unwrap_model(model) if accelerator is not None else model
+    unwrapped_model = (
+        accelerator.unwrap_model(model) if accelerator is not None else model
+    )
 
     total_loss = 0.0
     total_local_dice = 0.0
@@ -540,7 +655,13 @@ def validate(
     label_dice_scores = {}
     label_samples = {}  # Store one sample per label for wandb image logging
 
-    pbar = tqdm(val_loader, desc="Validating", disable=not is_main, unit="batch", dynamic_ncols=True)
+    pbar = tqdm(
+        val_loader,
+        desc="Validating",
+        disable=not is_main,
+        unit="batch",
+        dynamic_ncols=True,
+    )
 
     for batch_idx, batch in enumerate(pbar):
         images = batch["image"].to(device)
@@ -584,13 +705,19 @@ def validate(
         patch_labels_float = patch_labels.float()
         patch_labels_binary = (patch_labels > 0).float()
         # Hard dice
-        patch_intersection = (patch_pred_binary * patch_labels_binary).sum(dim=(1, 2, 3, 4))
-        patch_union = patch_pred_binary.sum(dim=(1, 2, 3, 4)) + patch_labels_binary.sum(dim=(1, 2, 3, 4))
+        patch_intersection = (patch_pred_binary * patch_labels_binary).sum(
+            dim=(1, 2, 3, 4)
+        )
+        patch_union = patch_pred_binary.sum(dim=(1, 2, 3, 4)) + patch_labels_binary.sum(
+            dim=(1, 2, 3, 4)
+        )
         local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
         total_local_dice += local_dice.mean().item()
         # Soft dice
         soft_intersection = (patch_probs * patch_labels_float).sum(dim=(1, 2, 3, 4))
-        soft_denom = patch_probs.sum(dim=(1, 2, 3, 4)) + patch_labels_float.sum(dim=(1, 2, 3, 4))
+        soft_denom = patch_probs.sum(dim=(1, 2, 3, 4)) + patch_labels_float.sum(
+            dim=(1, 2, 3, 4)
+        )
         local_softdice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
         total_local_softdice += local_softdice.mean().item()
 
@@ -600,7 +727,9 @@ def validate(
             level_pred = level_outputs[-1]["pred"]
             level_res = level_pred.shape[-1]
             scale_factor = labels.shape[-1] // level_res
-            labels_ds = F.max_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
+            labels_ds = F.max_pool2d(
+                labels.float(), kernel_size=scale_factor, stride=scale_factor
+            )
             pred_probs = torch.sigmoid(level_pred)
             pred_binary = (pred_probs > 0.5).float()
             labels_float = labels_ds
@@ -618,18 +747,28 @@ def validate(
         total_final_dice += final_dice.mean().item()
         # Soft dice
         soft_inter = (pred_probs * labels_float).sum(dim=spatial_dims)
-        soft_denom = pred_probs.sum(dim=spatial_dims) + labels_float.sum(dim=spatial_dims)
+        soft_denom = pred_probs.sum(dim=spatial_dims) + labels_float.sum(
+            dim=spatial_dims
+        )
         final_softdice = (2 * soft_inter + 1e-6) / (soft_denom + 1e-6)
         total_final_softdice += final_softdice.mean().item()
 
         # Per-case tracking
         batch_case_ids = batch.get("case_id", [None] * images.shape[0])
-        batch_label_ids = batch.get("label_ids") or batch.get("label_id", [None] * images.shape[0])
+        batch_label_ids = batch.get("label_ids") or batch.get(
+            "label_id", [None] * images.shape[0]
+        )
         for i in range(images.shape[0]):
-            case_id = batch_case_ids[i] if batch_case_ids else f"batch{batch_idx}_sample{i}"
+            case_id = (
+                batch_case_ids[i] if batch_case_ids else f"batch{batch_idx}_sample{i}"
+            )
             label_id = batch_label_ids[i] if batch_label_ids else "unknown"
-            dice_val = final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
-            case_results.append({"case_id": case_id, "label_id": label_id, "dice": dice_val})
+            dice_val = (
+                final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
+            )
+            case_results.append(
+                {"case_id": case_id, "label_id": label_id, "dice": dice_val}
+            )
             if label_id not in label_dice_scores:
                 label_dice_scores[label_id] = []
             label_dice_scores[label_id].append(dice_val)
@@ -657,8 +796,14 @@ def validate(
                     "pred": pred_binary[i].detach().cpu(),
                     "pred_probs": pred_probs[i].detach().cpu(),
                     "dice": dice_val,
-                    "context_in": context_in[i].detach().cpu() if context_in is not None else None,
-                    "context_out": context_out[i].detach().cpu() if context_out is not None else None,
+                    "context_in": (
+                        context_in[i].detach().cpu() if context_in is not None else None
+                    ),
+                    "context_out": (
+                        context_out[i].detach().cpu()
+                        if context_out is not None
+                        else None
+                    ),
                     "target_coords": target_coords,
                     "context_coords": context_coords,
                     "patch_size": patch_size,
@@ -675,29 +820,44 @@ def validate(
                 ctx_labels_float = context_labels.float()
                 ctx_labels_binary = (context_labels > 0).float()
                 # Hard dice
-                ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(dim=(2, 3, 4))
-                ctx_union = ctx_pred_binary.sum(dim=(2, 3, 4)) + ctx_labels_binary.sum(dim=(2, 3, 4))
+                ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(
+                    dim=(2, 3, 4)
+                )
+                ctx_union = ctx_pred_binary.sum(dim=(2, 3, 4)) + ctx_labels_binary.sum(
+                    dim=(2, 3, 4)
+                )
                 ctx_dice = (2 * ctx_intersection + 1e-6) / (ctx_union + 1e-6)
                 total_context_dice += ctx_dice.mean().item()
                 # Soft dice
                 ctx_soft_inter = (ctx_probs * ctx_labels_float).sum(dim=(2, 3, 4))
-                ctx_soft_denom = ctx_probs.sum(dim=(2, 3, 4)) + ctx_labels_float.sum(dim=(2, 3, 4))
+                ctx_soft_denom = ctx_probs.sum(dim=(2, 3, 4)) + ctx_labels_float.sum(
+                    dim=(2, 3, 4)
+                )
                 ctx_softdice = (2 * ctx_soft_inter + 1e-6) / (ctx_soft_denom + 1e-6)
                 total_context_softdice += ctx_softdice.mean().item()
                 context_dice_count += 1
 
         # Update progress bar
         n_batches = batch_idx + 1
-        pbar.set_postfix({
-            "loss": f"{total_loss / n_batches:.4f}",
-            "dice": f"{total_final_dice / n_batches:.4f}",
-            "sdice": f"{total_final_softdice / n_batches:.4f}",
-        })
+        pbar.set_postfix(
+            {
+                "loss": f"{total_loss / n_batches:.4f}",
+                "dice": f"{total_final_dice / n_batches:.4f}",
+                "sdice": f"{total_final_softdice / n_batches:.4f}",
+            }
+        )
 
     n = len(val_loader)
-    ctx_dice_final = total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
-    ctx_softdice_final = total_context_softdice / context_dice_count if context_dice_count > 0 else 0.0
-    label_avg_dice = {label_id: sum(scores) / len(scores) for label_id, scores in label_dice_scores.items()}
+    ctx_dice_final = (
+        total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
+    )
+    ctx_softdice_final = (
+        total_context_softdice / context_dice_count if context_dice_count > 0 else 0.0
+    )
+    label_avg_dice = {
+        label_id: sum(scores) / len(scores)
+        for label_id, scores in label_dice_scores.items()
+    }
 
     # Log one image per label to wandb
     if use_wandb and is_main and label_samples:
@@ -705,7 +865,13 @@ def validate(
 
     # Save images to disk if save_dir is provided
     if save_dir is not None and is_main and label_samples:
-        _save_sample_images(label_samples, save_dir, epoch, prefix="val", max_samples=max_save_batches * 4)
+        _save_sample_images(
+            label_samples,
+            save_dir,
+            epoch,
+            prefix="val",
+            max_samples=max_save_batches * 4,
+        )
 
     detailed_results = {
         "per_case": case_results,
@@ -715,4 +881,10 @@ def validate(
         "context_softdice": ctx_softdice_final,
     }
 
-    return total_loss / n, total_local_dice / n, total_final_dice / n, ctx_dice_final, detailed_results
+    return (
+        total_loss / n,
+        total_local_dice / n,
+        total_final_dice / n,
+        ctx_dice_final,
+        detailed_results,
+    )
