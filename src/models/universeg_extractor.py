@@ -6,15 +6,22 @@ A dummy support (zeros) is passed so features are computed per-image.
 
 Features:
 - Input: Grayscale images resized to 128x128, normalized to [0, 1]
-- Output: [B, N, D] where D = 64 (UniverSeg channel width)
-- N depends on layer_idx:
+- Single layer: [B, N, D] where D = 64
+- Multi-layer:  [B, N, D*L] where L = number of layers, all resized to output_grid_size
+- N depends on output_grid_size (or native size of chosen layer):
     layer 0: 128x128 = 16384
     layer 1:  64x64  = 4096
     layer 2:  32x32  = 1024
     layer 3:  16x16  = 256  (bottleneck)
 
 Usage:
+    # Single layer
     extractor = UniverSegExtractor(layer_idx=3, device="cuda")
+    # All layers concatenated
+    extractor = UniverSegExtractor(layer_idx="all", output_grid_size=8, device="cuda")
+    # Specific layers
+    extractor = UniverSegExtractor(layer_idx=[1, 2, 3], output_grid_size=8, device="cuda")
+
     target_features, context_features = extractor.extract_batch(
         target_images, context_images
     )
@@ -22,7 +29,7 @@ Usage:
 from __future__ import annotations
 
 import sys
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -33,6 +40,16 @@ UNIVERSEG_REPO = "/work/dlclarge2/ndirt-SegFM3D/repos/UniverSeg"
 
 # Grid sizes per encoder layer
 LAYER_GRID_SIZES = {0: 128, 1: 64, 2: 32, 3: 16}
+NUM_ENCODER_LAYERS = 4
+
+
+def _parse_layer_idx(layer_idx) -> List[int]:
+    """Parse layer_idx into a sorted list of layer indices."""
+    if layer_idx == "all":
+        return list(range(NUM_ENCODER_LAYERS))
+    if isinstance(layer_idx, (list, tuple)):
+        return sorted(int(i) for i in layer_idx)
+    return [int(layer_idx)]
 
 
 class UniverSegExtractor(nn.Module):
@@ -42,19 +59,23 @@ class UniverSegExtractor(nn.Module):
     support (zeros) is passed so the cross-conv sees no real context.
 
     Args:
-        layer_idx: Encoder block to extract from (0-3). Default 3 (bottleneck).
+        layer_idx: Encoder block(s) to extract from. Options:
+            - int (0-3): single layer (default 3 = bottleneck)
+            - "all": all 4 layers, concatenated along feature dim
+            - list of ints: specific layers, concatenated along feature dim
         device: Device for computation.
         pretrained: Load pretrained weights.
         freeze: Freeze all model weights.
-        output_grid_size: Resize features to this grid. None = native.
+        output_grid_size: Resize features to this grid. None = native (single-layer only).
+            Required when using multiple layers since they have different native sizes.
     """
 
     INPUT_SIZE = 128  # UniverSeg expects 128x128
-    FEATURE_DIM = 64  # All encoder blocks output 64 channels
+    FEATURE_DIM_PER_LAYER = 64  # Each encoder block outputs 64 channels
 
     def __init__(
         self,
-        layer_idx: int = 3,
+        layer_idx: Union[int, str, List[int]] = 3,
         device: Union[str, torch.device] = "cuda",
         pretrained: bool = True,
         freeze: bool = True,
@@ -62,12 +83,26 @@ class UniverSegExtractor(nn.Module):
     ):
         super().__init__()
         self.device = torch.device(device) if isinstance(device, str) else device
-        self.layer_idx = layer_idx
-        self.feature_dim = self.FEATURE_DIM
 
-        # Native grid size for chosen layer
-        self.native_grid_size = LAYER_GRID_SIZES[layer_idx]
-        self.output_grid_size = output_grid_size or self.native_grid_size
+        # Parse layer indices
+        self.layer_indices = _parse_layer_idx(layer_idx)
+        self.multi_layer = len(self.layer_indices) > 1
+        self.feature_dim = self.FEATURE_DIM_PER_LAYER * len(self.layer_indices)
+
+        # For backwards compat, expose single layer_idx when not multi-layer
+        self.layer_idx = self.layer_indices[0] if not self.multi_layer else self.layer_indices
+
+        # Determine output grid size
+        if self.multi_layer:
+            if output_grid_size is None:
+                # Default: use the smallest native grid among selected layers
+                output_grid_size = min(LAYER_GRID_SIZES[i] for i in self.layer_indices)
+            self.native_grid_size = None  # No single native size
+        else:
+            self.native_grid_size = LAYER_GRID_SIZES[self.layer_indices[0]]
+            if output_grid_size is None:
+                output_grid_size = self.native_grid_size
+        self.output_grid_size = output_grid_size
 
         # Load UniverSeg model
         self._load_model(pretrained)
@@ -78,18 +113,9 @@ class UniverSegExtractor(nn.Module):
             self.model.eval()
         self._frozen = freeze
 
-        # Resize layer if output differs from native
-        if self.output_grid_size == self.native_grid_size:
-            self.resize = None
-        elif self.output_grid_size < self.native_grid_size:
-            self.resize = nn.AdaptiveAvgPool2d(
-                (self.output_grid_size, self.output_grid_size)
-            )
-        else:
-            self.resize = "upsample"
-
-        print(f"UniverSeg extractor: layer={layer_idx}, "
-              f"native={self.native_grid_size}x{self.native_grid_size}, "
+        layers_str = "all" if layer_idx == "all" else self.layer_indices
+        print(f"UniverSeg extractor: layers={layers_str}, "
+              f"feature_dim={self.feature_dim}, "
               f"output={self.output_grid_size}x{self.output_grid_size}")
 
     def _load_model(self, pretrained: bool):
@@ -107,15 +133,28 @@ class UniverSegExtractor(nn.Module):
             self.model.eval()
         return self
 
+    def _resize_feat(self, feat: torch.Tensor) -> torch.Tensor:
+        """Resize feature map to output_grid_size."""
+        _, _, H, W = feat.shape
+        if H == self.output_grid_size and W == self.output_grid_size:
+            return feat
+        if self.output_grid_size < H:
+            return F.adaptive_avg_pool2d(feat, (self.output_grid_size, self.output_grid_size))
+        return F.interpolate(
+            feat, size=(self.output_grid_size, self.output_grid_size),
+            mode="bilinear", align_corners=False,
+        )
+
     @torch.no_grad()
     def extract_features(self, images: torch.Tensor) -> torch.Tensor:
-        """Extract features from encoder block via forward hook.
+        """Extract features from encoder block(s) via forward hooks.
 
         Args:
             images: [B, 1, H, W] grayscale images, normalized to [0, 1]
 
         Returns:
-            features: [B, N, D] where N = output_grid_size^2, D = 64
+            features: [B, N, D] where N = output_grid_size^2,
+                      D = 64 (single layer) or 64*L (multi-layer concat)
         """
         was_training = self.model.training
         self.model.eval()
@@ -141,39 +180,38 @@ class UniverSegExtractor(nn.Module):
         support_labels = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
                                      device=device)
 
-        # Register hook to capture features at target layer
+        # Register hooks to capture features at each requested layer
         captured = {}
+        handles = []
 
-        def hook_fn(module, input, output):
-            target, support = output
-            # target: [B, 1, C, H, W] -> squeeze group dim -> [B, C, H, W]
-            captured["features"] = target[:, 0]
+        def make_hook(layer_id):
+            def hook_fn(module, input, output):
+                target, support = output
+                captured[layer_id] = target[:, 0]  # [B, C, H, W]
+            return hook_fn
 
-        handle = self.model.enc_blocks[self.layer_idx].register_forward_hook(hook_fn)
+        for lid in self.layer_indices:
+            h = self.model.enc_blocks[lid].register_forward_hook(make_hook(lid))
+            handles.append(h)
 
         # Forward pass (output is discarded, we only want the hooked features)
         self.model(images, support_images, support_labels)
 
-        handle.remove()
+        for h in handles:
+            h.remove()
 
-        # features: [B, C, H, W]
-        feat = captured["features"]
+        # Collect and resize features from each layer
+        feat_list = []
+        for lid in self.layer_indices:
+            feat = self._resize_feat(captured[lid])  # [B, 64, G, G]
+            feat_list.append(feat)
 
-        # Resize if needed
-        if self.resize is not None:
-            if self.resize == "upsample":
-                feat = F.interpolate(
-                    feat,
-                    size=(self.output_grid_size, self.output_grid_size),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            else:
-                feat = self.resize(feat)
+        # Concatenate along channel dim: [B, 64*L, G, G]
+        feat = torch.cat(feat_list, dim=1)
 
-        # [B, C, H, W] -> [B, H*W, C] = [B, N, D]
-        B, C, H, W = feat.shape
-        features = feat.reshape(B, C, H * W).permute(0, 2, 1)
+        # [B, D, G, G] -> [B, G*G, D] = [B, N, D]
+        B, D, G, _ = feat.shape
+        features = feat.reshape(B, D, G * G).permute(0, 2, 1)
 
         if was_training and not self._frozen:
             self.model.train()
@@ -214,14 +252,16 @@ class UniverSegExtractor(nn.Module):
     def get_feature_info(self) -> dict:
         """Get information about extracted features."""
         grid = self.output_grid_size
-        native = self.native_grid_size
         return {
             "extractor": "universeg",
+            "layer_indices": self.layer_indices,
             "layer_idx": self.layer_idx,
+            "multi_layer": self.multi_layer,
             "feature_dim": self.feature_dim,
+            "feature_dim_per_layer": self.FEATURE_DIM_PER_LAYER,
+            "num_layers": len(self.layer_indices),
             "input_size": self.INPUT_SIZE,
-            "native_grid_size": native,
+            "native_grid_size": self.native_grid_size,
             "output_grid_size": grid,
             "num_tokens": grid * grid,
-            "resized": grid != native,
         }

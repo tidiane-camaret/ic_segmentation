@@ -122,7 +122,7 @@ model:
     feature_extractor:
       type: "universeg"
       checkpoint_path: "/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/checkpoints/medsam_vit_b.pth"
-      layer_idx: 3
+      layer_idx: "all"  # "all", single int (0-3), or list [1,2,3]. "all" → D=256 (64*4 layers)
       freeze: true
       target_size: 128
       output_grid_size: 8
@@ -153,7 +153,7 @@ model:
     backbone:
       decoder_use_skip_connections: true
       image_size: 256
-      embed_dim: 64
+      embed_dim: 256  # Must match feature_extractor output dim (64 * num_layers)
       embed_proj_dim: 64
       feature_grid_size: 8
       patch_feature_grid_size: 8  # Must match patch_size

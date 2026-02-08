@@ -237,7 +237,8 @@ def main(cfg: DictConfig) -> None:
             )
             if accelerator.is_main_process:
                 info = feature_extractor.get_feature_info()
-                print(f"Feature mode: on_the_fly (UniverSeg layer {info['layer_idx']}, grid={info['output_grid_size']})")
+                print(f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
+                      f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
         else:
             raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
     else:

@@ -172,6 +172,21 @@ def main(cfg: DictConfig) -> None:
                     print(f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, "
                           f"input={info['target_size']}×{info['target_size']}, "
                           f"grid={info['output_grid_size']}×{info['output_grid_size']})")
+            elif extractor_type == "universeg":
+                from src.models.universeg_extractor import UniverSegExtractor
+                if accelerator.is_main_process:
+                    print("Initializing UniverSeg for on-the-fly feature extraction...")
+                feature_extractor = UniverSegExtractor(
+                    layer_idx=fe_cfg.get("layer_idx", 3) if fe_cfg else 3,
+                    device=device,
+                    pretrained=fe_cfg.get("pretrained", True) if fe_cfg else True,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                )
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
+                          f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
             else:
                 raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
         else:
