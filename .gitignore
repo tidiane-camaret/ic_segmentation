@@ -22,3 +22,4 @@ results/patchicl_attention.ipynb
 results/register_tokens_data.npz
 
 .claude/.nfs000000a80614b680000451b6
+results/totalseg2d_patch_icl_eval/

@@ -21,68 +21,6 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _log_sample_images(label_samples: dict, epoch: int, prefix: str = "train") -> None:
-    """Log one image + prediction per label to wandb."""
-    try:
-        import wandb
-    except ImportError:
-        return
-
-    wandb_images = []
-    for label_id, sample in label_samples.items():
-        img = sample["image"]  # [C, H, W]
-        label = sample["label"]  # [1, H, W] or [C, H, W]
-        pred = sample["pred"]  # [1, H, W] or [C, H, W]
-        dice = sample["dice"]
-
-        # Convert image to [H, W, C] for wandb (handle grayscale and RGB)
-        if img.shape[0] == 1:
-            # Grayscale: repeat to RGB
-            img_np = img.squeeze(0).numpy()
-            img_np = np.stack([img_np, img_np, img_np], axis=-1)
-        elif img.shape[0] == 3:
-            img_np = img.permute(1, 2, 0).numpy()
-        else:
-            # Take first 3 channels or first channel
-            img_np = (
-                img[:3].permute(1, 2, 0).numpy()
-                if img.shape[0] >= 3
-                else img[0].numpy()
-            )
-            if img_np.ndim == 2:
-                img_np = np.stack([img_np, img_np, img_np], axis=-1)
-
-        # Normalize to [0, 255]
-        img_np = (
-            (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8) * 255
-        ).astype(np.uint8)
-
-        # Get mask data (take first channel if multi-channel)
-        gt_mask = (label[0].numpy() > 0).astype(np.uint8)
-        pred_mask = (pred[0].numpy() > 0).astype(
-            np.uint8
-        ) * 2  # Use 2 for pred to distinguish
-
-        wandb_img = wandb.Image(
-            img_np,
-            masks={
-                "ground_truth": {
-                    "mask_data": gt_mask,
-                    "class_labels": {0: "background", 1: "foreground"},
-                },
-                "prediction": {
-                    "mask_data": pred_mask,
-                    "class_labels": {0: "background", 2: "prediction"},
-                },
-            },
-            caption=f"{label_id} (dice={dice:.3f})",
-        )
-        wandb_images.append(wandb_img)
-
-    if wandb_images:
-        wandb.log({f"{prefix}/samples": wandb_images, "epoch": epoch})
-
-
 def _save_sample_images(
     label_samples: dict,
     save_dir: Path,
@@ -162,38 +100,25 @@ def _save_sample_images(
         level_res = sample.get("level_res", 32)
 
         n_ctx = ctx_in.shape[0] if ctx_in is not None else 0
-        n_rows = 1 + (1 if n_ctx > 0 else 0)
+        n_cols = max(1 + n_ctx, 4)
 
-        fig, axes = plt.subplots(n_rows, 4, figsize=(16, 4 * n_rows))
-        if n_rows == 1:
-            axes = [axes]
+        fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 8))
 
+        # --- Top row: target + context images with patch boxes & GT overlay ---
         axes[0][0].imshow(img, cmap="gray")
+        axes[0][0].imshow(gt, cmap="Reds", alpha=0.3)
         if target_coords is not None and level_res is not None:
             draw_patch_boxes(
-                axes[0][0], img, target_coords, patch_size, level_res, color="red"
+                axes[0][0], img, target_coords, patch_size, level_res, color="lime"
             )
-        axes[0][0].set_title("Target + Patches")
+        axes[0][0].set_title("Target")
         axes[0][0].axis("off")
 
-        axes[0][1].imshow(gt, cmap="gray")
-        axes[0][1].set_title("Ground Truth")
-        axes[0][1].axis("off")
-
-        axes[0][2].imshow(pred, cmap="gray")
-        axes[0][2].set_title(f"Prediction (dice={dice:.3f})")
-        axes[0][2].axis("off")
-
-        if pred_heatmap is not None:
-            im = axes[0][3].imshow(pred_heatmap, cmap="hot", vmin=0, vmax=1)
-            axes[0][3].set_title("Prediction Heatmap")
-            plt.colorbar(im, ax=axes[0][3], fraction=0.046, pad=0.04)
-        axes[0][3].axis("off")
-
-        if n_ctx > 0 and n_rows > 1:
-            ctx_img = ctx_in[0].squeeze().numpy()
-            ctx_mask = ctx_out[0].squeeze().numpy()
-            axes[1][0].imshow(ctx_img, cmap="gray")
+        for ci in range(n_ctx):
+            ctx_img = ctx_in[ci].squeeze().numpy()
+            ctx_mask = ctx_out[ci].squeeze().numpy()
+            axes[0][1 + ci].imshow(ctx_img, cmap="gray")
+            axes[0][1 + ci].imshow(ctx_mask, cmap="Reds", alpha=0.3)
             if (
                 context_coords is not None
                 and level_res is not None
@@ -202,50 +127,51 @@ def _save_sample_images(
                 try:
                     total_patches = context_coords.shape[0]
                     K_per_ctx = total_patches // n_ctx
-                    ctx1_coords = context_coords[:K_per_ctx]
+                    ci_coords = context_coords[ci * K_per_ctx : (ci + 1) * K_per_ctx]
                     draw_patch_boxes(
-                        axes[1][0],
-                        ctx_img,
-                        ctx1_coords,
-                        patch_size,
-                        level_res,
-                        color="cyan",
+                        axes[0][1 + ci], ctx_img, ci_coords,
+                        patch_size, level_res, color="cyan",
                     )
                 except (IndexError, TypeError, ZeroDivisionError):
                     pass
-            axes[1][0].set_title("Context 1 + Patches")
-            axes[1][0].axis("off")
+            axes[0][1 + ci].set_title(f"Context {ci + 1}")
+            axes[0][1 + ci].axis("off")
 
-            axes[1][1].imshow(ctx_mask, cmap="gray")
-            axes[1][1].set_title("Context 1 Mask")
-            axes[1][1].axis("off")
+        for j in range(1 + n_ctx, n_cols):
+            axes[0][j].axis("off")
 
-            if n_ctx > 1:
-                ctx_img2 = ctx_in[1].squeeze().numpy()
-                ctx_mask2 = ctx_out[1].squeeze().numpy()
-                axes[1][2].imshow(ctx_img2, cmap="gray")
-                axes[1][2].imshow(ctx_mask2, cmap="Reds", alpha=0.4)
-                if context_coords is not None and context_coords.ndim == 2:
-                    try:
-                        total_patches = context_coords.shape[0]
-                        K_per_ctx = total_patches // n_ctx
-                        ctx2_coords = context_coords[K_per_ctx : 2 * K_per_ctx]
-                        draw_patch_boxes(
-                            axes[1][2],
-                            ctx_img2,
-                            ctx2_coords,
-                            patch_size,
-                            level_res,
-                            color="cyan",
-                        )
-                    except (IndexError, TypeError, ZeroDivisionError):
-                        pass
-                axes[1][2].set_title("Context 2 + Mask")
-                axes[1][2].axis("off")
-            else:
-                axes[1][2].axis("off")
-            axes[1][3].axis("off")
+        # --- Bottom row: GT mask | Downsized GT | Pred heatmap | Pred mask ---
+        axes[1][0].imshow(gt, cmap="gray")
+        axes[1][0].set_title("GT Mask")
+        axes[1][0].axis("off")
 
+        # Downsized GT (avg-pool to level resolution, matches training metric)
+        if level_res is not None and level_res < gt.shape[0]:
+            gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
+            scale = max(1, gt.shape[0] // level_res)
+            gt_ds = F.avg_pool2d(gt_t, kernel_size=scale, stride=scale).squeeze().numpy()
+        else:
+            gt_ds = gt
+        axes[1][1].imshow(gt_ds, cmap="gray")
+        axes[1][1].set_title(f"GT Downsized ({gt_ds.shape[0]}x{gt_ds.shape[1]})")
+        axes[1][1].axis("off")
+
+        if pred_heatmap is not None:
+            im = axes[1][2].imshow(pred_heatmap, cmap="hot", vmin=0, vmax=1)
+            axes[1][2].set_title("Pred Heatmap")
+            plt.colorbar(im, ax=axes[1][2], fraction=0.046, pad=0.04)
+        else:
+            axes[1][2].set_title("Pred Heatmap (N/A)")
+        axes[1][2].axis("off")
+
+        axes[1][3].imshow(pred, cmap="gray")
+        axes[1][3].set_title(f"Pred Mask (dice={dice:.3f})")
+        axes[1][3].axis("off")
+
+        for j in range(4, n_cols):
+            axes[1][j].axis("off")
+
+        fig.suptitle(label_id, fontsize=12, y=1.01)
         fig.tight_layout()
         safe_label = label_id.replace("/", "_")
         save_path = epoch_dir / f"{safe_label}.png"
@@ -594,10 +520,6 @@ def train_epoch(
         for label_id, scores in label_dice_scores.items()
     }
 
-    # Log one image per label to wandb
-    if use_wandb and is_main and label_samples:
-        _log_sample_images(label_samples, epoch, prefix="train")
-
     # Save train images to disk periodically
     if (
         save_dir is not None
@@ -767,16 +689,18 @@ def validate(
         batch_label_ids = batch.get("label_ids") or batch.get(
             "label_id", [None] * images.shape[0]
         )
+        batch_axes = batch.get("axes", [None] * images.shape[0])
         for i in range(images.shape[0]):
             case_id = (
                 batch_case_ids[i] if batch_case_ids else f"batch{batch_idx}_sample{i}"
             )
             label_id = batch_label_ids[i] if batch_label_ids else "unknown"
+            axis = batch_axes[i] if batch_axes else None
             dice_val = (
                 final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
             )
             case_results.append(
-                {"case_id": case_id, "label_id": label_id, "dice": dice_val}
+                {"case_id": case_id, "label_id": label_id, "axis": axis, "dice": dice_val}
             )
             if label_id not in label_dice_scores:
                 label_dice_scores[label_id] = []
@@ -868,9 +792,6 @@ def validate(
         for label_id, scores in label_dice_scores.items()
     }
 
-    # Log one image per label to wandb
-    if use_wandb and is_main and label_samples:
-        _log_sample_images(label_samples, epoch, prefix="val")
 
     # Save images to disk if save_dir is provided
     if save_dir is not None and is_main and label_samples:

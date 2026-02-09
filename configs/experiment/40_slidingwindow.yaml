@@ -28,6 +28,7 @@ medsegbench:
     - cystoidfluid       # OCT - macular edema
     - monusac            # Pathology - multi-organ (5-class)
     - tnbcnuclei         # Pathology - histopathology nuclei
+
   val_datasets:  # 8 datasets, ~4.5K val-split images
     - busi               # Ultrasound - breast lesions
     - covidquex          # Chest X-Ray - lung
@@ -37,12 +38,13 @@ medsegbench:
     - wbc                # Microscopy - WBC (3-class)
     - drive              # Fundus - retinal vessels
     - nuclei             # Pathology - cell nuclei
+    
   max_samples_per_dataset: null  # Limit per dataset (for debugging)
 
 
 paths:
   ckpts:
-    #patch_icl_v2: ${..RESULTS_DIR}/checkpoints/best_model_06_02_26_2.pt
+    patch_icl_v2: ${..RESULTS_DIR}/checkpoints/radiant-salad-168/best_model.pt
 
 logging:
   use_wandb: true
@@ -125,10 +127,10 @@ model:
       layer_idx: "all"  # "all", single int (0-3), or list [1,2,3]. "all" → D=256 (64*4 layers)
       freeze: true
       target_size: 128
-      output_grid_size: 16
+      output_grid_size: 32
 
     levels:
-      - resolution: 16
+      - resolution: 32
         patch_size: 8
         num_patches: 16  # Used by continuous sampler
         sampling_temperature: 0.1
@@ -151,11 +153,11 @@ model:
       min_coverage: 1e-6
 
     backbone:
-      decoder_use_skip_connections: true
+      decoder_use_skip_connections: false
       image_size: 256
       embed_dim: 256  # Must match feature_extractor output dim (64 * num_layers)
       embed_proj_dim: 64
-      feature_grid_size: 16
+      feature_grid_size: 32
       patch_feature_grid_size: 8  # Must match patch_size
       num_heads: 8
       num_layers: 4
@@ -174,7 +176,7 @@ model:
         default:
           target_patch: 1.0
           target_aggreg: 1.0
-          context_patch: 0.5  # Enabled context loss
-          context_aggreg: 0.5  # Enabled context loss
+          context_patch: 0  # Enabled context loss
+          context_aggreg: 0  # Enabled context loss
 
 

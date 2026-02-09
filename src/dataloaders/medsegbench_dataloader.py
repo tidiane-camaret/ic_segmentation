@@ -14,7 +14,14 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from src.dataloaders.augmentations import create_augmentation_transforms
+from src.dataloaders.augmentations import (
+    create_augmentation_transforms,
+    carve_mix_2d,
+    foreground_random_crop,
+    perturb_mask,
+    degrade_resolution,
+    random_intensity_shift,
+)
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -59,6 +66,10 @@ class MedSegBenchDataset(Dataset):
         augment: bool = False,
         augment_config: Optional[Dict] = None,
         max_samples_per_dataset: Optional[int] = None,
+        carve_mix: bool = False,
+        carve_mix_config: Optional[Dict] = None,
+        advanced_augmentation: bool = False,
+        advanced_augmentation_config: Optional[Dict] = None,
     ):
         self.data_root = data_root
         self.split = split
@@ -85,6 +96,39 @@ class MedSegBenchDataset(Dataset):
             self.augment = False
             self.spatial_transform = None
             self.intensity_transform = None
+
+        # Setup CarveMix
+        self.carve_mix = carve_mix
+        cm_cfg = carve_mix_config or {}
+        self.carve_mix_p = cm_cfg.get("probability", 0.5)
+        self.carve_mix_margin_range = tuple(cm_cfg.get("margin_range", [0.1, 0.5]))
+        self.carve_mix_harmonize = cm_cfg.get("harmonize", True)
+        self.carve_mix_harmonize_sigma = cm_cfg.get("harmonize_sigma", 5.0)
+        if self.carve_mix:
+            print(f"CarveMix enabled: p={self.carve_mix_p}, margin={self.carve_mix_margin_range}, "
+                  f"harmonize={self.carve_mix_harmonize}, sigma={self.carve_mix_harmonize_sigma}")
+
+        # Setup advanced augmentation
+        self.advanced_augmentation = advanced_augmentation
+        adv = advanced_augmentation_config or {}
+        fg = adv.get("foreground_crop", {})
+        self.adv_fg_crop_p = fg.get("probability", 0.3)
+        self.adv_fg_crop_min = fg.get("min_crop_frac", 0.5)
+        mp = adv.get("mask_perturbation", {})
+        self.adv_mask_perturb_p = mp.get("probability", 0.3)
+        self.adv_mask_perturb_kernel = mp.get("max_kernel", 5)
+        rd = adv.get("resolution_degradation", {})
+        self.adv_degrade_p = rd.get("probability", 0.2)
+        self.adv_degrade_min_scale = rd.get("min_scale", 0.25)
+        ai = adv.get("asymmetric_intensity", {})
+        self.adv_asym_p = ai.get("probability", 0.5)
+        self.adv_asym_brightness = ai.get("brightness_shift", 0.15)
+        self.adv_asym_contrast = ai.get("contrast_scale", 0.15)
+        self.adv_asym_gamma = tuple(ai.get("gamma_range", [0.7, 1.5]))
+        if self.advanced_augmentation:
+            print(f"Advanced augmentation enabled: "
+                  f"fg_crop_p={self.adv_fg_crop_p}, mask_perturb_p={self.adv_mask_perturb_p}, "
+                  f"degrade_p={self.adv_degrade_p}, asym_intensity_p={self.adv_asym_p}")
 
         # Find dataset files
         if datasets is None:
@@ -282,6 +326,103 @@ class MedSegBenchDataset(Dataset):
         k = min(k, len(candidates))
         return random.sample(candidates, k)
 
+    def _load_carve_mix_donor(
+        self, ds_name: str, label_value: int, exclude_indices: List[int],
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Load a random donor image/mask for CarveMix from same dataset+label."""
+        candidates = self.label_to_samples.get(label_value, [])
+        exclude_set = set(exclude_indices)
+        candidates = [
+            (ds, idx) for ds, idx in candidates
+            if ds == ds_name and idx not in exclude_set
+        ]
+        if not candidates:
+            return None
+
+        random.shuffle(candidates)
+        for donor_ds, donor_idx in candidates[:3]:
+            try:
+                donor_img = self.data[donor_ds]["images"][donor_idx]
+                donor_mask = self.data[donor_ds]["labels"][donor_idx]
+                donor_img = self._to_grayscale(donor_img)
+                donor_img = self._normalize_image(donor_img)
+                donor_binary = self._create_binary_mask(donor_mask, label_value)
+                if donor_binary.max() == 0:
+                    continue
+                donor_img = self._resize(donor_img, mode="bilinear")
+                donor_binary = self._resize(donor_binary, mode="nearest")
+                return donor_img, donor_binary
+            except Exception:
+                continue
+        return None
+
+    def _apply_carve_mix(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        ds_name: str,
+        label_value: int,
+        exclude_indices: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Conditionally apply CarveMix to target based on probability."""
+        if not self.carve_mix or random.random() > self.carve_mix_p:
+            return target_img, target_mask
+
+        donor = self._load_carve_mix_donor(ds_name, label_value, exclude_indices)
+        if donor is None:
+            return target_img, target_mask
+
+        donor_img, donor_mask = donor
+        return carve_mix_2d(
+            target_img, target_mask, donor_img, donor_mask,
+            margin_range=self.carve_mix_margin_range,
+            harmonize=self.carve_mix_harmonize,
+            harmonize_sigma=self.carve_mix_harmonize_sigma,
+        )
+
+    def _apply_advanced_augmentation(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        context_imgs: Optional[List[np.ndarray]] = None,
+        context_masks: Optional[List[np.ndarray]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[List[np.ndarray]], Optional[List[np.ndarray]]]:
+        """Apply post-resize advanced augmentations.
+
+        Asymmetric intensity and resolution degradation are applied independently
+        per image. Context masks get morphological perturbation.
+        """
+        if not self.advanced_augmentation:
+            return target_img, target_mask, context_imgs, context_masks
+
+        # Asymmetric intensity (different random params per image)
+        if random.random() < self.adv_asym_p:
+            target_img = random_intensity_shift(
+                target_img, self.adv_asym_brightness, self.adv_asym_contrast, self.adv_asym_gamma
+            )
+        if context_imgs:
+            for i in range(len(context_imgs)):
+                if random.random() < self.adv_asym_p:
+                    context_imgs[i] = random_intensity_shift(
+                        context_imgs[i], self.adv_asym_brightness, self.adv_asym_contrast, self.adv_asym_gamma
+                    )
+
+        # Resolution degradation (independent per image)
+        if random.random() < self.adv_degrade_p:
+            target_img = degrade_resolution(target_img, self.adv_degrade_min_scale)
+        if context_imgs:
+            for i in range(len(context_imgs)):
+                if random.random() < self.adv_degrade_p:
+                    context_imgs[i] = degrade_resolution(context_imgs[i], self.adv_degrade_min_scale)
+
+        # Context mask perturbation (context only - target mask is GT)
+        if context_masks:
+            for i in range(len(context_masks)):
+                if random.random() < self.adv_mask_perturb_p:
+                    context_masks[i] = perturb_mask(context_masks[i], self.adv_mask_perturb_kernel)
+
+        return target_img, target_mask, context_imgs, context_masks
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a sample with context examples.
@@ -320,6 +461,12 @@ class MedSegBenchDataset(Dataset):
         # Create binary mask for sampled label
         target_binary = self._create_binary_mask(target_mask, label_value)
 
+        # Foreground random crop (before resize, ensures FG stays visible)
+        if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
+            target_img, target_binary = foreground_random_crop(
+                target_img, target_binary, self.adv_fg_crop_min
+            )
+
         # Resize
         target_img = self._resize(target_img, mode="bilinear")
         target_binary = self._resize(target_binary, mode="nearest")
@@ -339,21 +486,46 @@ class MedSegBenchDataset(Dataset):
             ctx_img = self._normalize_image(ctx_img)
             ctx_binary = self._create_binary_mask(ctx_mask, label_value)
 
+            # Foreground random crop (independent per context)
+            if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
+                ctx_img, ctx_binary = foreground_random_crop(
+                    ctx_img, ctx_binary, self.adv_fg_crop_min
+                )
+
             ctx_img = self._resize(ctx_img, mode="bilinear")
             ctx_binary = self._resize(ctx_binary, mode="nearest")
-
-            # Apply augmentation (independent per context)
-            if self.augment:
-                ctx_img, ctx_binary = self._apply_augmentation(ctx_img, ctx_binary)
 
             context_imgs.append(ctx_img)
             context_masks.append(ctx_binary)
 
-        # Apply augmentation to target
+        # CarveMix on target (after resize, before augmentation)
+        exclude_indices = [sample_idx] + [idx for _, idx in context_samples]
+        target_img, target_binary = self._apply_carve_mix(
+            target_img, target_binary, ds_name, label_value, exclude_indices
+        )
+
+        # Advanced augmentation (asymmetric intensity, resolution degradation, mask perturbation)
+        target_img, target_binary, context_imgs, context_masks = self._apply_advanced_augmentation(
+            target_img, target_binary,
+            context_imgs if context_imgs else None,
+            context_masks if context_masks else None,
+        )
+        context_imgs = context_imgs or []
+        context_masks = context_masks or []
+
+        # Apply spatial/intensity augmentation (different random transform per image)
         if self.augment:
             target_img, target_binary = self._apply_augmentation(
                 target_img, target_binary
             )
+            aug_context_imgs = []
+            aug_context_masks = []
+            for ci, cm in zip(context_imgs, context_masks):
+                ci_aug, cm_aug = self._apply_augmentation(ci, cm)
+                aug_context_imgs.append(ci_aug)
+                aug_context_masks.append(cm_aug)
+            context_imgs = aug_context_imgs
+            context_masks = aug_context_masks
 
         # Convert to tensors
         target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()

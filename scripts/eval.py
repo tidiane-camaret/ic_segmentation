@@ -344,7 +344,7 @@ def main(cfg: DictConfig) -> None:
         # Log per-case results as a wandb Table
         case_table = wandb.Table(columns=["case_id", "label_id", "axis", "dice"])
         for result in detailed_results["per_case"]:
-            case_table.add_data(result["case_id"], result["label_id"], result["axis"], result["dice"])
+            case_table.add_data(result["case_id"], result["label_id"], result.get("axis") or "N/A", result["dice"])
         wandb.log({"per_case_dice": case_table})
 
     """
