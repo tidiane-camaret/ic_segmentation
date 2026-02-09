@@ -369,13 +369,12 @@ def main(cfg: DictConfig) -> None:
                     log_dict[f"val_dice/{label_id}"] = dice_score
             wandb.log(log_dict)
 
-        # Save best
+        # Save best — sync all ranks before checkpoint to avoid collective mismatch
+        accelerator.wait_for_everyone()
         if val_final_dice > best_dice:
             best_dice = val_final_dice
             if accelerator.is_main_process:
                 print(f"  -> New best dice: {best_dice:.5f}")
-            accelerator.wait_for_everyone()
-            if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
                 torch.save({
                     "epoch": epoch,
