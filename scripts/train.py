@@ -245,7 +245,7 @@ def main(cfg: DictConfig) -> None:
                 print("Initializing ICLEncoder for on-the-fly feature extraction...")
             feature_extractor = ICLEncoder(
                 layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
-                output_grid_size=output_grid,
+                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
                 freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
             )
             if accelerator.is_main_process:
