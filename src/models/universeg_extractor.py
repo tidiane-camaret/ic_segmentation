@@ -2,7 +2,11 @@
 UniverSeg Feature Extractor for on-the-fly feature computation.
 
 Extracts per-image features from UniverSeg encoder blocks using forward hooks.
-A dummy support (zeros) is passed so features are computed per-image.
+
+For target images (no mask): dummy support (zeros) is used.
+For context images (with mask): self-support trick — the image is passed as both
+target and its own support with the GT mask, so the pretrained cross-conv fuses
+mask information into the features without new parameters.
 
 Features:
 - Input: Grayscale images resized to 128x128, normalized to [0, 1]
@@ -23,7 +27,7 @@ Usage:
     extractor = UniverSegExtractor(layer_idx=[1, 2, 3], output_grid_size=8, device="cuda")
 
     target_features, context_features = extractor.extract_batch(
-        target_images, context_images
+        target_images, context_images, context_masks
     )
 """
 from __future__ import annotations
@@ -146,11 +150,18 @@ class UniverSegExtractor(nn.Module):
         )
 
     @torch.no_grad()
-    def extract_features(self, images: torch.Tensor) -> torch.Tensor:
+    def extract_features(
+        self,
+        images: torch.Tensor,
+        masks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Extract features from encoder block(s) via forward hooks.
 
         Args:
             images: [B, 1, H, W] grayscale images, normalized to [0, 1]
+            masks: [B, 1, H, W] binary masks (optional). When provided, uses
+                   self-support: the image is its own support with the mask,
+                   so cross-conv fuses mask info into the features.
 
         Returns:
             features: [B, N, D] where N = output_grid_size^2,
@@ -174,11 +185,22 @@ class UniverSegExtractor(nn.Module):
                 align_corners=False,
             )
 
-        # Dummy support: 1 support image of zeros with zero label
-        support_images = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
-                                     device=device)
-        support_labels = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
-                                     device=device)
+        if masks is not None:
+            # Self-support: image is its own support, with real mask
+            if masks.shape[-2:] != (self.INPUT_SIZE, self.INPUT_SIZE):
+                masks = F.interpolate(
+                    masks.float(),
+                    size=(self.INPUT_SIZE, self.INPUT_SIZE),
+                    mode="nearest",
+                )
+            support_images = images.unsqueeze(1)  # [B, 1, 1, H, W]
+            support_labels = masks.unsqueeze(1)    # [B, 1, 1, H, W]
+        else:
+            # Dummy support: zeros (image-only features)
+            support_images = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
+                                         device=device)
+            support_labels = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
+                                         device=device)
 
         # Register hooks to capture features at each requested layer
         captured = {}
@@ -225,12 +247,18 @@ class UniverSegExtractor(nn.Module):
         self,
         target_images: torch.Tensor,
         context_images: Optional[torch.Tensor] = None,
+        context_masks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Extract features for target and context images.
+
+        Target images use dummy support (image-only features).
+        Context images use self-support with their GT masks when provided,
+        so context features are mask-conditioned via the pretrained cross-conv.
 
         Args:
             target_images: [B, 1, H, W]
             context_images: [B, k, 1, H, W] (optional)
+            context_masks: [B, k, 1, H, W] binary masks for context (optional)
 
         Returns:
             target_features: [B, N, D]
@@ -238,16 +266,26 @@ class UniverSegExtractor(nn.Module):
         """
         B = target_images.shape[0]
 
-        if context_images is not None:
-            k = context_images.shape[1]
-            ctx_flat = context_images.view(B * k, *context_images.shape[2:])
+        if context_images is None:
+            return self.extract_features(target_images), None
+
+        k = context_images.shape[1]
+        ctx_flat = context_images.view(B * k, *context_images.shape[2:])
+
+        if context_masks is not None:
+            # Separate paths: target with dummy support, context with self-support + mask
+            target_features = self.extract_features(target_images)
+            mask_flat = context_masks.view(B * k, *context_masks.shape[2:])
+            context_features = self.extract_features(ctx_flat, masks=mask_flat)
+            context_features = context_features.view(B, k, *context_features.shape[1:])
+        else:
+            # No masks: batch target + context together (faster)
             all_images = torch.cat([target_images, ctx_flat], dim=0)
             all_features = self.extract_features(all_images)
             target_features = all_features[:B]
             context_features = all_features[B:].view(B, k, *all_features.shape[1:])
-            return target_features, context_features
-        else:
-            return self.extract_features(target_images), None
+
+        return target_features, context_features
 
     def get_feature_info(self) -> dict:
         """Get information about extracted features."""

@@ -198,11 +198,12 @@ class PatchICL(nn.Module):
         self,
         target_images: torch.Tensor,
         context_images: torch.Tensor | None = None,
+        context_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Extract features on-the-fly using the feature extractor."""
         if self.feature_extractor is None:
             raise RuntimeError("No feature extractor available.")
-        return self.feature_extractor.extract_batch(target_images, context_images)
+        return self.feature_extractor.extract_batch(target_images, context_images, context_masks)
 
     def _select_context_patches(
         self,
@@ -253,7 +254,7 @@ class PatchICL(nn.Module):
 
         # On-the-fly feature extraction if needed
         if target_features is None and self.feature_extractor is not None:
-            target_features, context_features = self._extract_features(image, context_in)
+            target_features, context_features = self._extract_features(image, context_in, context_out)
 
         # Downsample to level resolution
         image_ds = self._downsample(image)
