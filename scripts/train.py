@@ -239,6 +239,19 @@ def main(cfg: DictConfig) -> None:
                 info = feature_extractor.get_feature_info()
                 print(f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
                       f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
+        elif extractor_type == "icl_encoder":
+            from src.models.icl_encoder import ICLEncoder
+            if accelerator.is_main_process:
+                print("Initializing ICLEncoder for on-the-fly feature extraction...")
+            feature_extractor = ICLEncoder(
+                layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
+                output_grid_size=output_grid,
+                freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
+            )
+            if accelerator.is_main_process:
+                info = feature_extractor.get_feature_info()
+                print(f"Feature mode: on_the_fly (ICLEncoder layers={info['layer_indices']}, "
+                      f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
         else:
             raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
     else:

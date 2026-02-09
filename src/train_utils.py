@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+# Thresholds for hard-dice metric binarization
+PRED_THRESHOLD = 0.5    # sigmoid probability → binary prediction
+GT_AREA_THRESHOLD = 0.25  # soft avg-pooled GT → binary (≥25% coverage = foreground)
+
+
 def seed_everything(seed: int) -> None:
     """Set random seeds for reproducibility."""
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -283,9 +288,9 @@ def train_epoch(
             patch_logits = outputs["patch_logits"]
             patch_labels = outputs["patch_labels"]
             patch_probs = torch.sigmoid(patch_logits)
-            patch_pred_binary = (patch_probs > 0.5).float()
+            patch_pred_binary = (patch_probs > PRED_THRESHOLD).float()
             patch_labels_float = patch_labels.float()
-            patch_labels_binary = (patch_labels > 0).float()
+            patch_labels_binary = (patch_labels > GT_AREA_THRESHOLD).float()
             # Hard dice
             patch_intersection = (patch_pred_binary * patch_labels_binary).sum(
                 dim=(1, 2, 3, 4)
@@ -315,14 +320,14 @@ def train_epoch(
                     labels.float(), kernel_size=scale_factor, stride=scale_factor
                 )
                 pred_probs = torch.sigmoid(level_pred)
-                pred_binary = (pred_probs > 0.5).float()
+                pred_binary = (pred_probs > PRED_THRESHOLD).float()
                 labels_float = labels_ds  # soft target for soft dice
-                labels_binary = (labels_ds > 0.25).float()  # area threshold for hard dice
+                labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
             else:
                 pred_probs = torch.sigmoid(outputs["final_logit"])
-                pred_binary = (pred_probs > 0.5).float()
+                pred_binary = (pred_probs > PRED_THRESHOLD).float()
                 labels_float = labels.float()
-                labels_binary = (labels > 0).float()
+                labels_binary = (labels > GT_AREA_THRESHOLD).float()
             spatial_dims = tuple(range(2, pred_binary.dim()))
             # Hard dice
             intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
@@ -398,9 +403,9 @@ def train_epoch(
                 context_labels = level_outputs[-1].get("context_labels")
                 if context_pred is not None and context_labels is not None:
                     ctx_probs = torch.sigmoid(context_pred)
-                    ctx_pred_binary = (ctx_probs > 0.5).float()
+                    ctx_pred_binary = (ctx_probs > PRED_THRESHOLD).float()
                     ctx_labels_float = context_labels.float()
-                    ctx_labels_binary = (context_labels > 0).float()
+                    ctx_labels_binary = (context_labels > GT_AREA_THRESHOLD).float()
                     # Hard dice
                     ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(
                         dim=(2, 3, 4)
@@ -630,9 +635,9 @@ def validate(
         patch_logits = outputs["patch_logits"]
         patch_labels = outputs["patch_labels"]
         patch_probs = torch.sigmoid(patch_logits)
-        patch_pred_binary = (patch_probs > 0.5).float()
+        patch_pred_binary = (patch_probs > PRED_THRESHOLD).float()
         patch_labels_float = patch_labels.float()
-        patch_labels_binary = (patch_labels > 0).float()
+        patch_labels_binary = (patch_labels > GT_AREA_THRESHOLD).float()
         # Hard dice
         patch_intersection = (patch_pred_binary * patch_labels_binary).sum(
             dim=(1, 2, 3, 4)
@@ -662,14 +667,14 @@ def validate(
                 labels.float(), kernel_size=scale_factor, stride=scale_factor
             )
             pred_probs = torch.sigmoid(level_pred)
-            pred_binary = (pred_probs > 0.5).float()
+            pred_binary = (pred_probs > PRED_THRESHOLD).float()
             labels_float = labels_ds  # soft target for soft dice
-            labels_binary = (labels_ds > 0.25).float()  # area threshold for hard dice
+            labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
         else:
             pred_probs = torch.sigmoid(predictions)
-            pred_binary = (pred_probs > 0.5).float()
+            pred_binary = (pred_probs > PRED_THRESHOLD).float()
             labels_float = labels.float()
-            labels_binary = (labels > 0).float()
+            labels_binary = (labels > GT_AREA_THRESHOLD).float()
         spatial_dims = tuple(range(2, pred_binary.dim()))
         # Hard dice
         intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
@@ -749,9 +754,9 @@ def validate(
             context_labels = level_outputs[-1].get("context_labels")
             if context_pred is not None and context_labels is not None:
                 ctx_probs = torch.sigmoid(context_pred)
-                ctx_pred_binary = (ctx_probs > 0.5).float()
+                ctx_pred_binary = (ctx_probs > PRED_THRESHOLD).float()
                 ctx_labels_float = context_labels.float()
-                ctx_labels_binary = (context_labels > 0).float()
+                ctx_labels_binary = (context_labels > GT_AREA_THRESHOLD).float()
                 # Hard dice
                 ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(
                     dim=(2, 3, 4)

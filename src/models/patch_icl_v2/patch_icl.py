@@ -193,7 +193,6 @@ class PatchICL(nn.Module):
             return mask
         return mask.max(dim=1, keepdim=True)[0]
 
-    @torch.no_grad()
     def _extract_features(
         self,
         target_images: torch.Tensor,
@@ -203,6 +202,9 @@ class PatchICL(nn.Module):
         """Extract features on-the-fly using the feature extractor."""
         if self.feature_extractor is None:
             raise RuntimeError("No feature extractor available.")
+        if getattr(self.feature_extractor, '_frozen', False):
+            with torch.no_grad():
+                return self.feature_extractor.extract_batch(target_images, context_images, context_masks)
         return self.feature_extractor.extract_batch(target_images, context_images, context_masks)
 
     def _select_context_patches(

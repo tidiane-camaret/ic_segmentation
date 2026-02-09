@@ -24,5 +24,5 @@ nvidia-smi
 # uv run scripts/totalseg_3d_to_2d.py cluster=dlclarge
 # uv run scripts/extract_dinov3_features.py cluster=dlclarge
 
-uv run accelerate launch --multi_gpu scripts/train.py experiment=40_slidingwindow cluster=dlclarge dataset=totalseg2d
+uv run accelerate launch --multi_gpu scripts/train.py experiment=50_256_token cluster=dlclarge
 # uv run accelerate launch --multi_gpu scripts/eval.py experiment=40_slidingwindow cluster=dlclarge # dataset=totalseg2d val_label_ids=val
