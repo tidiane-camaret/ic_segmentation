@@ -177,15 +177,15 @@ class PatchICL(nn.Module):
         return F.interpolate(x, size=(self.resolution, self.resolution), mode='bilinear', align_corners=False)
 
     def _downsample_mask(self, mask: torch.Tensor) -> torch.Tensor:
-        """Downsample mask to level resolution using max pooling for binary masks."""
+        """Downsample mask to level resolution using avg pooling (soft area-fraction targets)."""
         if mask.shape[-1] == self.resolution and mask.shape[-2] == self.resolution:
             return mask
         if mask.shape[1] > 1:  # Multi-channel (RGB)
             return F.interpolate(mask.float(), size=(self.resolution, self.resolution), mode='bilinear', align_corners=False)
         scale_factor = mask.shape[-1] // self.resolution
         if scale_factor > 1:
-            return F.max_pool2d(mask.float(), kernel_size=scale_factor, stride=scale_factor)
-        return F.interpolate(mask.float(), size=(self.resolution, self.resolution), mode='nearest')
+            return F.avg_pool2d(mask.float(), kernel_size=scale_factor, stride=scale_factor)
+        return F.interpolate(mask.float(), size=(self.resolution, self.resolution), mode='area')
 
     def _mask_to_weights(self, mask: torch.Tensor) -> torch.Tensor:
         """Convert multi-channel mask to single-channel weights for sampling."""
@@ -392,7 +392,8 @@ class PatchICL(nn.Module):
                 'context_patch_logits': context_patch_logits,
                 'context_coords': context_coords,
                 'context_pred': context_pred,
-                'context_labels': context_out_ds,
+                'context_labels': context_out_ds,  # max_pool2d downsampled (used for sampling)
+                'context_labels_fullres': context_out,  # original full-res masks for loss
                 'attn_weights': backbone_out.get('attn_weights'),
                 'register_tokens': backbone_out.get('register_tokens'),
                 'patch_size': self.patch_size,
@@ -441,9 +442,10 @@ class PatchICL(nn.Module):
         losses['level_0_patch_loss'] = target_patch_loss
         total_loss = total_loss + self.loss_weights['target_patch'] * target_patch_loss
 
-        # Target aggreg loss
+        # Target aggreg loss (soft avg_pool targets — preserves area fraction)
         pred = level_out['pred']
-        labels_ds = F.interpolate(labels.float(), size=pred.shape[-2:], mode='nearest')
+        scale_factor = labels.shape[-1] // pred.shape[-1]
+        labels_ds = F.avg_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
         target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
         losses['level_0_target_aggreg_loss'] = target_aggreg_loss
         losses['level_0_pred_loss'] = target_aggreg_loss
@@ -464,12 +466,16 @@ class PatchICL(nn.Module):
             losses['level_0_context_patch_loss'] = torch.tensor(0.0, device=device)
 
         context_pred = level_out.get('context_pred')
-        context_labels = level_out.get('context_labels')
-        if context_pred is not None and context_labels is not None:
+        context_labels_fullres = level_out.get('context_labels_fullres')
+        if context_pred is not None and context_labels_fullres is not None:
             B_ctx, k_ctx = context_pred.shape[:2]
+            # Soft avg_pool targets for context (same as target aggreg loss)
+            ctx_flat = context_labels_fullres.view(B_ctx * k_ctx, *context_labels_fullres.shape[2:])
+            ctx_scale = ctx_flat.shape[-1] // context_pred.shape[-1]
+            context_labels_ds = F.avg_pool2d(ctx_flat.float(), kernel_size=ctx_scale, stride=ctx_scale)
             context_aggreg_loss = self.aggreg_criterion(
                 context_pred.reshape(B_ctx * k_ctx, -1),
-                context_labels.reshape(B_ctx * k_ctx, -1),
+                context_labels_ds.reshape(B_ctx * k_ctx, -1),
             )
             losses['level_0_context_aggreg_loss'] = context_aggreg_loss
             total_loss = total_loss + self.loss_weights['context_aggreg'] * context_aggreg_loss

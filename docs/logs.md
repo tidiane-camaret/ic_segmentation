@@ -1,5 +1,48 @@
 # Research Logs
 
+## 2026-02-09: Unified soft GT downsampling (max_pool → avg_pool)
+
+### Problem
+
+GT masks were downsampled inconsistently across the pipeline — three different methods in different places:
+
+| Location | Method | Result |
+|----------|--------|--------|
+| `_downsample_mask()` (sampling weights + patch labels) | `max_pool2d` | Binary, dilated — any FG in 8×8 block → FG |
+| `compute_loss()` target aggreg loss | `F.interpolate` nearest | Picks 1 pixel per block, can miss small FG |
+| Dice metrics in `train_utils.py` | `avg_pool2d` > 0.25 | Area-fraction threshold |
+
+This caused conflicting supervision: patch loss trained against dilated binary GT while the aggreg loss (after nearest downsample) could miss small structures entirely.
+
+### Solution
+
+Replaced all GT downsampling with `avg_pool2d`, producing soft [0, 1] area-fraction targets throughout:
+
+1. **`_downsample_mask()`**: `max_pool2d` → `avg_pool2d`. Affects sampling weights and patch labels (now soft).
+2. **Target aggreg loss** in `compute_loss()`: `F.interpolate(nearest)` → `F.avg_pool2d` from full-res labels.
+3. **Context aggreg loss** in `compute_loss()`: Was using `context_out_ds` (max_pool2d from forward pass). Now stores full-res context masks (`context_labels_fullres`) and recomputes soft targets with `avg_pool2d`.
+
+### Rationale
+
+- `avg_pool2d` preserves the true foreground area fraction per 8×8 block (e.g., 0.3 = 30% coverage)
+- `SoftDiceBCE` already handles continuous targets — BCE acts as label smoothing at boundaries, Soft Dice compares predicted probability against true coverage
+- Consistent with how dice metrics are already computed in `train_utils.py`
+- `max_pool2d` was too aggressive: inflated small structures and blurred boundaries by marking entire blocks as foreground
+
+### Impact on pipeline
+
+All GT downsampling is now `avg_pool2d`:
+- **Sampling weights**: soft values — ContinuousSampler will prefer dense FG regions (to be revisited)
+- **Patch labels**: soft [0, 1] — patch loss learns proportional coverage
+- **Aggreg loss GT**: soft [0, 1] — consistent with patch labels
+- **Dice metrics**: unchanged (already used `avg_pool2d`)
+
+### Files modified
+
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl_v2/patch_icl.py` | `_downsample_mask()`: max_pool → avg_pool; `compute_loss()`: avg_pool for target + context aggreg loss; forward: store `context_labels_fullres` |
+
 ## 2026-02-04: Feature Extraction Experiments Infrastructure
 
 ### Overview

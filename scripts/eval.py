@@ -52,7 +52,10 @@ def main(cfg: DictConfig) -> None:
         from src.dataloaders.totalseg2d_dataloader import (
             get_dataloader as get_totalseg2d_dataloader,
         )
-
+    elif cfg.dataset == "medsegbench":
+        from src.dataloaders.medsegbench_dataloader import (
+            get_dataloader as get_medsegbench_dataloader,
+        )
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset}")
 
@@ -108,6 +111,31 @@ def main(cfg: DictConfig) -> None:
             load_dinov3_features=cfg.get("load_dinov3_features", False),
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
+        )
+    elif cfg.dataset == "medsegbench":
+        msb_cfg = cfg.get("medsegbench", {})
+        msb_val_datasets = msb_cfg.get("val_datasets", None)
+        if msb_val_datasets is not None:
+            msb_val_datasets = list(msb_val_datasets)
+        else:
+            msb_datasets = msb_cfg.get("datasets", None)
+            msb_val_datasets = list(msb_datasets) if msb_datasets is not None else None
+        max_samples = msb_cfg.get("max_samples_per_dataset", None)
+
+        if accelerator.is_main_process:
+            print(f"MedSegBench val datasets: {msb_val_datasets}")
+
+        val_loader = get_medsegbench_dataloader(
+            data_root=cfg.paths.medsegbench,
+            datasets=msb_val_datasets,
+            split="val",
+            context_size=cfg.context_size,
+            batch_size=cfg.val_batch_size,
+            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            num_workers=cfg.training.get("num_workers", 4),
+            shuffle=False,
+            augment=False,
+            max_samples_per_dataset=max_samples,
         )
     # Get model (don't move to device yet - accelerator.prepare handles that)
     if cfg.method == "patch_icl":
