@@ -805,7 +805,7 @@ def validate(
             save_dir,
             epoch,
             prefix="val",
-            max_samples=max_save_batches * 4,
+            max_samples=len(label_samples),
         )
 
     detailed_results = {
