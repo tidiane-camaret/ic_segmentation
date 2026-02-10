@@ -19,6 +19,60 @@ from src.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate
 
 
+def measure_flops(model, val_loader, device, accelerator=None):
+    """Measure forward-pass FLOPs on one batch using PyTorch's built-in counter."""
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+    except ImportError:
+        print("FlopCounterMode not available (requires PyTorch >= 2.1)")
+        return None
+
+    unwrapped = accelerator.unwrap_model(model) if accelerator else model
+    unwrapped.eval()
+
+    # Grab one batch
+    batch = next(iter(val_loader))
+    images = batch["image"].to(device)
+    labels = batch["label"].to(device)
+    if labels.dim() == 3:
+        labels = labels.unsqueeze(1)
+
+    context_in = batch.get("context_in")
+    context_out = batch.get("context_out")
+    if context_in is not None:
+        context_in = context_in.to(device)
+    if context_out is not None:
+        context_out = context_out.to(device)
+
+    target_features = batch.get("target_features")
+    context_features = batch.get("context_features")
+    if target_features is not None:
+        target_features = target_features.to(device)
+    if context_features is not None:
+        context_features = context_features.to(device)
+
+    batch_size = images.shape[0]
+
+    with torch.no_grad():
+        flop_counter = FlopCounterMode(display=False)
+        with flop_counter:
+            unwrapped(
+                images, labels=labels,
+                context_in=context_in, context_out=context_out,
+                target_features=target_features, context_features=context_features,
+                mode="val",
+            )
+        total_flops = flop_counter.get_total_flops()
+
+    per_sample = total_flops / batch_size
+    return {
+        "total_flops_batch": total_flops,
+        "flops_per_sample": per_sample,
+        "gflops_per_sample": per_sample / 1e9,
+        "batch_size": batch_size,
+    }
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     """Main training function."""
@@ -343,6 +397,14 @@ def main(cfg: DictConfig) -> None:
     print_every = cfg.training.print_every
     grad_accumulate_steps = cfg.training.get("grad_accumulate_steps", 1)
 
+    # Measure FLOPs (one-time, before validation)
+    flop_info = None
+    if accelerator.is_main_process:
+        flop_info = measure_flops(model, val_loader, device, accelerator)
+        if flop_info:
+            print(f"FLOPs per sample: {flop_info['gflops_per_sample']:.3f} GFLOPs "
+                  f"(batch_size={flop_info['batch_size']})")
+
     # Validation with optional saving
     save_imgs = cfg.logging.get("save_imgs_masks", False)
     if save_imgs:
@@ -377,6 +439,9 @@ def main(cfg: DictConfig) -> None:
             "val_final_dice": val_final_dice,
             "val_context_dice": val_context_dice,
         }
+        if flop_info:
+            log_dict["gflops_per_sample"] = flop_info["gflops_per_sample"]
+            log_dict["flops_per_sample"] = flop_info["flops_per_sample"]
         # Log per-label dice
         for label_id, dice in detailed_results["per_label"].items():
             log_dict[f"dice_label/{label_id}"] = dice
