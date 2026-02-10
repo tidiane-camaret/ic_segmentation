@@ -73,7 +73,7 @@ model:
     levels:
       - resolution: 32
         patch_size: 8
-        num_patches: 32  # Training patches (continuous sampler)
+        num_patches: 64  # Training patches (continuous sampler)
         num_patches_val: 64  # Validation patches (defaults to num_patches if omitted)
         sampling_temperature: 0.3
 
