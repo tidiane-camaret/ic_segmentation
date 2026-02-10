@@ -532,7 +532,7 @@ def train_epoch(
         and label_samples
         and (epoch % save_every_n_epochs == 0)
     ):
-        _save_sample_images(label_samples, save_dir, epoch, prefix="train")
+        _save_sample_images(label_samples, save_dir, epoch, prefix="train", max_samples=len(label_samples))
 
     return {
         "loss": total_loss / n,

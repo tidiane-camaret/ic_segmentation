@@ -3,7 +3,7 @@ dataset: totalseg2d
 
 paths:
   ckpts:
-    #patch_icl_v2: ${..RESULTS_DIR}/checkpoints/radiant-salad-168/best_model.pt
+    patch_icl_v2: null #${..RESULTS_DIR}/checkpoints/peach-plasma-179/best_model.pt
 
 logging:
   use_wandb: true

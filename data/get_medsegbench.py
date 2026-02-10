@@ -1,13 +1,23 @@
 import pandas as pd
 import os
 import inspect
-import medsegbench
+import sys
+from pathlib import Path
 
-# 1. Configuration
-# Use an absolute path to avoid ambiguity
-DOWNLOAD_ROOT = "/work/dlclarge2/ndirt-SegFM3D/data/medsegbench"
+import medsegbench
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+
+# Load config to get paths.medsegbench
+config_path = Path(__file__).resolve().parents[1] / "configs"
+with initialize_config_dir(config_dir=str(config_path), version_base=None):
+    cfg = compose(config_name="train")
+
+DOWNLOAD_ROOT = cfg.paths.medsegbench
 IMG_SIZE = 256
 stats_list = []
+
+print(f"Loaded path from config: {DOWNLOAD_ROOT}")
 
 # --- CRITICAL FIX: Create the directory manually first ---
 if not os.path.exists(DOWNLOAD_ROOT):
