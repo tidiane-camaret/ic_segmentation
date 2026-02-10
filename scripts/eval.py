@@ -323,7 +323,7 @@ def main(cfg: DictConfig) -> None:
         print(f"Model parameters: {num_params:,}")
 
     # Load checkpoint weights
-    ckpt_path = cfg.paths.ckpts.get("patch_icl_v2", None)
+    ckpt_path = cfg.get("checkpoint", None)
     if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
@@ -331,7 +331,7 @@ def main(cfg: DictConfig) -> None:
             print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
     else:
         if accelerator.is_main_process:
-            print("Warning: No checkpoint loaded, using random weights")
+            print("No checkpoint loaded, using default weights")
 
     # Optimizer
     opt_type = cfg.optimizer.get("optimizer_type", "adamw").lower()

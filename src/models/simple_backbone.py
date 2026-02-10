@@ -269,11 +269,13 @@ class AttentionBlock(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         mlp_ratio: int = 4,
+        append_zero_attn: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.embed_dim = embed_dim
+        self.append_zero_attn = append_zero_attn
 
         # Per-layer type embeddings
         self.target_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
@@ -359,6 +361,16 @@ class AttentionBlock(nn.Module):
         k = k.view(B, K_total, H, -1).transpose(1, 2)
         v = v.view(B, K_total, H, -1).transpose(1, 2)
 
+        # Append zero token to keys/values — gives queries a "do nothing" option
+        if self.append_zero_attn:
+            zero_k = torch.zeros(B, H, 1, k.shape[-1], device=k.device, dtype=k.dtype)
+            zero_v = torch.zeros(B, H, 1, v.shape[-1], device=v.device, dtype=v.dtype)
+            k = torch.cat([k, zero_k], dim=2)  # [B, H, K_total+1, head_dim]
+            v = torch.cat([v, zero_v], dim=2)
+            # Extend mask: all queries can attend to the zero token (append 0.0 column)
+            zero_col = torch.zeros(B, H, K_total, 1, device=attn_mask.device, dtype=attn_mask.dtype)
+            attn_mask = torch.cat([attn_mask, zero_col], dim=-1)
+
         attn_weights = None
         if return_attn_weights:
             scale = 1.0 / math.sqrt(q.shape[-1])
@@ -406,6 +418,7 @@ class CrossPatchAttention(nn.Module):
         max_seq_len: int = 1024,
         target_self_attention: bool = False,
         dropout: float = 0.0,
+        append_zero_attn: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -429,7 +442,7 @@ class CrossPatchAttention(nn.Module):
 
         # Stack of attention blocks
         self.layers = nn.ModuleList([
-            AttentionBlock(embed_dim, num_heads, dropout)
+            AttentionBlock(embed_dim, num_heads, dropout, append_zero_attn=append_zero_attn)
             for _ in range(num_layers)
         ])
 
@@ -704,6 +717,7 @@ class SimpleBackbone(nn.Module):
         dropout: float = 0.0,
         max_seq_len: int = 1024,
         decoder_use_skip_connections: bool = True,
+        append_zero_attn: bool = False,
     ):
         """
         Args:
@@ -720,6 +734,7 @@ class SimpleBackbone(nn.Module):
             dropout: Attention dropout rate
             max_seq_len: Maximum sequence length for RoPE cache
             decoder_use_skip_connections: If True, use U-Net skips in decoder
+            append_zero_attn: Append zero token to K/V for attention sink
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -741,6 +756,7 @@ class SimpleBackbone(nn.Module):
             max_seq_len=max_seq_len,
             target_self_attention=target_self_attention,
             dropout=dropout,
+            append_zero_attn=append_zero_attn,
         )
 
         self.decoder = SimpleCNNDecoder(

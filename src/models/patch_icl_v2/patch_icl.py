@@ -85,6 +85,7 @@ class PatchICL(nn.Module):
         self.resolution = level_cfg['resolution']
         self.patch_size = level_cfg['patch_size']
         self.num_patches = level_cfg['num_patches']
+        self.num_patches_val = level_cfg.get('num_patches_val', self.num_patches)
 
         # Oracle config
         self.oracle_train = config.get('oracle_levels_train', [True])[0]
@@ -112,6 +113,7 @@ class PatchICL(nn.Module):
             sampler_type=self.sampler_type,
             patch_size=self.patch_size,
             num_patches=self.num_patches,
+            num_patches_val=self.num_patches_val,
             temperature=level_cfg.get('sampling_temperature', 0.3),
             stride=self.sliding_window_stride,
             augmenter=self.augmenter,
@@ -159,6 +161,7 @@ class PatchICL(nn.Module):
             dropout=backbone_cfg.get('dropout', 0.0),
             feature_grid_size=patch_feature_grid_size,
             decoder_use_skip_connections=backbone_cfg.get('decoder_use_skip_connections', True),
+            append_zero_attn=backbone_cfg.get('append_zero_attn', False),
         )
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
@@ -212,28 +215,31 @@ class PatchICL(nn.Module):
         context_in: torch.Tensor,
         context_out: torch.Tensor,
         context_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[dict]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[dict]], torch.Tensor]:
         """Select patches from each context image."""
         B, k = context_in.shape[:2]
-        all_ctx_patches, all_ctx_labels, all_ctx_coords, all_aug_params = [], [], [], []
+        all_ctx_patches, all_ctx_labels, all_ctx_coords, all_aug_params, all_ctx_validity = [], [], [], [], []
 
         for b in range(B):
-            batch_patches, batch_labels, batch_coords, batch_aug_params = [], [], [], []
+            batch_patches, batch_labels, batch_coords, batch_aug_params, batch_validity = [], [], [], [], []
             for ctx_idx in range(k):
                 ctx_img = context_in[b, ctx_idx].unsqueeze(0)
                 ctx_mask = context_out[b, ctx_idx].unsqueeze(0)
                 ctx_weight = context_weights[b, ctx_idx].unsqueeze(0)
-                patches, labels, coords, _, aug_params = self.sampler(ctx_img, ctx_mask, ctx_weight)
+                patches, labels, coords, _, aug_params, validity = self.sampler(ctx_img, ctx_mask, ctx_weight)
                 batch_patches.append(patches.squeeze(0))
                 batch_labels.append(labels.squeeze(0))
                 batch_coords.append(coords.squeeze(0))
                 batch_aug_params.append(aug_params)
+                batch_validity.append(validity.squeeze(0))
             all_ctx_patches.append(torch.cat(batch_patches, dim=0))
             all_ctx_labels.append(torch.cat(batch_labels, dim=0))
             all_ctx_coords.append(torch.cat(batch_coords, dim=0))
             all_aug_params.append(batch_aug_params)
+            all_ctx_validity.append(torch.cat(batch_validity, dim=0))
 
-        return torch.stack(all_ctx_patches), torch.stack(all_ctx_labels), torch.stack(all_ctx_coords), all_aug_params
+        return (torch.stack(all_ctx_patches), torch.stack(all_ctx_labels),
+                torch.stack(all_ctx_coords), all_aug_params, torch.stack(all_ctx_validity))
 
     def forward(
         self,
@@ -270,7 +276,7 @@ class PatchICL(nn.Module):
             weights = torch.ones(B, 1, self.resolution, self.resolution, device=device)
 
         # Select target patches
-        patches, patch_labels, coords, _, aug_params = self.sampler(image_ds, labels_ds, weights, None)
+        patches, patch_labels, coords, _, aug_params, target_validity = self.sampler(image_ds, labels_ds, weights, None)
         K = patches.shape[1]
         coord_scale = H / self.resolution
 
@@ -291,6 +297,7 @@ class PatchICL(nn.Module):
         context_patches, context_patch_labels, context_coords = None, None, None
         context_patch_logits, context_pred, context_out_ds = None, None, None
         context_aug_params = None
+        context_validity = None
 
         if context_in is not None and context_out is not None:
             k = context_in.shape[1]
@@ -300,7 +307,7 @@ class PatchICL(nn.Module):
             context_out_ds = self._downsample_mask(context_out_flat).view(B, k, context_out.shape[2], self.resolution, self.resolution)
             context_weights = self._mask_to_weights(context_out_ds.view(B * k, *context_out_ds.shape[2:])).view(B, k, 1, self.resolution, self.resolution)
 
-            context_patches, context_patch_labels, context_coords, context_aug_params = self._select_context_patches(
+            context_patches, context_patch_labels, context_coords, context_aug_params, context_validity = self._select_context_patches(
                 context_in_ds, context_out_ds, context_weights
             )
             K_ctx = context_patches.shape[1]
@@ -396,6 +403,8 @@ class PatchICL(nn.Module):
                 'context_pred': context_pred,
                 'context_labels': context_out_ds,  # max_pool2d downsampled (used for sampling)
                 'context_labels_fullres': context_out,  # original full-res masks for loss
+                'target_validity': target_validity,
+                'context_validity': context_validity,
                 'attn_weights': backbone_out.get('attn_weights'),
                 'register_tokens': backbone_out.get('register_tokens'),
                 'patch_size': self.patch_size,
@@ -412,6 +421,22 @@ class PatchICL(nn.Module):
             'attn_weights': backbone_out.get('attn_weights'),
             'register_tokens': backbone_out.get('register_tokens'),
         }
+
+    def _masked_patch_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        validity: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Compute patch loss, masking out invalid (out-of-image) pixels."""
+        if validity is None:
+            return self.patch_criterion(logits, labels)
+        # For invalid pixels: set logit to -100 (sigmoid≈0) and label to 0,
+        # so the loss contribution is ~0 for any standard criterion (BCE, dice).
+        invalid = ~validity.expand_as(logits).bool()
+        masked_logits = torch.where(invalid, torch.tensor(-100.0, device=logits.device), logits)
+        masked_labels = torch.where(invalid, torch.zeros_like(labels), labels)
+        return self.patch_criterion(masked_logits, masked_labels)
 
     def compute_loss(
         self,
@@ -432,13 +457,15 @@ class PatchICL(nn.Module):
 
         level_out = outputs['level_outputs'][0]
 
-        # Target patch loss
+        # Target patch loss (masked by validity for border patches)
         patch_logits = level_out['patch_logits']
         patch_labels = level_out['patch_labels']
+        target_validity = level_out.get('target_validity')
         K = patch_logits.shape[1]
-        target_patch_loss = self.patch_criterion(
+        target_patch_loss = self._masked_patch_loss(
             patch_logits.reshape(B * K, -1),
             patch_labels.reshape(B * K, -1),
+            target_validity.reshape(B * K, -1) if target_validity is not None else None,
         )
         losses['level_0_target_patch_loss'] = target_patch_loss
         losses['level_0_patch_loss'] = target_patch_loss
@@ -456,11 +483,13 @@ class PatchICL(nn.Module):
         # Context losses
         context_patch_logits = level_out.get('context_patch_logits')
         context_patch_labels = level_out.get('context_patch_labels')
+        context_validity = level_out.get('context_validity')
         if context_patch_logits is not None and context_patch_labels is not None:
             K_ctx = context_patch_logits.shape[1]
-            context_patch_loss = self.patch_criterion(
+            context_patch_loss = self._masked_patch_loss(
                 context_patch_logits.reshape(B * K_ctx, -1),
                 context_patch_labels.reshape(B * K_ctx, -1),
+                context_validity.reshape(B * K_ctx, -1) if context_validity is not None else None,
             )
             losses['level_0_context_patch_loss'] = context_patch_loss
             total_loss = total_loss + self.loss_weights['context_patch'] * context_patch_loss

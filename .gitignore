@@ -25,3 +25,4 @@ results/register_tokens_data.npz
 results/totalseg2d_patch_icl_eval/
 results/medsegbench_patch_icl_eval/
 results/medsegbench_universeg_eval/
+results/totalseg2d_universeg_eval/

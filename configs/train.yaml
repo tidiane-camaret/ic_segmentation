@@ -71,6 +71,7 @@ training:
   log_every: 10
 
 method: "patch_icl"
+checkpoint: null  # Path to model checkpoint to load weights from
 
 # Feature extraction mode: "precomputed" or "on_the_fly"
 feature_mode: "precomputed"

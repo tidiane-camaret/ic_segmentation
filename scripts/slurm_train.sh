@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -p ml_gpu-rtx2080
 #SBATCH -c 20
-#SBATCH --mem 48000  # Doubled from 24GB to 48GB
-#SBATCH --gres=gpu:1
-#SBATCH --time=1:00:00
+#SBATCH --mem 24000  
+#SBATCH --gres=gpu:2
+#SBATCH --time=24:00:00
 
 
 # interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 48000 --gres=gpu:2 --time=12:00:00 --pty bash 
@@ -22,4 +22,4 @@ nvidia-smi
 
 # run with sbatch scripts/slurm_batch.sh
 
-uv run accelerate launch --multi_gpu scripts/train.py experiment=51_trainable_encoder cluster=dlclarge
+uv run accelerate launch --multi_gpu scripts/train.py experiment=52_continuous_sampling cluster=dlclarge #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/warm-vortex-184/best_model.pt

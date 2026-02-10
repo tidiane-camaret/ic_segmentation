@@ -177,8 +177,8 @@ class PatchAugmenter(nn.Module):
         elif aug_params.get('rotation_angles') is not None:
             aug_features = self._rotate_features_continuous(aug_features, aug_params['rotation_angles'])
         if aug_params.get('flip_h') is not None or aug_params.get('flip_v') is not None:
-            flip_h = aug_params.get('flip_h') or torch.zeros_like(aug_params.get('flip_v'))
-            flip_v = aug_params.get('flip_v') or torch.zeros_like(aug_params.get('flip_h'))
+            flip_h = aug_params['flip_h'] if aug_params.get('flip_h') is not None else torch.zeros_like(aug_params['flip_v'])
+            flip_v = aug_params['flip_v'] if aug_params.get('flip_v') is not None else torch.zeros_like(aug_params['flip_h'])
             aug_features = self._flip_features(aug_features, flip_h, flip_v)
         return aug_features
 
@@ -189,8 +189,8 @@ class PatchAugmenter(nn.Module):
         inv_pred = predictions
         # Inverse flipping (flip is its own inverse)
         if aug_params.get('flip_h') is not None or aug_params.get('flip_v') is not None:
-            flip_h = aug_params.get('flip_h') or torch.zeros_like(aug_params.get('flip_v'))
-            flip_v = aug_params.get('flip_v') or torch.zeros_like(aug_params.get('flip_h'))
+            flip_h = aug_params['flip_h'] if aug_params.get('flip_h') is not None else torch.zeros_like(aug_params['flip_v'])
+            flip_v = aug_params['flip_v'] if aug_params.get('flip_v') is not None else torch.zeros_like(aug_params['flip_h'])
             inv_pred = self._flip(inv_pred, flip_h, flip_v)
         # Inverse rotation
         if aug_params.get('rotation_k') is not None:
@@ -202,18 +202,20 @@ class PatchAugmenter(nn.Module):
 
 
 class ContinuousSampler(nn.Module):
-    """Samples patches at any pixel coordinate (not restricted to a grid)."""
+    """Samples patches at any pixel coordinate whose center is inside the image."""
 
     def __init__(
         self,
         patch_size: int,
         num_patches: int,
+        num_patches_val: int | None = None,
         temperature: float = 1.0,
         augmenter: PatchAugmenter | None = None,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.num_patches = num_patches
+        self.num_patches_val = num_patches_val if num_patches_val is not None else num_patches
         self.temperature = temperature
         self.augmenter = augmenter
 
@@ -223,50 +225,73 @@ class ContinuousSampler(nn.Module):
         labels: torch.Tensor,
         weights: torch.Tensor,
         patch_features: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
-        """Sample K patches at any pixel coordinate."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict, torch.Tensor]:
+        """Sample K patches whose center is inside the image (may extend beyond borders)."""
         B, C, H, W = image.shape
         C_mask = labels.shape[1]
         ps = self.patch_size
-        K = self.num_patches
+        K = self.num_patches if self.training else self.num_patches_val
         device = image.device
 
-        valid_h = H - ps + 1
-        valid_w = W - ps + 1
+        pad_before = ps // 2
+        pad_after = ps - pad_before - 1
+
+        # Pad inputs so all center-inside patches can be fully extracted
+        image_pad = F.pad(image, (pad_before, pad_after, pad_before, pad_after), mode='constant', value=0)
+        labels_pad = F.pad(labels, (pad_before, pad_after, pad_before, pad_after), mode='constant', value=0)
+        weights_pad = F.pad(weights, (pad_before, pad_after, pad_before, pad_after), mode='constant', value=0)
+
+        # Validity map: 1 for original image pixels, 0 for padding
+        validity_map = torch.zeros(1, 1, H + ps - 1, W + ps - 1, device=device)
+        validity_map[:, :, pad_before:pad_before + H, pad_before:pad_before + W] = 1.0
+
+        # In padded space, valid_h = H, valid_w = W (one position per center pixel)
+        H_pad, W_pad = image_pad.shape[2], image_pad.shape[3]
+        valid_h = H_pad - ps + 1  # = H
+        valid_w = W_pad - ps + 1  # = W
         if valid_h <= 0 or valid_w <= 0:
             raise ValueError(f"Image size ({H}, {W}) too small for patch size {ps}")
 
-        # Pool weights over patch area
-        pooled_weights = F.max_pool2d(weights, kernel_size=ps, stride=1, padding=0)
+        # Pool weights over patch area (on padded weights)
+        pooled_weights = F.max_pool2d(weights_pad, kernel_size=ps, stride=1, padding=0)
         flat_weights = pooled_weights.reshape(B, -1) / self.temperature
         probs = F.softmax(flat_weights, dim=1)
 
         # Sample K indices without replacement
         indices = torch.multinomial(probs, K, replacement=False)
-        h_coords = indices // valid_w
-        w_coords = indices % valid_w
-        coords = torch.stack([h_coords, w_coords], dim=2)
+        h_coords_pad = indices // valid_w
+        w_coords_pad = indices % valid_w
 
-        # Extract patches
+        # Extract patches from padded tensors
         patches = torch.zeros(B, K, C, ps, ps, device=device)
         patch_labels = torch.zeros(B, K, C_mask, ps, ps, device=device)
+        patch_validity = torch.zeros(B, K, 1, ps, ps, device=device)
         for b in range(B):
             for k in range(K):
-                h, w = h_coords[b, k].item(), w_coords[b, k].item()
-                patches[b, k] = image[b, :, h:h+ps, w:w+ps]
-                patch_labels[b, k] = labels[b, :, h:h+ps, w:w+ps]
+                h, w = h_coords_pad[b, k].item(), w_coords_pad[b, k].item()
+                patches[b, k] = image_pad[b, :, h:h+ps, w:w+ps]
+                patch_labels[b, k] = labels_pad[b, :, h:h+ps, w:w+ps]
+                patch_validity[b, k] = validity_map[0, :, h:h+ps, w:w+ps]
 
-        # Apply augmentation
+        # Convert to original-space coordinates (can be negative)
+        h_coords = h_coords_pad - pad_before
+        w_coords = w_coords_pad - pad_before
+        coords = torch.stack([h_coords, w_coords], dim=2)
+
+        # Apply augmentation (validity is augmented alongside labels)
         aug_params = {}
         aug_features = patch_features
         if self.augmenter is not None:
-            patches, patch_labels, aug_features, aug_params = self.augmenter(patches, patch_labels, patch_features)
+            combined = torch.cat([patch_labels, patch_validity], dim=2)
+            patches, combined, aug_features, aug_params = self.augmenter(patches, combined, patch_features)
+            patch_labels = combined[:, :, :C_mask]
+            patch_validity = combined[:, :, C_mask:]
 
-        return patches, patch_labels, coords, aug_features, aug_params
+        return patches, patch_labels, coords, aug_features, aug_params, patch_validity
 
 
 class SlidingWindowSampler(nn.Module):
-    """Extracts patches in a regular grid pattern (sliding window)."""
+    """Extracts patches in a regular grid pattern, including border patches whose center is inside."""
 
     def __init__(
         self,
@@ -285,44 +310,64 @@ class SlidingWindowSampler(nn.Module):
         labels: torch.Tensor,
         weights: torch.Tensor,  # Ignored for sliding window
         patch_features: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict]:
-        """Extract all patches in a sliding window pattern."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict, torch.Tensor]:
+        """Extract all patches in a sliding window pattern (patches may extend beyond borders)."""
         B, C, H, W = image.shape
         C_mask = labels.shape[1]
         ps = self.patch_size
         stride = self.stride
+        device = image.device
 
-        grid_h = max(1, (H - ps) // stride + 1)
-        grid_w = max(1, (W - ps) // stride + 1)
+        pad_before = ps // 2
+        pad_after = ps - pad_before - 1
 
-        # Extract patches using unfold
-        patches_unfolded = image.unfold(2, ps, stride).unfold(3, ps, stride)
+        # Pad inputs
+        image_pad = F.pad(image, (pad_before, pad_after, pad_before, pad_after), mode='constant', value=0)
+        labels_pad = F.pad(labels, (pad_before, pad_after, pad_before, pad_after), mode='constant', value=0)
+
+        # Validity map
+        H_pad, W_pad = image_pad.shape[2], image_pad.shape[3]
+        validity_map = torch.zeros(1, 1, H_pad, W_pad, device=device)
+        validity_map[:, :, pad_before:pad_before + H, pad_before:pad_before + W] = 1.0
+
+        grid_h = max(1, (H_pad - ps) // stride + 1)
+        grid_w = max(1, (W_pad - ps) // stride + 1)
+
+        # Extract patches using unfold on padded tensors
+        patches_unfolded = image_pad.unfold(2, ps, stride).unfold(3, ps, stride)
         patches = patches_unfolded.reshape(B, C, -1, ps, ps).permute(0, 2, 1, 3, 4)
 
-        labels_unfolded = labels.unfold(2, ps, stride).unfold(3, ps, stride)
+        labels_unfolded = labels_pad.unfold(2, ps, stride).unfold(3, ps, stride)
         patch_labels = labels_unfolded.reshape(B, C_mask, -1, ps, ps).permute(0, 2, 1, 3, 4)
 
-        # Generate coordinates
-        device = image.device
-        h_indices = torch.arange(grid_h, device=device) * stride
-        w_indices = torch.arange(grid_w, device=device) * stride
+        validity_expanded = validity_map.expand(B, -1, -1, -1)
+        validity_unfolded = validity_expanded.unfold(2, ps, stride).unfold(3, ps, stride)
+        patch_validity = validity_unfolded.reshape(B, 1, -1, ps, ps).permute(0, 2, 1, 3, 4)
+
+        # Generate coordinates in original space (can be negative)
+        h_indices = torch.arange(grid_h, device=device) * stride - pad_before
+        w_indices = torch.arange(grid_w, device=device) * stride - pad_before
         h_grid, w_grid = torch.meshgrid(h_indices, w_indices, indexing='ij')
         coords_single = torch.stack([h_grid.flatten(), w_grid.flatten()], dim=1)
         coords = coords_single.unsqueeze(0).expand(B, -1, -1)
 
-        # Apply augmentation
+        # Apply augmentation (validity is augmented alongside labels)
         aug_params = {}
         aug_features = patch_features
         if self.augmenter is not None:
-            patches, patch_labels, aug_features, aug_params = self.augmenter(patches, patch_labels, patch_features)
+            combined = torch.cat([patch_labels, patch_validity], dim=2)
+            patches, combined, aug_features, aug_params = self.augmenter(patches, combined, patch_features)
+            patch_labels = combined[:, :, :C_mask]
+            patch_validity = combined[:, :, C_mask:]
 
-        return patches, patch_labels, coords, aug_features, aug_params
+        return patches, patch_labels, coords, aug_features, aug_params, patch_validity
 
 
 def create_sampler(
     sampler_type: str,
     patch_size: int,
     num_patches: int = 16,
+    num_patches_val: int | None = None,
     temperature: float = 1.0,
     stride: int | None = None,
     augmenter: PatchAugmenter | None = None,
@@ -332,6 +377,7 @@ def create_sampler(
         return ContinuousSampler(
             patch_size=patch_size,
             num_patches=num_patches,
+            num_patches_val=num_patches_val,
             temperature=temperature,
             augmenter=augmenter,
         )

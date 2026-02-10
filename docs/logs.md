@@ -1,5 +1,45 @@
 # Research Logs
 
+## 2026-02-10: Center-based patch sampling + train/val patch counts
+
+### Center-based sampling (border patches)
+
+**Problem:** Patches could only be sampled fully inside the image. For a 32×32 feature map with patch_size=8, only 25×25=625 valid positions existed, under-representing image borders.
+
+**Solution:** Allow any patch whose **center** is inside the image. Top-left coordinate now ranges from `-ps//2` to `H - 1 - ps//2`, giving H×W valid positions (32×32=1024).
+
+**Implementation:**
+- **Samplers** (`sampling.py`): Pad image/labels/weights by `ps//2` before and `ps - ps//2 - 1` after. Sample from padded space, then convert coordinates back to original space (can be negative).
+- **Validity mask**: Binary `[B, K, 1, ps, ps]` tensor tracking which pixels are real (1) vs padding (0). Concatenated with labels during augmentation so rotation/flip applies consistently, then split back.
+- **Aggregator** (`aggregate.py`): Two-sided coordinate clipping handles negative coords — computes overlap between patch and output image.
+- **Loss** (`patch_icl.py`): `_masked_patch_loss()` sets invalid pixels to logit=-100 / label=0, making loss contribution ≈0 for any criterion (BCE, dice).
+- **Feature extraction**: `extract_patch_features()` already clamps coords to `[0, max_start]`, so negative coords safely map to edge features.
+
+### Train/val patch counts
+
+**Problem:** Fixed `num_patches` for both training and validation. Want fewer patches during training (faster, regularization) and more during validation (better coverage).
+
+**Solution:** Added `num_patches_val` per level config. `ContinuousSampler` picks based on `self.training`. Defaults to `num_patches` if omitted.
+
+```yaml
+levels:
+  - resolution: 32
+    patch_size: 8
+    num_patches: 16        # Training
+    num_patches_val: 64    # Validation (defaults to num_patches)
+```
+
+Downstream code already handles variable K via `K = patches.shape[1]`.
+
+### Files modified
+
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl_v2/sampling.py` | Both samplers: pad inputs, create validity map, convert coords to original space, augment validity with labels. `ContinuousSampler`: added `num_patches_val`, picks K based on `self.training`. |
+| `src/models/patch_icl_v2/aggregate.py` | Two-sided coordinate clipping in scatter loop (handles negative h, w). |
+| `src/models/patch_icl_v2/patch_icl.py` | Thread validity through `_select_context_patches` and `forward`. `_masked_patch_loss()` helper. Read `num_patches_val` from level config, pass to `create_sampler`. |
+| `configs/experiment/52_continuous_sampling.yaml` | Added `num_patches_val: 64`. |
+
 ## 2026-02-09: Unified soft GT downsampling (max_pool → avg_pool)
 
 ### Problem

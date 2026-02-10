@@ -84,13 +84,20 @@ class PatchAggregator(nn.Module):
         for b in range(B):
             for k in range(K):
                 h, w = int(coords[b, k, 0].item()), int(coords[b, k, 1].item())
+                # Two-sided clipping: handle negative coords (border patches)
+                h_start = max(h, 0)
+                w_start = max(w, 0)
                 h_end = min(h + ps, H)
                 w_end = min(w + ps, W)
-                patch_h = h_end - h
-                patch_w = w_end - w
-                patch_weight = weights[b, k, :, :patch_h, :patch_w]
-                output[b, :, h:h_end, w:w_end] += patch_logits[b, k, :, :patch_h, :patch_w] * patch_weight
-                counts[b, :, h:h_end, w:w_end] += patch_weight
+                if h_start >= h_end or w_start >= w_end:
+                    continue
+                ph_start = h_start - h
+                pw_start = w_start - w
+                ph_end = ph_start + (h_end - h_start)
+                pw_end = pw_start + (w_end - w_start)
+                patch_weight = weights[b, k, :, ph_start:ph_end, pw_start:pw_end]
+                output[b, :, h_start:h_end, w_start:w_end] += patch_logits[b, k, :, ph_start:ph_end, pw_start:pw_end] * patch_weight
+                counts[b, :, h_start:h_end, w_start:w_end] += patch_weight
 
         covered = counts > self.min_coverage
         counts_safe = counts.clamp(min=self.min_coverage)

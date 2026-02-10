@@ -269,7 +269,7 @@ def main(cfg: DictConfig) -> None:
     model.set_loss_functions(patch_criterion, aggreg_criterion)
 
     # Optionally load model weights from checkpoint (like eval.py)
-    ckpt_path = cfg.paths.ckpts.get("patch_icl_v2", None)
+    ckpt_path = cfg.get("checkpoint", None)
     if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
@@ -277,7 +277,7 @@ def main(cfg: DictConfig) -> None:
             print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
     else:
         if accelerator.is_main_process:
-            print("Warning: No checkpoint loaded, using random weights")
+            print("No checkpoint loaded, training from scratch")
     if accelerator.is_main_process:
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model parameters: {num_params:,}")
