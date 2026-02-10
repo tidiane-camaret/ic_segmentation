@@ -407,7 +407,7 @@ def main(cfg: DictConfig) -> None:
             }, ckpt_dir / f"{model_name}_best_model.pt")
     """
     if accelerator.is_main_process:
-        print(f"\nVal complete! Best Dice: {best_dice:.5f}")
+        print(f"\nVal complete! Avg Dice: {val_final_dice:.5f}")
 
     if cfg.logging.use_wandb and accelerator.is_main_process:
         wandb.finish()
