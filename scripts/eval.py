@@ -117,7 +117,7 @@ def main(cfg: DictConfig) -> None:
     if cfg.logging.use_wandb and accelerator.is_main_process:
         import wandb
         wandb.init(
-            project=cfg.logging.wandb_project,
+            project=cfg.logging.wandb_project_eval,
             config=OmegaConf.to_container(cfg, resolve=True),  # wandb needs plain dict
         )
     # Build dataloaders

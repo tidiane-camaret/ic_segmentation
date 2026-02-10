@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import sys 
 
 class UniverSegBaseline(nn.Module):
     """
@@ -24,9 +24,10 @@ class UniverSegBaseline(nn.Module):
 
     def __init__(self, pretrained: bool = True):
         super().__init__()
+        sys.path.append("/work/dlclarge2/ndirt-SegFM3D/repos/UniVerseg")  # Add path to import universeg
         from universeg import universeg
         self.model = universeg(pretrained=pretrained)
-        self.input_size = 256  # UniverSeg expects 256x256 inputs
+        self.input_size = 128  # UniverSeg expects 128x128 inputs
         
         # Placeholder loss function (can be set via set_loss_functions)
         self.aggreg_criterion = None
@@ -38,14 +39,14 @@ class UniverSegBaseline(nn.Module):
         self.aggreg_criterion = aggreg_criterion
 
     def _resize_to_model(self, x: torch.Tensor) -> torch.Tensor:
-        """Resize tensor to model input size (256x256)."""
+        """Resize tensor to model input size (128x128)."""
         if x.shape[-2:] != (self.input_size, self.input_size):
             return F.interpolate(x, size=(self.input_size, self.input_size), 
                                mode='bilinear', align_corners=False)
         return x
 
     def _resize_mask_to_model(self, x: torch.Tensor) -> torch.Tensor:
-        """Resize mask to model input size (256x256) using nearest neighbor."""
+        """Resize mask to model input size (128x128) using nearest neighbor."""
         if x.shape[-2:] != (self.input_size, self.input_size):
             return F.interpolate(x, size=(self.input_size, self.input_size), mode='nearest')
         return x
@@ -101,7 +102,7 @@ class UniverSegBaseline(nn.Module):
         else:
             target_image = image
             
-        # Resize target to 256x256 and apply min-max normalization to [0, 1]
+        # Resize target to 128x128 and apply min-max normalization to [0, 1]
         target_resized = self._resize_to_model(target_image)
         target_resized = self._minmax_normalize(target_resized)
         
@@ -119,7 +120,7 @@ class UniverSegBaseline(nn.Module):
                 
             support_labels = context_out
             
-            # Resize support images and labels to 256x256
+            # Resize support images and labels to 128x128
             support_images_flat = support_images.view(B_ctx * k, 1, H_ctx, W_ctx)
             support_images_resized = self._resize_to_model(support_images_flat)
             # Apply min-max normalization to [0, 1] for support images
@@ -154,15 +155,19 @@ class UniverSegBaseline(nn.Module):
         num_patches = 1
         dummy_patches = target_image[:, :, :dummy_patch_size, :dummy_patch_size].unsqueeze(1)
         dummy_patch_logits = final_logit[:, :, :dummy_patch_size, :dummy_patch_size].unsqueeze(1)
+        if labels is not None:
+            dummy_patch_labels = labels[:, :, :dummy_patch_size, :dummy_patch_size].unsqueeze(1)
+        else:
+            dummy_patch_labels = torch.zeros_like(dummy_patch_logits)
         dummy_coords = torch.zeros(B, num_patches, 2, device=device)
-        
+
         return {
             'final_pred': final_logit,
             'final_logit': final_logit,
             'coarse_pred': final_logit,
             'level_outputs': [],  # No level outputs for this simple model
             'patches': dummy_patches,
-            'patch_labels': dummy_patches,
+            'patch_labels': dummy_patch_labels,
             'patch_logits': dummy_patch_logits,
             'patch_coords': dummy_coords,
             'context_patches': None,

@@ -2,8 +2,8 @@
 #SBATCH -p ml_gpu-rtx2080
 #SBATCH -c 20
 #SBATCH --mem 48000  # Doubled from 24GB to 48GB
-#SBATCH --gres=gpu:2
-#SBATCH --time=12:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --time=1:00:00
 
 
 # interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 48000 --gres=gpu:2 --time=12:00:00 --pty bash 
@@ -21,8 +21,5 @@ export NCCL_TIMEOUT=1800
 nvidia-smi
 
 # run with sbatch scripts/slurm_batch.sh
-# uv run scripts/totalseg_3d_to_2d.py cluster=dlclarge
-# uv run scripts/extract_dinov3_features.py cluster=dlclarge
 
-uv run accelerate launch --multi_gpu scripts/train.py experiment=51_trainable_encoder cluster=dlclarge
-# uv run accelerate launch --multi_gpu scripts/eval.py experiment=40_slidingwindow cluster=dlclarge # dataset=totalseg2d val_label_ids=val
+uv run accelerate launch --multi_gpu scripts/eval.py experiment=51_trainable_encoder cluster=dlclarge dataset=medsegbench paths.ckpts.patch_icl_v2=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/warm-vortex-184

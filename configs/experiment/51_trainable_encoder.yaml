@@ -5,21 +5,15 @@ paths:
   ckpts:
     patch_icl_v2: null #${..RESULTS_DIR}/checkpoints/peach-plasma-179/best_model.pt
 
-logging:
-  use_wandb: true
-  wandb_project: "patch_icl"
-  save_imgs_masks: true
-  save_every_n_epochs: 1  # Save train images every N epochs
 
-context_size: 3  # Increased from 1
-random_coloring_nb: 0
-
-# Use on-the-fly MedSAM v1 features
+# trainable image encoder
 feature_mode: "on_the_fly"
 feature_extractor_type: "icl_encoder"
 
 preprocessing:
   image_size: [256, 256, 256]
+
+context_size: 3  # Increased from 1
 
 # CarveMix augmentation (training only, single-label mode)
 carve_mix:
@@ -68,11 +62,6 @@ training:
   num_workers: 12
   log_every: 10
 
-optimizer:
-  optimizer_type: "adamw"
-  optimizer_args:
-    lr: 0.0003
-    weight_decay: 0.01
 
 warmup_scheduler:
   enabled: true
@@ -92,8 +81,8 @@ model:
         num_patches: 16  # Used by continuous sampler
         sampling_temperature: 0.1
 
-    oracle_levels_train: [false]  # GT-guided sampling during training
-    oracle_levels_valid: [false]  # Uniform sampling during validation
+    oracle_levels_train: [false]  # Unused with sliding_window sampler 
+    oracle_levels_valid: [false]  # Unused with sliding_window sampler
 
     sampler:
       type: "sliding_window"  # Changed from sliding_window - uses oracle weights

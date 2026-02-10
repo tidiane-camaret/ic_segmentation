@@ -1,4 +1,3 @@
-# Simplified training configuration for PatchICL v2
 # Override any parameter via CLI: python scripts/train.py experiment=patch_icl_v1
 # Multi-run sweep: python scripts/train.py -m context_size=1,2,3
 
@@ -7,13 +6,22 @@ defaults:
   - experiment: null
   - cluster: nfs
 
+
+# Logging
+logging:
+  use_wandb: true
+  wandb_project: "patch_icl"
+  wandb_project_eval: "patch_icl_eval"
+  save_imgs_masks: true
+  save_every_n_epochs: 1  # Save train images every N epochs
+  
 # Dataset: "totalseg2d" or "medsegbench"
 dataset: totalseg2d
 download: false
 load_dinov3_features: true
 context_size: 1
 random_coloring_nb: 0
-method: "patch_icl"
+
 train_label_ids: "train"
 val_label_ids: "val"
 
@@ -21,12 +29,6 @@ val_label_ids: "val"
 medsegbench:
   datasets: null  # List of dataset names to load, null for all
   max_samples_per_dataset: null  # Limit per dataset (for debugging)
-
-# Feature extraction mode: "precomputed" or "on_the_fly"
-feature_mode: "precomputed"
-feature_extractor_type: "meddino"
-feature_extraction_resolution: 256
-meddino_layer_idx: 11
 
 # Preprocessing
 preprocessing:
@@ -68,11 +70,13 @@ training:
   num_workers: 8
   log_every: 10
 
-# Logging
-logging:
-  use_wandb: true
-  wandb_project: "patch_icl"
-  save_imgs_masks: false
+method: "patch_icl"
+
+# Feature extraction mode: "precomputed" or "on_the_fly"
+feature_mode: "precomputed"
+feature_extractor_type: "meddino"
+feature_extraction_resolution: 256
+meddino_layer_idx: 11
 
 # Model
 model:
