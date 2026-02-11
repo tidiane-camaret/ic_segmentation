@@ -3,7 +3,7 @@
 #SBATCH -c 20
 #SBATCH --mem 24000  
 #SBATCH --gres=gpu:2
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 
 
 # interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 48000 --gres=gpu:2 --time=12:00:00 --pty bash 
@@ -22,4 +22,4 @@ nvidia-smi
 
 # run with sbatch scripts/slurm_batch.sh
 
-uv run accelerate launch --multi_gpu scripts/train.py experiment=60_2_levels cluster=dlclarge #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/warm-vortex-184/best_model.pt
+uv run accelerate launch --multi_gpu scripts/train.py experiment=60_2_levels cluster=dlclarge checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/rich-valley-210/best_model.pt

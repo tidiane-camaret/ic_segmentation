@@ -20,7 +20,7 @@ paths:
     # patch_icl_v2: ${..RESULTS_DIR}/checkpoints/scarlet-firefly-161/best_model.pt
 
 # Cluster-specific training settings
-train_batch_size: 14
-val_batch_size: 14
+train_batch_size: 10
+val_batch_size: 10
 training:
   num_workers: 16

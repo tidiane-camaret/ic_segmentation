@@ -21,7 +21,8 @@
       "WebFetch(domain:www.nature.com)",
       "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
       "Bash(uv run python:*)",
-      "WebFetch(domain:ar5iv.labs.arxiv.org)"
+      "WebFetch(domain:ar5iv.labs.arxiv.org)",
+      "Bash(timeout 30 bash:*)"
     ],
     "deny": [
       "Read(./old/**)"

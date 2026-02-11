@@ -72,30 +72,34 @@ model:
       output_grid_size: 32 #128  # Full resolution (layer 0 native size)
 
     levels:
+      - resolution: 8
+        patch_size: 8
+        num_patches: 9
+        num_patches_val: 9
+        sampling_temperature: 0.2
+        sampling_method: "sliding_window"
       - resolution: 16
         patch_size: 8
-        num_patches: 8
+        num_patches: 16
         num_patches_val: 16
         sampling_temperature: 0.2
-      - resolution: 32
-        patch_size: 8
-        num_patches: 12
-        num_patches_val: 32
-        sampling_temperature: 0.2
-      - resolution: 64
-        patch_size: 8
-        num_patches: 16
-        num_patches_val: 64
-        sampling_temperature: 0.2
+        sampling_method: "continuous"
+      #- resolution: 32
+      #  patch_size: 8
+      #  num_patches: 16
+      #  num_patches_val: 32
+      #  sampling_temperature: 0.2
+      #  sampling_method: "continuous"
 
-    oracle_levels_train: [false, false, false]  # Level 0: uniform, Level 1: guided by level 0 predictions
-    oracle_levels_valid: [false, false, false]  # Level 0: uniform, Level 1: guided by level 0 predictions
+
+    oracle_levels_train: [false, true]  # Level 0: uniform, Level 1: guided by level 0 predictions
+    oracle_levels_valid: [false, false]  # Level 0: uniform, Level 1: guided by level 0 predictions
 
     cascade:
       detach_between_levels: true  # Detach predictions between levels (memory efficient)
 
     sampler:
-      type: "continuous"
+      sliding_window_stride: 4  
 
     aggregator:
       type: "average"
@@ -129,4 +133,4 @@ model:
           target_aggreg: 1.0
           context_patch: 0.5
           context_aggreg: 0.5
-      level_weights: [1.0, 1.0, 1.0]  # Per-level loss multiplier
+      level_weights: [1.0, 1.0]  # Per-level loss multiplier

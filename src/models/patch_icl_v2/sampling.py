@@ -254,6 +254,11 @@ class ContinuousSampler(nn.Module):
 
         # Pool weights over patch area (on padded weights)
         pooled_weights = F.max_pool2d(weights_pad, kernel_size=ps, stride=1, padding=0)
+        # Min-max normalize to [0, 1] per sample for discriminative sampling
+        flat = pooled_weights.flatten(1)
+        lo = flat.min(dim=1, keepdim=True).values
+        hi = flat.max(dim=1, keepdim=True).values
+        pooled_weights = (pooled_weights - lo.view(B, 1, 1, 1)) / (hi.view(B, 1, 1, 1) - lo.view(B, 1, 1, 1) + 1e-6)
         flat_weights = pooled_weights.reshape(B, -1) / self.temperature
         probs = F.softmax(flat_weights, dim=1)
 
@@ -296,12 +301,16 @@ class SlidingWindowSampler(nn.Module):
     def __init__(
         self,
         patch_size: int,
+        num_patches: int = 16,
+        num_patches_val: int | None = None,
         stride: int | None = None,
         augmenter: PatchAugmenter | None = None,
     ):
         super().__init__()
         self.patch_size = patch_size
-        self.stride = stride if stride is not None else patch_size
+        self.num_patches = num_patches
+        self.num_patches_val = num_patches_val if num_patches_val is not None else num_patches
+        self.stride = stride  # None means auto-compute from num_patches
         self.augmenter = augmenter
 
     def forward(
@@ -315,7 +324,6 @@ class SlidingWindowSampler(nn.Module):
         B, C, H, W = image.shape
         C_mask = labels.shape[1]
         ps = self.patch_size
-        stride = self.stride
         device = image.device
 
         pad_before = ps // 2
@@ -329,6 +337,17 @@ class SlidingWindowSampler(nn.Module):
         H_pad, W_pad = image_pad.shape[2], image_pad.shape[3]
         validity_map = torch.zeros(1, 1, H_pad, W_pad, device=device)
         validity_map[:, :, pad_before:pad_before + H, pad_before:pad_before + W] = 1.0
+
+        # Compute stride: use explicit stride or auto-compute from num_patches
+        if self.stride is not None:
+            stride = self.stride
+        else:
+            K = self.num_patches if self.training else self.num_patches_val
+            grid_side = max(1, round(K ** 0.5))
+            if grid_side > 1 and H > 1:
+                stride = max(1, (H - 1) // (grid_side - 1))
+            else:
+                stride = 1
 
         grid_h = max(1, (H_pad - ps) // stride + 1)
         grid_w = max(1, (W_pad - ps) // stride + 1)
@@ -384,6 +403,8 @@ def create_sampler(
     elif sampler_type == "sliding_window":
         return SlidingWindowSampler(
             patch_size=patch_size,
+            num_patches=num_patches,
+            num_patches_val=num_patches_val,
             stride=stride,
             augmenter=augmenter,
         )

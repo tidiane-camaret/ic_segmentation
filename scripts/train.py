@@ -104,8 +104,6 @@ def main(cfg: DictConfig) -> None:
         # TotalSeg2D dataloader
         from src.dataloaders.totalseg2d_dataloader import get_dataloader as get_totalseg2d_dataloader
 
-        load_precomputed_features = (feature_mode == "precomputed") and cfg.get("load_dinov3_features", True)
-
         train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
 
@@ -140,7 +138,6 @@ def main(cfg: DictConfig) -> None:
             num_workers=cfg.training.get("num_workers", 4),
             split="train",
             shuffle=True,
-            load_dinov3_features=load_precomputed_features,
             max_ds_len=max_ds_len_train,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             augment=use_image_augmentation,
@@ -163,7 +160,6 @@ def main(cfg: DictConfig) -> None:
             num_workers=cfg.training.get("num_workers", 4),
             split="val",
             shuffle=False,
-            load_dinov3_features=load_precomputed_features,
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             augment=False,  # No augmentation for validation
@@ -339,7 +335,7 @@ def main(cfg: DictConfig) -> None:
         if accelerator.is_main_process:
             print(
                 f"Epoch {epoch:04d} | "
-                f"Train Loss: {train_losses['loss']:.5f} | Train Dice: {train_losses['final_dice']:.5f} | "
+                f"Train Loss: {train_losses['total_loss']:.5f} | Train Dice: {train_losses['final_dice']:.5f} | "
                 f"Val Loss: {val_loss:.5f} | Val Dice: {val_final_dice:.5f} | "
                 f"LR: {scheduler.get_last_lr()[0]:.2e}"
             )
@@ -347,14 +343,6 @@ def main(cfg: DictConfig) -> None:
         if cfg.logging.use_wandb and accelerator.is_main_process:
             log_dict = {
                 "epoch": epoch,
-                "train_loss": train_losses["loss"],
-                "train_local_dice": train_losses["local_dice"],
-                "train_final_dice": train_losses["final_dice"],
-                "train_context_dice": train_losses.get("context_dice", 0),
-                "train_target_patch_loss": train_losses.get("target_patch_loss", 0),
-                "train_target_aggreg_loss": train_losses.get("target_aggreg_loss", 0),
-                "train_context_patch_loss": train_losses.get("context_patch_loss", 0),
-                "train_context_aggreg_loss": train_losses.get("context_aggreg_loss", 0),
                 "val_loss": val_loss,
                 "val_local_dice": val_local_dice,
                 "val_final_dice": val_final_dice,
@@ -364,14 +352,24 @@ def main(cfg: DictConfig) -> None:
                 "val_context_softdice": val_detailed.get("context_softdice", 0),
                 "lr": scheduler.get_last_lr()[0],
             }
-            # Log per-label dice scores for training
+            # Log all train metrics dynamically
+            for key, val in train_losses.items():
+                if key == "per_label":
+                    continue
+                log_dict[f"train/{key}"] = val
+            # Log per-label dice scores
             if "per_label" in train_losses:
                 for label_id, dice_score in train_losses["per_label"].items():
                     log_dict[f"train_dice/{label_id}"] = dice_score
-            # Log per-label dice scores for validation
             if val_detailed and "per_label" in val_detailed:
                 for label_id, dice_score in val_detailed["per_label"].items():
                     log_dict[f"val_dice/{label_id}"] = dice_score
+            # Log per-level val metrics (level_N_dice, level_N_softdice, level_N_avg_probs_*)
+            if val_detailed:
+                skip_keys = {"per_case", "per_label", "local_softdice", "final_softdice", "context_softdice"}
+                for key, value in val_detailed.items():
+                    if key not in skip_keys:
+                        log_dict[f"val/{key}"] = value
             wandb.log(log_dict)
 
         # Save best — sync all ranks before checkpoint to avoid collective mismatch

@@ -143,11 +143,12 @@ class PatchICL(nn.Module):
         else:
             self.augmenter = None
 
-        # Per-level samplers
+        # Per-level samplers (each level can override sampling_method)
         self.samplers = nn.ModuleList()
         for level_cfg in levels_cfg:
+            level_sampler_type = level_cfg.get('sampling_method', self.sampler_type)
             self.samplers.append(create_sampler(
-                sampler_type=self.sampler_type,
+                sampler_type=level_sampler_type,
                 patch_size=level_cfg['patch_size'],
                 num_patches=level_cfg['num_patches'],
                 num_patches_val=level_cfg.get('num_patches_val', level_cfg['num_patches']),
@@ -483,7 +484,7 @@ class PatchICL(nn.Module):
             target_features, context_features = self._extract_features(image, context_in, context_out)
 
         # Process each level
-        prev_pred = None
+        prev_preds = []  # collect predictions from all previous levels
         level_outputs = []
 
         for i in range(self.num_levels):
@@ -494,14 +495,20 @@ class PatchICL(nn.Module):
             if use_oracle and labels is not None:
                 labels_ds = self._downsample_mask(labels, resolution)
                 weights = self._mask_to_weights(labels_ds)
-            elif prev_pred is not None:
-                # Use previous level's prediction to guide sampling
-                prev_probs = torch.sigmoid(prev_pred)
-                if self.detach_between_levels:
-                    prev_probs = prev_probs.detach()
-                weights = F.interpolate(prev_probs, size=(resolution, resolution), mode='bilinear', align_corners=False)
+            elif len(prev_preds) > 0:
+                # Average probs from all previous levels (sampler normalizes)
+                probs_list = []
+                for pp in prev_preds:
+                    pp_prob = torch.sigmoid(pp)
+                    if self.detach_between_levels:
+                        pp_prob = pp_prob.detach()
+                    probs_list.append(F.interpolate(pp_prob, size=(resolution, resolution), mode='bilinear', align_corners=False))
+                weights = torch.stack(probs_list).mean(dim=0)
             else:
                 weights = torch.ones(B, 1, resolution, resolution, device=device)
+
+            # Store averaged probs used for sampling (None for level 0 / oracle)
+            avg_probs = weights if len(prev_preds) > 0 and not use_oracle else None
 
             level_out, pred = self._forward_level(
                 level_idx=i,
@@ -515,11 +522,12 @@ class PatchICL(nn.Module):
                 H=H, W=W,
                 return_attn_weights=return_attn_weights,
             )
+            level_out['avg_prev_probs'] = avg_probs
             level_outputs.append(level_out)
-            prev_pred = pred
+            prev_preds.append(pred)
 
         # Final prediction from last level
-        final_pred = F.interpolate(prev_pred, size=(H, W), mode='bilinear', align_corners=False)
+        final_pred = F.interpolate(prev_preds[-1], size=(H, W), mode='bilinear', align_corners=False)
         coarse_pred = F.interpolate(level_outputs[0]['pred'], size=(H, W), mode='bilinear', align_corners=False)
 
         # Backward compat aliases from last level
@@ -594,7 +602,6 @@ class PatchICL(nn.Module):
                 target_validity.reshape(B * K, -1) if target_validity is not None else None,
             )
             losses[f'level_{i}_target_patch_loss'] = target_patch_loss
-            losses[f'level_{i}_patch_loss'] = target_patch_loss
             total_loss = total_loss + lw * self.loss_weights['target_patch'] * target_patch_loss
             sum_target_patch = sum_target_patch + target_patch_loss
 
@@ -604,7 +611,6 @@ class PatchICL(nn.Module):
             labels_ds = F.avg_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
             target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
             losses[f'level_{i}_target_aggreg_loss'] = target_aggreg_loss
-            losses[f'level_{i}_pred_loss'] = target_aggreg_loss
             total_loss = total_loss + lw * self.loss_weights['target_aggreg'] * target_aggreg_loss
             sum_target_aggreg = sum_target_aggreg + target_aggreg_loss
 
@@ -643,10 +649,25 @@ class PatchICL(nn.Module):
             else:
                 losses[f'level_{i}_context_aggreg_loss'] = torch.tensor(0.0, device=device)
 
-        # Final prediction loss (from last level, upsampled to full res)
-        final_loss = self.aggreg_criterion(outputs['final_pred'], labels)
-        losses['final_loss'] = final_loss
-        total_loss = total_loss + final_loss
+        # Dice / soft-dice of averaged previous-level probs vs GT (logging only)
+        for i, level_out in enumerate(outputs['level_outputs']):
+            avg_probs = level_out.get('avg_prev_probs')
+            if avg_probs is not None:
+                resolution = avg_probs.shape[-1]
+                gt_ds = self._downsample_mask(labels, resolution)
+                gt_ds = self._mask_to_weights(gt_ds)
+                p_flat = avg_probs.flatten(1)
+                g_flat = gt_ds.flatten(1)
+                # Soft dice
+                intersection = (p_flat * g_flat).sum(dim=1)
+                soft_dice = (2.0 * intersection / (p_flat.sum(dim=1) + g_flat.sum(dim=1) + 1e-6)).mean()
+                losses[f'level_{i}_avg_probs_soft_dice'] = soft_dice
+                # Hard dice (threshold at 0.5)
+                p_bin = (p_flat > 0.5).float()
+                intersection_hard = (p_bin * g_flat).sum(dim=1)
+                hard_dice = (2.0 * intersection_hard / (p_bin.sum(dim=1) + g_flat.sum(dim=1) + 1e-6)).mean()
+                losses[f'level_{i}_avg_probs_dice'] = hard_dice
+
         losses['total_loss'] = total_loss
 
         # Aggregated losses for logging (mean across levels)
@@ -659,10 +680,5 @@ class PatchICL(nn.Module):
         losses['context_loss'] = losses['context_patch_loss'] + losses['context_aggreg_loss']
         losses['patch_loss_total'] = losses['target_patch_loss'] + losses['context_patch_loss']
         losses['aggreg_loss_total'] = losses['target_aggreg_loss'] + losses['context_aggreg_loss']
-
-        # Legacy compatibility
-        losses['aggreg_loss'] = losses['target_aggreg_loss']
-        losses['local_loss'] = losses['target_patch_loss']
-        losses['agg_loss'] = final_loss
 
         return losses

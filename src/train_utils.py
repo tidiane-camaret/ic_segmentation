@@ -119,6 +119,7 @@ def _save_sample_images(
             l_patch_size = level_info.get("patch_size", 16)
             l_level_res = level_info.get("level_res", 32)
             l_pred_probs = level_info.get("pred_probs")
+            l_avg_prev_probs = level_info.get("avg_prev_probs")
 
             # --- Top row: target + context images with patch boxes ---
             axes[top_row][0].imshow(img, cmap="gray")
@@ -202,7 +203,18 @@ def _save_sample_images(
                 axes[bot_row][2].set_title("Pred (N/A)")
             axes[bot_row][2].axis("off")
 
-            for j in range(3, n_cols):
+            # Avg previous-level probs (sampling weights for this level)
+            if l_avg_prev_probs is not None and n_cols > 3:
+                ap = l_avg_prev_probs.squeeze().numpy()
+                im = axes[bot_row][3].imshow(ap, cmap="hot", vmin=0, vmax=1)
+                axes[bot_row][3].set_title(f"Prev probs ({ap.shape[0]}x{ap.shape[1]})")
+                plt.colorbar(im, ax=axes[bot_row][3], fraction=0.046, pad=0.04)
+            elif n_cols > 3:
+                axes[bot_row][3].set_title("Prev probs (N/A)")
+            if n_cols > 3:
+                axes[bot_row][3].axis("off")
+
+            for j in range(4, n_cols):
                 axes[bot_row][j].axis("off")
 
         fig.suptitle(f"{label_id} (final dice={dice:.3f})", fontsize=12, y=1.01)
@@ -251,8 +263,12 @@ def train_epoch(
         except ImportError:
             use_wandb = False
 
-    # Metrics
-    total_loss = 0.0
+    # Metrics - dynamically accumulate all loss keys from compute_loss
+    from collections import defaultdict
+    loss_accum = defaultdict(float)  # sums for all compute_loss keys
+    loss_count = defaultdict(int)    # counts (some keys appear conditionally)
+    dice_accum = defaultdict(float)  # per-level dice accumulators
+    dice_count = defaultdict(int)
     total_local_dice = 0.0
     total_final_dice = 0.0
     total_context_dice = 0.0
@@ -260,10 +276,6 @@ def train_epoch(
     total_final_softdice = 0.0
     total_context_softdice = 0.0
     context_dice_count = 0
-    total_target_patch = 0.0
-    total_target_aggreg = 0.0
-    total_context_patch = 0.0
-    total_context_aggreg = 0.0
     label_dice_scores = {}  # Per-label tracking
     label_samples = {}  # Store one sample per label for wandb image logging
 
@@ -337,21 +349,42 @@ def train_epoch(
             local_softdice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
             total_local_softdice += local_softdice.mean().item()
 
-            # Final dice (at level resolution)
+            # Per-level dice (at each level's resolution)
             level_outputs = outputs.get("level_outputs")
             if level_outputs:
-                level_pred = level_outputs[-1]["pred"]
-                level_res = level_pred.shape[-1]
-                scale_factor = labels.shape[-1] // level_res
-                # avg_pool2d gives fractional coverage per patch (avoids
-                # inflating sparse masks the way max_pool2d does)
-                labels_ds = F.avg_pool2d(
-                    labels.float(), kernel_size=scale_factor, stride=scale_factor
-                )
-                pred_probs = torch.sigmoid(level_pred)
+                for li, level_out in enumerate(level_outputs):
+                    level_pred = level_out["pred"]
+                    level_res = level_pred.shape[-1]
+                    scale_factor = labels.shape[-1] // level_res
+                    labels_ds = F.avg_pool2d(
+                        labels.float(), kernel_size=scale_factor, stride=scale_factor
+                    )
+                    lp_probs = torch.sigmoid(level_pred)
+                    lp_binary = (lp_probs > PRED_THRESHOLD).float()
+                    lp_labels_float = labels_ds
+                    lp_labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
+                    sp_dims = tuple(range(2, lp_binary.dim()))
+                    # Hard dice
+                    l_inter = (lp_binary * lp_labels_binary).sum(dim=sp_dims)
+                    l_union = lp_binary.sum(dim=sp_dims) + lp_labels_binary.sum(dim=sp_dims)
+                    l_dice = (2 * l_inter + 1e-6) / (l_union + 1e-6)
+                    dice_accum[f"level_{li}_dice"] += l_dice.mean().item()
+                    dice_count[f"level_{li}_dice"] += 1
+                    # Soft dice
+                    l_s_inter = (lp_probs * lp_labels_float).sum(dim=sp_dims)
+                    l_s_denom = lp_probs.sum(dim=sp_dims) + lp_labels_float.sum(dim=sp_dims)
+                    l_sdice = (2 * l_s_inter + 1e-6) / (l_s_denom + 1e-6)
+                    dice_accum[f"level_{li}_softdice"] += l_sdice.mean().item()
+                    dice_count[f"level_{li}_softdice"] += 1
+
+                # Use last level for final_dice (backward compat)
+                pred_probs = torch.sigmoid(level_outputs[-1]["pred"])
                 pred_binary = (pred_probs > PRED_THRESHOLD).float()
-                labels_float = labels_ds  # soft target for soft dice
-                labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
+                last_res = level_outputs[-1]["pred"].shape[-1]
+                sf = labels.shape[-1] // last_res
+                labels_ds_last = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
+                labels_float = labels_ds_last
+                labels_binary = (labels_ds_last > GT_AREA_THRESHOLD).float()
             else:
                 pred_probs = torch.sigmoid(outputs["final_logit"])
                 pred_binary = (pred_probs > PRED_THRESHOLD).float()
@@ -402,12 +435,16 @@ def train_epoch(
                             l_pred_probs = None
                             if l_pred is not None:
                                 l_pred_probs = torch.sigmoid(l_pred[i]).detach().cpu()
+                            l_avg_prev = level_out.get("avg_prev_probs")
+                            if l_avg_prev is not None:
+                                l_avg_prev = l_avg_prev[i].detach().cpu()
                             levels.append({
                                 "target_coords": l_coords,
                                 "context_coords": l_ctx_coords,
                                 "patch_size": level_out.get("patch_size", 16),
                                 "level_res": level_out.get("level_res", 32),
                                 "pred_probs": l_pred_probs,
+                                "avg_prev_probs": l_avg_prev,
                             })
 
                     label_samples[label_id] = {
@@ -472,23 +509,18 @@ def train_epoch(
             optimizer.step()
 
         # Track metrics
-        total_loss += loss.item()
-        total_target_patch += losses.get("target_patch_loss", torch.tensor(0.0)).item()
-        total_target_aggreg += losses.get(
-            "target_aggreg_loss", torch.tensor(0.0)
-        ).item()
-        total_context_patch += losses.get(
-            "context_patch_loss", torch.tensor(0.0)
-        ).item()
-        total_context_aggreg += losses.get(
-            "context_aggreg_loss", torch.tensor(0.0)
-        ).item()
+        # Accumulate all loss keys dynamically
+        for key, val in losses.items():
+            v = val.item() if hasattr(val, 'item') else float(val)
+            loss_accum[key] += v
+            loss_count[key] += 1
 
         # Update progress bar
         n_batches = idx + 1
+        avg_loss = loss_accum['total_loss'] / loss_count['total_loss'] if loss_count['total_loss'] else 0
         pbar.set_postfix(
             {
-                "loss": f"{total_loss / n_batches:.4f}",
+                "loss": f"{avg_loss:.4f}",
                 "dice": f"{total_final_dice / n_batches:.4f}",
                 "sdice": f"{total_final_softdice / n_batches:.4f}",
             }
@@ -507,38 +539,33 @@ def train_epoch(
                 if context_dice_count > 0
                 else 0.0
             )
-            wandb.log(
-                {
-                    "train_batch/loss": total_loss / n_batches,
-                    "train_batch/local_dice": total_local_dice / n_batches,
-                    "train_batch/final_dice": total_final_dice / n_batches,
-                    "train_batch/context_dice": ctx_dice_avg,
-                    "train_batch/local_softdice": total_local_softdice / n_batches,
-                    "train_batch/final_softdice": total_final_softdice / n_batches,
-                    "train_batch/context_softdice": ctx_softdice_avg,
-                    "train_batch/target_patch_loss": total_target_patch / n_batches,
-                    "train_batch/target_aggreg_loss": total_target_aggreg / n_batches,
-                    "train_batch/context_patch_loss": total_context_patch / n_batches,
-                    "train_batch/context_aggreg_loss": total_context_aggreg / n_batches,
-                    "global_step": global_step,
-                },
-                step=global_step,
-            )
+            log_dict = {
+                "train_batch/local_dice": total_local_dice / n_batches,
+                "train_batch/final_dice": total_final_dice / n_batches,
+                "train_batch/context_dice": ctx_dice_avg,
+                "train_batch/local_softdice": total_local_softdice / n_batches,
+                "train_batch/final_softdice": total_final_softdice / n_batches,
+                "train_batch/context_softdice": ctx_softdice_avg,
+                "global_step": global_step,
+            }
+            # Log all compute_loss keys (includes avg_probs dices)
+            for key in loss_accum:
+                log_dict[f"train_batch/{key}"] = loss_accum[key] / loss_count[key]
+            # Log per-level dice metrics
+            for key in dice_accum:
+                if dice_count[key] > 0:
+                    log_dict[f"train_batch/{key}"] = dice_accum[key] / dice_count[key]
+            wandb.log(log_dict, step=global_step)
 
         # Print progress
         if print_every and idx % print_every == 0 and is_main:
-            ctx_dice_avg = (
-                total_context_dice / context_dice_count
-                if context_dice_count > 0
-                else 0.0
-            )
+            avg_loss = loss_accum['total_loss'] / loss_count['total_loss'] if loss_count['total_loss'] else 0
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
-                f"Loss: {total_loss / n_batches:.5f} | "
-                f"LocalDice: {total_local_dice / n_batches:.5f} | "
+                f"Loss: {avg_loss:.5f} | "
+                f"PatchDice: {total_local_dice / n_batches:.5f} | "
                 f"FinalDice: {total_final_dice / n_batches:.5f} | "
-                f"SoftDice: {total_final_softdice / n_batches:.5f} | "
-                f"CtxDice: {ctx_dice_avg:.5f}"
+                f"SoftDice: {total_final_softdice / n_batches:.5f}"
             )
 
         del outputs, losses
@@ -566,27 +593,23 @@ def train_epoch(
     ):
         _save_sample_images(label_samples, save_dir, epoch, prefix="train", max_samples=len(label_samples))
 
-    return {
-        "loss": total_loss / n,
+    # Build result dict from all accumulated loss keys
+    result = {key: loss_accum[key] / loss_count[key] for key in loss_accum}
+    # Add dice metrics
+    result.update({
         "local_dice": total_local_dice / n,
         "final_dice": total_final_dice / n,
         "context_dice": ctx_dice_final,
         "local_softdice": total_local_softdice / n,
         "final_softdice": total_final_softdice / n,
         "context_softdice": ctx_softdice_final,
-        "target_patch_loss": total_target_patch / n,
-        "target_aggreg_loss": total_target_aggreg / n,
-        "context_patch_loss": total_context_patch / n,
-        "context_aggreg_loss": total_context_aggreg / n,
-        "target_loss": (total_target_patch + total_target_aggreg) / n,
-        "context_loss": (total_context_patch + total_context_aggreg) / n,
-        "patch_loss_total": (total_target_patch + total_context_patch) / n,
-        "aggreg_loss_total": (total_target_aggreg + total_context_aggreg) / n,
-        "aggreg_loss": total_target_aggreg / n,
-        "local_loss": total_target_patch / n,
-        "agg_loss": total_loss / n,
         "per_label": label_avg_dice,
-    }
+    })
+    # Add per-level dice metrics
+    for key in dice_accum:
+        if dice_count[key] > 0:
+            result[key] = dice_accum[key] / dice_count[key]
+    return result
 
 
 @torch.no_grad()
@@ -607,6 +630,9 @@ def validate(
         accelerator.unwrap_model(model) if accelerator is not None else model
     )
 
+    from collections import defaultdict
+    dice_accum = defaultdict(float)
+    dice_count = defaultdict(int)
     total_loss = 0.0
     total_local_dice = 0.0
     total_final_dice = 0.0
@@ -687,21 +713,65 @@ def validate(
         local_softdice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
         total_local_softdice += local_softdice.mean().item()
 
-        # Final dice
+        # Per-level dice
         level_outputs = outputs.get("level_outputs", [])
         if level_outputs:
-            level_pred = level_outputs[-1]["pred"]
-            level_res = level_pred.shape[-1]
-            scale_factor = labels.shape[-1] // level_res
-            # avg_pool2d gives fractional coverage per patch (avoids
-            # inflating sparse masks the way max_pool2d does)
-            labels_ds = F.avg_pool2d(
-                labels.float(), kernel_size=scale_factor, stride=scale_factor
-            )
-            pred_probs = torch.sigmoid(level_pred)
+            for li, level_out in enumerate(level_outputs):
+                level_pred = level_out["pred"]
+                level_res = level_pred.shape[-1]
+                scale_factor = labels.shape[-1] // level_res
+                labels_ds = F.avg_pool2d(
+                    labels.float(), kernel_size=scale_factor, stride=scale_factor
+                )
+                lp_probs = torch.sigmoid(level_pred)
+                lp_binary = (lp_probs > PRED_THRESHOLD).float()
+                lp_labels_float = labels_ds
+                lp_labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
+                sp_dims = tuple(range(2, lp_binary.dim()))
+                # Hard dice
+                l_inter = (lp_binary * lp_labels_binary).sum(dim=sp_dims)
+                l_union = lp_binary.sum(dim=sp_dims) + lp_labels_binary.sum(dim=sp_dims)
+                l_dice = (2 * l_inter + 1e-6) / (l_union + 1e-6)
+                dice_accum[f"level_{li}_dice"] += l_dice.mean().item()
+                dice_count[f"level_{li}_dice"] += 1
+                # Soft dice
+                l_s_inter = (lp_probs * lp_labels_float).sum(dim=sp_dims)
+                l_s_denom = lp_probs.sum(dim=sp_dims) + lp_labels_float.sum(dim=sp_dims)
+                l_sdice = (2 * l_s_inter + 1e-6) / (l_s_denom + 1e-6)
+                dice_accum[f"level_{li}_softdice"] += l_sdice.mean().item()
+                dice_count[f"level_{li}_softdice"] += 1
+
+                # Avg previous-level probs dice (sampling guidance quality)
+                avg_prev = level_out.get("avg_prev_probs")
+                if avg_prev is not None:
+                    ap_res = avg_prev.shape[-1]
+                    ap_sf = labels.shape[-1] // ap_res
+                    ap_gt = F.avg_pool2d(labels.float(), kernel_size=ap_sf, stride=ap_sf)
+                    ap_gt_binary = (ap_gt > GT_AREA_THRESHOLD).float()
+                    ap_flat = avg_prev.flatten(1)
+                    gt_flat = ap_gt_binary.flatten(1)
+                    # Soft dice
+                    ap_s_inter = (ap_flat * ap_gt.flatten(1)).sum(dim=1)
+                    ap_s_denom = ap_flat.sum(dim=1) + ap_gt.flatten(1).sum(dim=1)
+                    ap_sdice = (2 * ap_s_inter + 1e-6) / (ap_s_denom + 1e-6)
+                    dice_accum[f"level_{li}_avg_probs_soft_dice"] += ap_sdice.mean().item()
+                    dice_count[f"level_{li}_avg_probs_soft_dice"] += 1
+                    # Hard dice
+                    ap_bin = (ap_flat > 0.5).float()
+                    ap_h_inter = (ap_bin * gt_flat).sum(dim=1)
+                    ap_h_denom = ap_bin.sum(dim=1) + gt_flat.sum(dim=1)
+                    ap_hdice = (2 * ap_h_inter + 1e-6) / (ap_h_denom + 1e-6)
+                    dice_accum[f"level_{li}_avg_probs_dice"] += ap_hdice.mean().item()
+                    dice_count[f"level_{li}_avg_probs_dice"] += 1
+
+            # Use last level for final_dice (backward compat)
+            pred_probs = torch.sigmoid(level_outputs[-1]["pred"])
             pred_binary = (pred_probs > PRED_THRESHOLD).float()
-            labels_float = labels_ds  # soft target for soft dice
-            labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
+            last_res = level_outputs[-1]["pred"].shape[-1]
+            sf = labels.shape[-1] // last_res
+            labels_ds_last = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
+            labels_float = labels_ds_last
+            labels_binary = (labels_ds_last > GT_AREA_THRESHOLD).float()
         else:
             pred_probs = torch.sigmoid(predictions)
             pred_binary = (pred_probs > PRED_THRESHOLD).float()
@@ -758,12 +828,16 @@ def validate(
                         l_pred_probs = None
                         if l_pred is not None:
                             l_pred_probs = torch.sigmoid(l_pred[i]).detach().cpu()
+                        l_avg_prev = level_out.get("avg_prev_probs")
+                        if l_avg_prev is not None:
+                            l_avg_prev = l_avg_prev[i].detach().cpu()
                         levels.append({
                             "target_coords": l_coords,
                             "context_coords": l_ctx_coords,
                             "patch_size": level_out.get("patch_size", 16),
                             "level_res": level_out.get("level_res", 32),
                             "pred_probs": l_pred_probs,
+                            "avg_prev_probs": l_avg_prev,
                         })
 
                 label_samples[label_id] = {
@@ -850,6 +924,10 @@ def validate(
         "final_softdice": total_final_softdice / n,
         "context_softdice": ctx_softdice_final,
     }
+    # Add per-level dice metrics
+    for key in dice_accum:
+        if dice_count[key] > 0:
+            detailed_results[key] = dice_accum[key] / dice_count[key]
 
     return (
         total_loss / n,

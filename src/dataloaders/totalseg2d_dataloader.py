@@ -17,6 +17,7 @@ import nibabel as nib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from data.label_ids_totalseg import get_label_ids
 from src.dataloaders.augmentations import (
@@ -77,8 +78,6 @@ class TotalSeg2DDataset(Dataset):
         bbox_padding: Padding (in pixels) to add around bbox when cropping
         split: 'train', 'val', or 'test' - filters by case/patient (requires meta.csv)
         random_context: If True, randomly sample context cases
-        load_dinov3_features: If True, load pre-computed DINOv3 features from
-            {axis}_slice_img_dinov3.npz files. Features are [196, 1024] patch tokens.
     """
 
     def __init__(
@@ -94,10 +93,7 @@ class TotalSeg2DDataset(Dataset):
         split: Optional[str] = None,
         random_context: bool = True,
         max_ds_len: Optional[int] = None,
-        load_dinov3_features: bool = False,
         random_coloring_nb: int = 0,
-        feature_layer_idx: int = 11,
-        feature_layers: Optional[List[int]] = None,
         augment: bool = False,
         augment_config: Optional[Dict] = None,
         carve_mix: bool = False,
@@ -113,10 +109,6 @@ class TotalSeg2DDataset(Dataset):
                 If > 0, samples this many labels, finds cases with all labels,
                 assigns random RGB colors, and returns 3-channel masks.
                 If 0, uses standard single-label binary masks (default behavior).
-            feature_layer_idx: Which MedDINO layer to load features from (default: 11).
-                Only used when load_dinov3_features=True.
-            feature_layers: If provided, load features from multiple layers as a list.
-                Overrides feature_layer_idx. Returns dict with features from each layer.
             augment: If True, apply data augmentation (rotation, scale, elastic, intensity).
             augment_config: Optional dict with augmentation parameters:
                 - rotation_limit: Max rotation angle in degrees (default: 15)
@@ -148,10 +140,7 @@ class TotalSeg2DDataset(Dataset):
         self.bbox_padding = bbox_padding
         self.random_context = random_context
         self.max_ds_len = max_ds_len
-        self.load_dinov3_features = load_dinov3_features
         self.random_coloring_nb = random_coloring_nb
-        self.feature_layer_idx = feature_layer_idx
-        self.feature_layers = feature_layers
 
         # Setup augmentation
         self.augment = augment
@@ -276,6 +265,9 @@ class TotalSeg2DDataset(Dataset):
             random.shuffle(self.samples)
             print(f"Shuffled samples")
 
+        # Build in-memory cache
+        self._build_cache()
+
     def _filter_by_split(self, split: str):
         """Filter cases by train/val/test split using meta.csv."""
         import pandas as pd
@@ -324,75 +316,38 @@ class TotalSeg2DDataset(Dataset):
         axis: str,
         color_map: Dict[int, Tuple[int, int, int]],
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Load multiple labels and create a 3-channel RGB colored mask.
-
-        Args:
-            case_id: Case ID
-            label_ids: List of label IDs to load
-            axis: Slice axis
-            color_map: Mapping from label index to RGB color
-
-        Returns:
-            img: [H, W] grayscale image
-            colored_mask: [3, H, W] RGB colored mask (values 0-1)
-        """
+        """Load multiple labels from cache and create a 3-channel RGB colored mask."""
         img = None
         colored_mask = None
 
         for label_idx, label_id in enumerate(label_ids):
-            slice_dir = self.root_dir / case_id / label_id
+            cached_img, cached_mask = self._load_slice(case_id, label_id, axis)
 
-            # Load image (only once, from first label)
             if img is None:
-                img_path_npy = slice_dir / f"{axis}_slice_img.npy"
-                if img_path_npy.exists():
-                    img = np.load(img_path_npy)
-                else:
-                    img_path = slice_dir / f"{axis}_slice_img.nii.gz"
-                    img = nib.load(str(img_path)).get_fdata().astype(np.float32)
-
-                # Initialize colored mask
+                img = cached_img
                 H, W = img.shape
                 colored_mask = np.zeros((3, H, W), dtype=np.float32)
 
-            # Load label mask
-            label_path_npy = slice_dir / f"{axis}_slice.npy"
-            if label_path_npy.exists():
-                label = np.load(label_path_npy)
-            else:
-                label_path = slice_dir / f"{axis}_slice.nii.gz"
-                label = nib.load(str(label_path)).get_fdata().astype(np.float32)
-
-            # Apply color to this label's mask
-            mask_binary = (label > 0.5).astype(np.float32)
+            mask_binary = (cached_mask > 0.5).astype(np.float32)
             r, g, b = color_map[label_idx]
-            if colored_mask is not None:
-                colored_mask[0] += mask_binary * (r / 255.0)
-                colored_mask[1] += mask_binary * (g / 255.0)
-                colored_mask[2] += mask_binary * (b / 255.0)
+            colored_mask[0] += mask_binary * (r / 255.0)
+            colored_mask[1] += mask_binary * (g / 255.0)
+            colored_mask[2] += mask_binary * (b / 255.0)
 
-        # Clip to [0, 1] in case of overlapping labels
         colored_mask = np.clip(colored_mask, 0, 1)
-
         return img, colored_mask
 
-    def _load_slice(self, case_id: str, label_id: str, axis: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Load image and label slice for a specific case/label/axis.
-
-        Supports both .npy (fast) and .nii.gz (legacy) formats.
-        """
+    def _load_slice_from_disk(self, case_id: str, label_id: str, axis: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Load image and label slice from disk. Supports .npy and .nii.gz."""
         slice_dir = self.root_dir / case_id / label_id
 
-        # Try .npy first (fast), fall back to .nii.gz (legacy)
         img_path_npy = slice_dir / f"{axis}_slice_img.npy"
         label_path_npy = slice_dir / f"{axis}_slice.npy"
 
         if img_path_npy.exists():
-            img = np.load(img_path_npy, mmap_mode='r')
-            label = np.load(label_path_npy, mmap_mode='r')
+            img = np.load(img_path_npy)
+            label = np.load(label_path_npy)
         else:
-            # Legacy .nii.gz format
             img_path = slice_dir / f"{axis}_slice_img.nii.gz"
             label_path = slice_dir / f"{axis}_slice.nii.gz"
             img = nib.load(str(img_path)).get_fdata().astype(np.float32)
@@ -400,65 +355,70 @@ class TotalSeg2DDataset(Dataset):
 
         return img, label
 
-    def _load_features(
-        self, case_id: str, label_id: str, axis: str, layer_idx: Optional[int] = None
-    ) -> Optional[torch.Tensor]:
-        """Load pre-computed DINOv3 features for a specific case/label/axis.
+    def _load_slice(self, case_id: str, label_id: str, axis: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Load from in-memory cache. Falls back to disk on cache miss."""
+        key = (case_id, label_id, axis)
+        if key in self._cache:
+            img, mask = self._cache[key]
+            return img.copy(), mask.astype(np.float32)
+        return self._load_slice_from_disk(case_id, label_id, axis)
 
-        Args:
-            case_id: Case identifier
-            label_id: Label identifier
-            axis: Slice axis ('x', 'y', 'z')
-            layer_idx: Specific layer to load (overrides self.feature_layer_idx)
+    def _build_cache(self):
+        """Pre-load all slices into memory with deterministic preprocessing."""
+        jitter = self.adv_windowing_jitter if self.advanced_augmentation else 0
+        self._cache_is_normalized = (jitter == 0)
 
-        Returns:
-            features: [N, D] where N = CLS + registers + patches, D = 768
-                If self.feature_layers is set, returns dict with features from each layer.
-        """
-        slice_dir = self.root_dir / case_id / label_id
-        features_path = slice_dir / f"{axis}_slice_img_meddino.npz"
+        # Collect unique keys from samples and valid_contexts
+        keys = set(self.samples)
+        for (label_id, axis), case_ids in self.valid_contexts.items():
+            for case_id in case_ids:
+                keys.add((case_id, label_id, axis))
 
-        if not features_path.exists():
-            return None
+        self._cache = {}
+        empty_keys = set()
 
-        data = np.load(features_path)
+        for case_id, label_id, axis in tqdm(keys, desc="Building cache"):
+            try:
+                img, mask = self._load_slice_from_disk(case_id, label_id, axis)
+            except Exception as e:
+                print(f"Warning: Cache load failed {case_id}/{label_id}/{axis}: {e}")
+                continue
 
-        # Determine which layer(s) to load
-        if self.feature_layers is not None:
-            # Multi-layer mode: return dict of features
-            result = {}
-            for lidx in self.feature_layers:
-                cls = torch.from_numpy(data[f"layer_{lidx}_cls"])
-                regs = torch.from_numpy(data[f"layer_{lidx}_registers"])
-                patches = torch.from_numpy(data[f"layer_{lidx}_patches"])
-                if cls.ndim == 1:
-                    cls = cls.unsqueeze(0)
-                if regs.ndim == 1:
-                    regs = regs.unsqueeze(0)
-                if patches.ndim == 1:
-                    patches = patches.unsqueeze(0)
-                full_sequence = torch.cat([cls, regs, patches], dim=0)
-                result[f"layer_{lidx}"] = full_sequence
-            return result
+            # Bbox crop (deterministic)
+            if self.crop_to_bbox:
+                bbox = self._get_2d_bbox(case_id, label_id, axis)
+                img, mask = self._crop_to_bbox(img, mask, bbox)
 
-        # Single layer mode
-        lidx = layer_idx if layer_idx is not None else self.feature_layer_idx
-        cls = torch.from_numpy(data[f"layer_{lidx}_cls"])
-        regs = torch.from_numpy(data[f"layer_{lidx}_registers"])
-        patches = torch.from_numpy(data[f"layer_{lidx}_patches"])
+            # Resize (deterministic)
+            if self.image_size is not None:
+                img = self._resize(img.astype(np.float32), self.image_size, mode="bilinear")
+                mask = self._resize(mask.astype(np.float32), self.image_size, mode="nearest")
 
-        # Ensure consistent shape
-        if cls.ndim == 1:
-            cls = cls.unsqueeze(0)
-        if regs.ndim == 1:
-            regs = regs.unsqueeze(0)
-        if patches.ndim == 1:
-            patches = patches.unsqueeze(0)
+            # Normalize (only when deterministic — no jitter)
+            if self._cache_is_normalized:
+                img = self._normalize_image(img.astype(np.float32))
 
-        # Concatenate: CLS (1) + Registers (4) + Patches
-        full_sequence = torch.cat([cls, regs, patches], dim=0)
+            # Track empty masks
+            if mask.max() == 0:
+                empty_keys.add((case_id, label_id, axis))
 
-        return full_sequence
+            self._cache[(case_id, label_id, axis)] = (
+                img.astype(np.float32),
+                mask.astype(bool),
+            )
+
+        # Filter empty masks from valid_contexts
+        if empty_keys:
+            for ctx_key, case_ids in self.valid_contexts.items():
+                label_id, axis = ctx_key
+                self.valid_contexts[ctx_key] = [
+                    c for c in case_ids
+                    if (c, label_id, axis) not in empty_keys
+                ]
+            print(f"Filtered {len(empty_keys)} empty-mask entries from valid_contexts")
+
+        total_bytes = sum(img.nbytes + mask.nbytes for img, mask in self._cache.values())
+        print(f"Cache: {len(self._cache)} entries, {total_bytes / 1e9:.2f} GB")
 
     def _get_2d_bbox(self, case_id: str, label_id: str, axis: str) -> Tuple[int, int, int, int]:
         """
@@ -594,13 +554,8 @@ class TotalSeg2DDataset(Dataset):
                 donor_img, donor_mask = self._load_slice(donor_case_id, label_id, axis)
                 if donor_mask.max() == 0:
                     continue
-                if self.crop_to_bbox:
-                    bbox = self._get_2d_bbox(donor_case_id, label_id, axis)
-                    donor_img, donor_mask = self._crop_to_bbox(donor_img, donor_mask, bbox)
-                donor_img = self._normalize_image(donor_img)
-                if self.image_size is not None:
-                    donor_img = self._resize(donor_img, self.image_size, mode="bilinear")
-                    donor_mask = self._resize(donor_mask, self.image_size, mode="nearest")
+                if not self._cache_is_normalized:
+                    donor_img = self._normalize_image(donor_img)
                 return donor_img, donor_mask
             except Exception:
                 continue
@@ -689,9 +644,6 @@ class TotalSeg2DDataset(Dataset):
             - 'label_id': str or List[str] (list if random_coloring_nb > 0)
             - 'axis': str
             - 'color_map': Dict[int, Tuple[int,int,int]] (only if random_coloring_nb > 0)
-            If load_dinov3_features=True, also includes:
-            - 'target_features': [196, 1024] - Target DINOv3 patch features
-            - 'context_features': [k, 196, 1024] - Context DINOv3 patch features
         """
         target_case_id, label_id, axis = self.samples[idx]
 
@@ -700,27 +652,18 @@ class TotalSeg2DDataset(Dataset):
             return self._getitem_random_coloring(idx)
 
         # Standard single-label mode
-        # Load target
+        # Load target (from cache: already cropped, resized, possibly normalized)
         target_img, target_label = self._load_slice(target_case_id, label_id, axis)
 
-        # Warn if target mask is empty (shouldn't happen with proper preprocessing)
         if target_label.max() == 0:
             print(f"Warning: Empty target mask for {target_case_id}/{label_id}/{axis}")
 
-        # Load target features if requested
-        target_features = None
-        if self.load_dinov3_features:
-            target_features = self._load_features(target_case_id, label_id, axis)
-
-        # Crop to bbox if enabled
-        if self.crop_to_bbox:
-            target_bbox = self._get_2d_bbox(target_case_id, label_id, axis)
-            target_img, target_label = self._crop_to_bbox(target_img, target_label, target_bbox)
-
+        # Normalize (skip if already done in cache)
         jitter = self.adv_windowing_jitter if self.advanced_augmentation else 0
-        target_img = self._normalize_image(target_img, jitter=jitter)
+        if not self._cache_is_normalized:
+            target_img = self._normalize_image(target_img, jitter=jitter)
 
-        # Foreground random crop (before resize, ensures FG stays visible)
+        # Foreground random crop (stochastic, may change shape)
         if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
             target_img, target_label = foreground_random_crop(
                 target_img, target_label, self.adv_fg_crop_min
@@ -728,8 +671,8 @@ class TotalSeg2DDataset(Dataset):
 
         # Skip context loading if context_size is 0
         if self.context_size == 0:
-            # Resize if needed
-            if self.image_size is not None:
+            # Re-resize if foreground crop changed shape
+            if self.image_size is not None and target_img.shape[:2] != tuple(self.image_size):
                 target_img = self._resize(target_img, self.image_size, mode="bilinear")
                 target_label = self._resize(target_label, self.image_size, mode="nearest")
 
@@ -751,18 +694,13 @@ class TotalSeg2DDataset(Dataset):
             target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()  # [1, H, W]
             target_out = torch.from_numpy(target_label.copy()).unsqueeze(0).float()  # [1, H, W]
 
-            result = {
+            return {
                 "image": target_in,
                 "label": target_out,
                 "target_case_id": target_case_id,
                 "label_id": label_id,
                 "axis": axis,
             }
-
-            if self.load_dinov3_features and target_features is not None:
-                result["target_features"] = target_features
-
-            return result
 
         # Get context cases with same label+axis that have non-empty masks (excluding target)
         # Use precomputed valid_contexts if available, otherwise fall back to label_to_cases
@@ -782,7 +720,6 @@ class TotalSeg2DDataset(Dataset):
         # Load context slices - try all candidates until we have enough
         context_imgs = []
         context_labels = []
-        context_features_list = []
         valid_context_ids = []
 
         for ctx_case_id in available_contexts:
@@ -793,21 +730,13 @@ class TotalSeg2DDataset(Dataset):
             try:
                 ctx_img, ctx_label = self._load_slice(ctx_case_id, label_id, axis)
 
-                # Skip context if mask is empty (label doesn't exist in this slice)
+                # Skip context if mask is empty
                 if ctx_label.max() == 0:
                     continue
 
-                # Load context features if requested
-                ctx_features = None
-                if self.load_dinov3_features:
-                    ctx_features = self._load_features(ctx_case_id, label_id, axis)
-
-                # Crop to bbox if enabled
-                if self.crop_to_bbox:
-                    ctx_bbox = self._get_2d_bbox(ctx_case_id, label_id, axis)
-                    ctx_img, ctx_label = self._crop_to_bbox(ctx_img, ctx_label, ctx_bbox)
-
-                ctx_img = self._normalize_image(ctx_img, jitter=jitter)
+                # Normalize (skip if already done in cache)
+                if not self._cache_is_normalized:
+                    ctx_img = self._normalize_image(ctx_img, jitter=jitter)
 
                 # Foreground random crop (independent per context)
                 if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
@@ -817,8 +746,6 @@ class TotalSeg2DDataset(Dataset):
 
                 context_imgs.append(ctx_img)
                 context_labels.append(ctx_label)
-                if ctx_features is not None:
-                    context_features_list.append(ctx_features)
                 valid_context_ids.append(ctx_case_id)
             except Exception as e:
                 print(f"Warning: Failed to load {ctx_case_id}/{label_id}/{axis}: {e}")
@@ -827,12 +754,14 @@ class TotalSeg2DDataset(Dataset):
         if len(context_imgs) == 0:
             raise RuntimeError(f"Failed to load any context for label '{label_id}' axis '{axis}' (tried {len(available_contexts)} cases, all had empty masks)")
 
-        # Resize if needed
+        # Re-resize if foreground crop changed any shapes
         if self.image_size is not None:
-            target_img = self._resize(target_img, self.image_size, mode="bilinear")
-            target_label = self._resize(target_label, self.image_size, mode="nearest")
-            context_imgs = [self._resize(c, self.image_size, mode="bilinear") for c in context_imgs]
-            context_labels = [self._resize(c, self.image_size, mode="nearest") for c in context_labels]
+            tgt_size = tuple(self.image_size)
+            if target_img.shape[:2] != tgt_size:
+                target_img = self._resize(target_img, self.image_size, mode="bilinear")
+                target_label = self._resize(target_label, self.image_size, mode="nearest")
+            context_imgs = [self._resize(c, self.image_size, mode="bilinear") if c.shape[:2] != tgt_size else c for c in context_imgs]
+            context_labels = [self._resize(c, self.image_size, mode="nearest") if c.shape[:2] != tgt_size else c for c in context_labels]
 
         # CarveMix on target only (after resize, before augmentation)
         exclude_ids = [target_case_id] + valid_context_ids
@@ -863,7 +792,7 @@ class TotalSeg2DDataset(Dataset):
         context_in = torch.stack([torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_imgs])  # [k, 1, H, W]
         context_out = torch.stack([torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_labels])  # [k, 1, H, W]
 
-        result = {
+        return {
             "image": target_in,
             "label": target_out,
             "context_in": context_in,
@@ -873,17 +802,6 @@ class TotalSeg2DDataset(Dataset):
             "label_id": label_id,
             "axis": axis,
         }
-
-        # Add features if loaded
-        if self.load_dinov3_features:
-            if target_features is not None:
-                result["target_features"] = target_features # [196, 1024]
-            if context_features_list:
-                result["context_features"] = torch.stack(
-                    [f for f in context_features_list]
-                )  # [k, 196, 1024]
-
-        return result
 
     def _getitem_random_coloring(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -923,12 +841,8 @@ class TotalSeg2DDataset(Dataset):
         target_img, target_label = self._create_colored_mask(
             target_case_id, sampled_labels, axis, color_map
         )
-        target_img = self._normalize_image(target_img)
-
-        # Load target features if requested (use first label's features)
-        target_features = None
-        if self.load_dinov3_features:
-            target_features = self._load_features(target_case_id, sampled_labels[0], axis)
+        if not self._cache_is_normalized:
+            target_img = self._normalize_image(target_img)
 
         # Get context candidates (excluding target), shuffle if random
         context_candidates = [c for c in available_cases if c != target_case_id]
@@ -938,7 +852,6 @@ class TotalSeg2DDataset(Dataset):
         # Load context slices with same color mapping - try all until we have enough
         context_imgs = []
         context_labels = []
-        context_features_list = []
         valid_context_ids = []
 
         for ctx_case_id in context_candidates:
@@ -951,21 +864,15 @@ class TotalSeg2DDataset(Dataset):
                     ctx_case_id, sampled_labels, axis, color_map
                 )
 
-                # Skip context if mask is empty (labels don't exist in this slice)
+                # Skip context if mask is empty
                 if ctx_label.max() == 0:
                     continue
 
-                ctx_img = self._normalize_image(ctx_img)
-
-                # Load context features if requested
-                ctx_features = None
-                if self.load_dinov3_features:
-                    ctx_features = self._load_features(ctx_case_id, sampled_labels[0], axis)
+                if not self._cache_is_normalized:
+                    ctx_img = self._normalize_image(ctx_img)
 
                 context_imgs.append(ctx_img)
                 context_labels.append(ctx_label)
-                if ctx_features is not None:
-                    context_features_list.append(ctx_features)
                 valid_context_ids.append(ctx_case_id)
             except Exception as e:
                 print(f"Warning: Failed to load colored mask for {ctx_case_id}: {e}")
@@ -974,12 +881,14 @@ class TotalSeg2DDataset(Dataset):
         if len(context_imgs) == 0:
             raise RuntimeError(f"Failed to load any context for labels {sampled_labels} axis '{axis}' (tried {len(context_candidates)} cases)")
 
-        # Resize if needed
+        # Resize if needed (should be no-op when cache already resized)
         if self.image_size is not None:
-            target_img = self._resize(target_img, self.image_size, mode="bilinear")
-            target_label = self._resize_multichannel(target_label, self.image_size, mode="nearest")
-            context_imgs = [self._resize(c, self.image_size, mode="bilinear") for c in context_imgs]
-            context_labels = [self._resize_multichannel(c, self.image_size, mode="nearest") for c in context_labels]
+            tgt_size = tuple(self.image_size)
+            if target_img.shape[:2] != tgt_size:
+                target_img = self._resize(target_img, self.image_size, mode="bilinear")
+                target_label = self._resize_multichannel(target_label, self.image_size, mode="nearest")
+            context_imgs = [self._resize(c, self.image_size, mode="bilinear") if c.shape[:2] != tgt_size else c for c in context_imgs]
+            context_labels = [self._resize_multichannel(c, self.image_size, mode="nearest") if c.shape[-2:] != tgt_size else c for c in context_labels]
 
         # Convert to tensors
         target_in = torch.from_numpy(target_img).unsqueeze(0)  # [1, H, W]
@@ -987,7 +896,7 @@ class TotalSeg2DDataset(Dataset):
         context_in = torch.stack([torch.from_numpy(c).unsqueeze(0) for c in context_imgs])  # [k, 1, H, W]
         context_out = torch.stack([torch.from_numpy(c) for c in context_labels])  # [k, 3, H, W]
 
-        result = {
+        return {
             "image": target_in,
             "label": target_out,
             "context_in": context_in,
@@ -998,17 +907,6 @@ class TotalSeg2DDataset(Dataset):
             "axis": axis,
             "color_map": color_map,  # For visualization/debugging
         }
-
-        # Add features if loaded
-        if self.load_dinov3_features:
-            if target_features is not None:
-                result["target_features"] = torch.from_numpy(target_features)
-            if context_features_list:
-                result["context_features"] = torch.stack(
-                    [torch.from_numpy(f) for f in context_features_list]
-                )
-
-        return result
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -1035,16 +933,6 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     if "color_map" in batch[0]:
         result["color_maps"] = [item["color_map"] for item in batch]
 
-    # Add features if present in batch
-    if "target_features" in batch[0]:
-        result["target_features"] = torch.stack(
-            [item["target_features"] for item in batch]
-        )  # [B, 196, 1024]
-    if "context_features" in batch[0]:
-        result["context_features"] = torch.stack(
-            [item["context_features"] for item in batch]
-        )  # [B, k, 196, 1024]
-
     return result
 
 
@@ -1060,10 +948,7 @@ def get_dataloader(
     num_workers: int = 4,
     split: Optional[str] = None,
     shuffle: bool = True,
-    load_dinov3_features: bool = False,
     random_coloring_nb: int = 0,
-    feature_layer_idx: int = 11,
-    feature_layers: Optional[List[int]] = None,
     max_labels: Optional[int] = None,
     **dataset_kwargs,
 ) -> DataLoader:
@@ -1082,12 +967,9 @@ def get_dataloader(
         num_workers: Number of data loading workers
         split: 'train', 'val', or 'test'
         shuffle: Whether to shuffle
-        load_dinov3_features: If True, load pre-computed DINOv3 features
         random_coloring_nb: Number of labels to sample for random coloring mode.
             If > 0, returns 3-channel RGB masks with random colors per label.
             If 0, uses standard single-label binary masks (default).
-        feature_layer_idx: Which MedDINO layer to load features from (default: 11).
-        feature_layers: If provided, load features from multiple layers.
         max_labels: If provided, only use the first n labels by total volume.
         **dataset_kwargs: Additional args for TotalSeg2DDataset
 
@@ -1103,10 +985,7 @@ def get_dataloader(
         crop_to_bbox=crop_to_bbox,
         bbox_padding=bbox_padding,
         split=split,
-        load_dinov3_features=load_dinov3_features,
         random_coloring_nb=random_coloring_nb,
-        feature_layer_idx=feature_layer_idx,
-        feature_layers=feature_layers,
         max_labels=max_labels,
         **dataset_kwargs,
     )
@@ -1118,4 +997,6 @@ def get_dataloader(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=3 if num_workers > 0 else None,
     )
