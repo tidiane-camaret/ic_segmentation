@@ -104,6 +104,7 @@ class TotalSeg2DDataset(Dataset):
         carve_mix_config: Optional[Dict] = None,
         advanced_augmentation: bool = False,
         advanced_augmentation_config: Optional[Dict] = None,
+        max_labels: Optional[int] = None,
     ):
         """
         Args:
@@ -131,10 +132,14 @@ class TotalSeg2DDataset(Dataset):
 
         # Resolve label_id_list if it's a string split name
         if isinstance(label_id_list, str):
-            self.label_id_list = get_label_ids(label_id_list)
-            print(f"Using {label_id_list} label split: {len(self.label_id_list)} labels")
+            self.label_id_list = get_label_ids(label_id_list, max_labels=max_labels)
+            max_labels_str = f" (top {max_labels} by volume)" if max_labels else ""
+            print(f"Using {label_id_list} label split: {len(self.label_id_list)} labels{max_labels_str}")
         else:
-            self.label_id_list = label_id_list
+            if max_labels is not None:
+                self.label_id_list = label_id_list[:max_labels]
+            else:
+                self.label_id_list = label_id_list
 
         self.context_size = context_size
         self.axes = axes
@@ -1059,6 +1064,7 @@ def get_dataloader(
     random_coloring_nb: int = 0,
     feature_layer_idx: int = 11,
     feature_layers: Optional[List[int]] = None,
+    max_labels: Optional[int] = None,
     **dataset_kwargs,
 ) -> DataLoader:
     """
@@ -1082,6 +1088,7 @@ def get_dataloader(
             If 0, uses standard single-label binary masks (default).
         feature_layer_idx: Which MedDINO layer to load features from (default: 11).
         feature_layers: If provided, load features from multiple layers.
+        max_labels: If provided, only use the first n labels by total volume.
         **dataset_kwargs: Additional args for TotalSeg2DDataset
 
     Returns:
@@ -1100,6 +1107,7 @@ def get_dataloader(
         random_coloring_nb=random_coloring_nb,
         feature_layer_idx=feature_layer_idx,
         feature_layers=feature_layers,
+        max_labels=max_labels,
         **dataset_kwargs,
     )
 

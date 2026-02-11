@@ -149,6 +149,7 @@ def main(cfg: DictConfig) -> None:
             carve_mix_config=carve_mix_config,
             advanced_augmentation=use_adv_aug,
             advanced_augmentation_config=adv_aug_config,
+            max_labels=cfg.get("max_labels", None),
         )
         val_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d,
@@ -166,6 +167,7 @@ def main(cfg: DictConfig) -> None:
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             augment=False,  # No augmentation for validation
+            max_labels=cfg.get("max_labels", None),
         )
 
     # Model (PatchICL v2)
