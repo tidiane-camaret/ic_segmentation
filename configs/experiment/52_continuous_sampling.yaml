@@ -68,13 +68,13 @@ model:
       type: "icl_encoder"
       layer_idx: "all"  # "all", single int (0-3), or list [1,2,3]. "all" → D=256 (64*4 layers)
       freeze: false
-      output_grid_size: 32
+      output_grid_size: 128  # Full resolution (layer 0 native size)
 
     levels:
-      - resolution: 32
+      - resolution: 16
         patch_size: 8
-        num_patches: 16  # Training patches (continuous sampler)
-        num_patches_val: 64  # Validation patches (defaults to num_patches if omitted)
+        num_patches: 8  # Training patches (continuous sampler)
+        num_patches_val: 16  # Validation patches (defaults to num_patches if omitted)
         sampling_temperature: 0.3
 
     oracle_levels_train: [false]  
@@ -93,7 +93,7 @@ model:
       image_size: 256
       embed_dim: 256  # Must match feature_extractor output dim (64 * num_layers)
       embed_proj_dim: 256
-      feature_grid_size: 32
+      feature_grid_size: 128  # Must match feature_extractor output_grid_size
       patch_feature_grid_size: 8  # Must match patch_size
       num_heads: 8
       num_layers: 3

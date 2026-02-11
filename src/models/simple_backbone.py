@@ -718,6 +718,7 @@ class SimpleBackbone(nn.Module):
         max_seq_len: int = 1024,
         decoder_use_skip_connections: bool = True,
         append_zero_attn: bool = False,
+        max_levels: int = 4,
     ):
         """
         Args:
@@ -735,11 +736,15 @@ class SimpleBackbone(nn.Module):
             max_seq_len: Maximum sequence length for RoPE cache
             decoder_use_skip_connections: If True, use U-Net skips in decoder
             append_zero_attn: Append zero token to K/V for attention sink
+            max_levels: Number of resolution levels for level embedding
         """
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.image_size = image_size
+
+        # Learnable level embedding (Deformable DETR style)
+        self.level_embed = nn.Parameter(torch.randn(max_levels, embed_dim) * 0.02)
 
         self.encoder = SimpleCNNEncoder(
             input_dim=input_dim,
@@ -773,6 +778,7 @@ class SimpleBackbone(nn.Module):
         coords: torch.Tensor = None,
         ctx_id_labels: torch.Tensor = None,
         return_attn_weights: bool = False,
+        level_idx: int = 0,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass: encode → attention → decode.
@@ -782,6 +788,7 @@ class SimpleBackbone(nn.Module):
             coords: [B, K, 2] - Patch coordinates (y, x)
             ctx_id_labels: [B, K] - 0 for target, >0 for context
             return_attn_weights: If True, return attention weights and register tokens
+            level_idx: Resolution level index for level embedding
 
         Returns:
             Dict with:
@@ -805,6 +812,9 @@ class SimpleBackbone(nn.Module):
 
         # Encode
         encoded, skips = self.encoder(img_patches)
+
+        # Add level embedding (Deformable DETR style)
+        encoded = encoded + self.level_embed[level_idx].view(1, 1, -1)
 
         # Cross-patch attention
         attended, extras = self.attention(encoded, coords, is_context, return_attn_weights)

@@ -127,6 +127,7 @@ label_ids = [
     "kidney_right",
 ]
 """
+
 # Top 50 labels by total volume (occurrences * avg_volume) from totalseg_2d.ipynb
 label_ids = ['liver',
  'lung_upper_lobe_left',
@@ -180,6 +181,7 @@ label_ids = ['liver',
  'vertebrae_T10']
 
 
+
 # Train/Val split (80/20 split with fixed random seed for reproducibility)
 _rng = random.Random(42)
 _shuffled = label_ids.copy()
@@ -191,11 +193,12 @@ label_ids_val = _shuffled[_split_idx:]
 
 # Clean up temporary variables
 del _rng, _shuffled, _split_idx
+
 """
 label_ids_train = [
     'liver',
-    #'lung_upper_lobe_left',
-    #'lung_lower_lobe_left',
+    'lung_upper_lobe_left',
+    'lung_lower_lobe_left',
     'lung_upper_lobe_right',
     'lung_lower_lobe_right',
     'lung_middle_lobe_right',
@@ -204,7 +207,7 @@ label_ids_train = [
     'spleen',
     'brain',
     'skull',
-    #'kidney_left',
+    'kidney_left',
     'kidney_right',
     'urinary_bladder',
     'sacrum',
@@ -216,17 +219,17 @@ label_ids_val = [
     'colon',
     'stomach',
     'autochthon_left',
-    #'autochthon_right',
+    'autochthon_right',
     'gluteus_maximus_left',
-    #'gluteus_maximus_right',
+    'gluteus_maximus_right',
     'gluteus_medius_left',
-    #'gluteus_medius_right',
+    'gluteus_medius_right',
     'iliopsoas_left',
-    #'iliopsoas_right',
+    'iliopsoas_right',
     'hip_left',
-    #'hip_right',
+    'hip_right',
     'femur_left',
-    #'femur_right'
+    'femur_right'
 ]
 
 

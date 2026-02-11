@@ -1,5 +1,19 @@
 # Development Log
 
+## 2026-02-11: Multi-Level Cascaded Training Support
+
+### Changes
+- **`src/models/patch_icl_v2/patch_icl.py`**: Refactored from single-level to multi-level cascaded architecture.
+  - `PatchICL.__init__`: Stores per-level samplers (`nn.ModuleList`), aggregators, oracle configs. Backward-compat aliases preserved.
+  - `_forward_level()`: New helper that processes a single resolution level (sampling, feature extraction, backbone, aggregation).
+  - `forward()`: Loops over levels coarse-to-fine. Level 0 uses uniform/oracle weights; subsequent levels use `sigmoid(prev_level_pred)` as sampling weights. Configurable `detach_between_levels` (default: True).
+  - `compute_loss()`: Per-level losses with configurable `level_weights` multiplier. Aggregated losses averaged across levels for logging.
+  - `_downsample`/`_downsample_mask`: Now take `resolution` parameter instead of using `self.resolution`.
+  - `_select_context_patches`: Now takes explicit `sampler` argument.
+  - All levels share the same `patch_size` (backbone constraint enforced via assertion).
+- **`configs/experiment/60_2_levels.yaml`**: New config with 2 levels (resolution 16 + 32, 8+12 patches).
+- **Design decisions**: Single backward after all levels (losses accumulated). Detach between levels by default (memory efficient, no gradient benefit since sampling is non-differentiable).
+
 ## 2026-02-06: Train/Val Dice Gap Analysis & Fixes
 
 ### Problem

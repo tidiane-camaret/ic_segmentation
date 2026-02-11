@@ -87,96 +87,125 @@ def _save_sample_images(
     for label_id, sample in list(label_samples.items())[:max_samples]:
         img = sample["image"].squeeze().numpy()
         gt = sample["label"].squeeze().numpy()
-        pred = sample["pred"].squeeze().numpy()
-        pred_probs = sample.get("pred_probs")
-        if pred_probs is not None:
-            pred_probs = pred_probs.squeeze().numpy()
-            pred_heatmap = (pred_probs - pred_probs.min()) / (
-                pred_probs.max() - pred_probs.min() + 1e-8
-            )
-        else:
-            pred_heatmap = None
         dice = sample["dice"]
         ctx_in = sample.get("context_in")
         ctx_out = sample.get("context_out")
-        target_coords = sample.get("target_coords")
-        context_coords = sample.get("context_coords")
-        patch_size = sample.get("patch_size", 16)
-        level_res = sample.get("level_res", 32)
 
+        # Build per-level info (backward compat with single-level samples)
+        levels_info = sample.get("levels", [])
+        if not levels_info:
+            levels_info = [{
+                "target_coords": sample.get("target_coords"),
+                "context_coords": sample.get("context_coords"),
+                "patch_size": sample.get("patch_size", 16),
+                "level_res": sample.get("level_res", 32),
+                "pred_probs": sample.get("pred_probs"),
+            }]
+
+        n_levels = len(levels_info)
         n_ctx = ctx_in.shape[0] if ctx_in is not None else 0
         n_cols = max(1 + n_ctx, 4)
+        n_rows = 2 * n_levels
 
-        fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 8))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+        if n_rows == 2:
+            axes = [axes[0], axes[1]]  # keep 2D indexing consistent
 
-        # --- Top row: target + context images with patch boxes & GT overlay ---
-        axes[0][0].imshow(img, cmap="gray")
-        axes[0][0].imshow(gt, cmap="Reds", alpha=0.3)
-        if target_coords is not None and level_res is not None:
-            draw_patch_boxes(
-                axes[0][0], img, target_coords, patch_size, level_res, color="lime"
-            )
-        axes[0][0].set_title("Target")
-        axes[0][0].axis("off")
+        for li, level_info in enumerate(levels_info):
+            top_row = 2 * li
+            bot_row = 2 * li + 1
+            l_target_coords = level_info.get("target_coords")
+            l_context_coords = level_info.get("context_coords")
+            l_patch_size = level_info.get("patch_size", 16)
+            l_level_res = level_info.get("level_res", 32)
+            l_pred_probs = level_info.get("pred_probs")
 
-        for ci in range(n_ctx):
-            ctx_img = ctx_in[ci].squeeze().numpy()
-            ctx_mask = ctx_out[ci].squeeze().numpy()
-            axes[0][1 + ci].imshow(ctx_img, cmap="gray")
-            axes[0][1 + ci].imshow(ctx_mask, cmap="Reds", alpha=0.3)
-            if (
-                context_coords is not None
-                and level_res is not None
-                and context_coords.ndim == 2
-            ):
-                try:
-                    total_patches = context_coords.shape[0]
-                    K_per_ctx = total_patches // n_ctx
-                    ci_coords = context_coords[ci * K_per_ctx : (ci + 1) * K_per_ctx]
-                    draw_patch_boxes(
-                        axes[0][1 + ci], ctx_img, ci_coords,
-                        patch_size, level_res, color="cyan",
-                    )
-                except (IndexError, TypeError, ZeroDivisionError):
-                    pass
-            axes[0][1 + ci].set_title(f"Context {ci + 1}")
-            axes[0][1 + ci].axis("off")
+            # --- Top row: target + context images with patch boxes ---
+            axes[top_row][0].imshow(img, cmap="gray")
+            axes[top_row][0].imshow(gt, cmap="Reds", alpha=0.3)
+            if l_target_coords is not None and l_level_res is not None:
+                draw_patch_boxes(
+                    axes[top_row][0], img, l_target_coords,
+                    l_patch_size, l_level_res, color="lime",
+                )
+            axes[top_row][0].set_title(f"Level {li} (res {l_level_res}) - Target")
+            axes[top_row][0].axis("off")
 
-        for j in range(1 + n_ctx, n_cols):
-            axes[0][j].axis("off")
+            for ci in range(n_ctx):
+                ctx_img = ctx_in[ci].squeeze().numpy()
+                ctx_mask = ctx_out[ci].squeeze().numpy()
+                axes[top_row][1 + ci].imshow(ctx_img, cmap="gray")
+                axes[top_row][1 + ci].imshow(ctx_mask, cmap="Reds", alpha=0.3)
+                if (
+                    l_context_coords is not None
+                    and l_level_res is not None
+                    and l_context_coords.ndim == 2
+                ):
+                    try:
+                        total_patches = l_context_coords.shape[0]
+                        K_per_ctx = total_patches // n_ctx
+                        ci_coords = l_context_coords[ci * K_per_ctx : (ci + 1) * K_per_ctx]
+                        draw_patch_boxes(
+                            axes[top_row][1 + ci], ctx_img, ci_coords,
+                            l_patch_size, l_level_res, color="cyan",
+                        )
+                    except (IndexError, TypeError, ZeroDivisionError):
+                        pass
+                axes[top_row][1 + ci].set_title(f"Context {ci + 1}")
+                axes[top_row][1 + ci].axis("off")
 
-        # --- Bottom row: GT mask | Downsized GT | Pred heatmap | Pred mask ---
-        axes[1][0].imshow(gt, cmap="gray")
-        axes[1][0].set_title("GT Mask")
-        axes[1][0].axis("off")
+            for j in range(1 + n_ctx, n_cols):
+                axes[top_row][j].axis("off")
 
-        # Downsized GT (avg-pool to level resolution, matches training metric)
-        if level_res is not None and level_res < gt.shape[0]:
-            gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
-            scale = max(1, gt.shape[0] // level_res)
-            gt_ds = F.avg_pool2d(gt_t, kernel_size=scale, stride=scale).squeeze().numpy()
-        else:
-            gt_ds = gt
-        axes[1][1].imshow(gt_ds, cmap="gray")
-        axes[1][1].set_title(f"GT Downsized ({gt_ds.shape[0]}x{gt_ds.shape[1]})")
-        axes[1][1].axis("off")
+            # --- Bottom row: Downsized GT | Pred heatmap | Pred mask ---
+            # Downsized GT
+            if l_level_res is not None and l_level_res < gt.shape[0]:
+                gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
+                scale = max(1, gt.shape[0] // l_level_res)
+                gt_ds = F.avg_pool2d(gt_t, kernel_size=scale, stride=scale).squeeze().numpy()
+            else:
+                gt_ds = gt
+            axes[bot_row][0].imshow(gt_ds, cmap="gray")
+            axes[bot_row][0].set_title(f"GT ({gt_ds.shape[0]}x{gt_ds.shape[1]})")
+            axes[bot_row][0].axis("off")
 
-        if pred_heatmap is not None:
-            im = axes[1][2].imshow(pred_heatmap, cmap="hot", vmin=0, vmax=1)
-            axes[1][2].set_title("Pred Heatmap")
-            plt.colorbar(im, ax=axes[1][2], fraction=0.046, pad=0.04)
-        else:
-            axes[1][2].set_title("Pred Heatmap (N/A)")
-        axes[1][2].axis("off")
+            # Pred heatmap
+            if l_pred_probs is not None:
+                pp = l_pred_probs.squeeze().numpy()
+                pred_heatmap = (pp - pp.min()) / (pp.max() - pp.min() + 1e-8)
+                im = axes[bot_row][1].imshow(pred_heatmap, cmap="hot", vmin=0, vmax=1)
+                axes[bot_row][1].set_title(f"Heatmap ({pp.shape[0]}x{pp.shape[1]})")
+                plt.colorbar(im, ax=axes[bot_row][1], fraction=0.046, pad=0.04)
+            else:
+                axes[bot_row][1].set_title("Heatmap (N/A)")
+            axes[bot_row][1].axis("off")
 
-        axes[1][3].imshow(pred, cmap="gray")
-        axes[1][3].set_title(f"Pred Mask (dice={dice:.3f})")
-        axes[1][3].axis("off")
+            # Pred mask with per-level dice
+            if l_pred_probs is not None:
+                pp = l_pred_probs.squeeze()
+                # Resize pred to match gt_ds if needed (backward compat)
+                if pp.shape[0] != gt_ds.shape[0]:
+                    pp = F.interpolate(
+                        pp.unsqueeze(0).unsqueeze(0).float(),
+                        size=(gt_ds.shape[0], gt_ds.shape[1]),
+                        mode='bilinear', align_corners=False,
+                    ).squeeze()
+                pp = pp.numpy() if hasattr(pp, 'numpy') else pp
+                pred_mask = (pp > PRED_THRESHOLD).astype(float)
+                gt_binary = (gt_ds > GT_AREA_THRESHOLD).astype(float)
+                inter = (pred_mask * gt_binary).sum()
+                union_val = pred_mask.sum() + gt_binary.sum()
+                level_dice = (2 * inter + 1e-6) / (union_val + 1e-6)
+                axes[bot_row][2].imshow(pred_mask, cmap="gray")
+                axes[bot_row][2].set_title(f"Pred (dice={level_dice:.3f})")
+            else:
+                axes[bot_row][2].set_title("Pred (N/A)")
+            axes[bot_row][2].axis("off")
 
-        for j in range(4, n_cols):
-            axes[1][j].axis("off")
+            for j in range(3, n_cols):
+                axes[bot_row][j].axis("off")
 
-        fig.suptitle(label_id, fontsize=12, y=1.01)
+        fig.suptitle(f"{label_id} (final dice={dice:.3f})", fontsize=12, y=1.01)
         fig.tight_layout()
         safe_label = label_id.replace("/", "_")
         save_path = epoch_dir / f"{safe_label}.png"
@@ -191,7 +220,7 @@ def _save_sample_images(
             wandb_images.append(wandb_img)
 
     # Log all images at once to wandb
-    if wandb_images and wandb_available:
+    if wandb_images and wandb_available and wandb.run is not None:
         wandb.log({f"{prefix}/saved_samples": wandb_images, "epoch": epoch})
 
 
@@ -359,21 +388,27 @@ def train_epoch(
                 # Store one sample per label for image logging (wandb or disk)
                 should_save = (use_wandb or save_dir is not None) and is_main
                 if should_save and label_id not in label_samples:
-                    # Get patch coordinates and info from level_outputs
-                    target_coords = None
-                    context_coords = None
-                    patch_size = None
-                    level_res = None
+                    # Collect per-level info for visualization
+                    levels = []
                     if level_outputs:
-                        level_out = level_outputs[-1]
-                        target_coords = level_out.get("coords")
-                        if target_coords is not None:
-                            target_coords = target_coords[i].detach().cpu()
-                        context_coords = level_out.get("context_coords")
-                        if context_coords is not None:
-                            context_coords = context_coords[i].detach().cpu()
-                        patch_size = level_out.get("patch_size", 16)
-                        level_res = level_out.get("level_res", 32)
+                        for level_out in level_outputs:
+                            l_coords = level_out.get("coords")
+                            if l_coords is not None:
+                                l_coords = l_coords[i].detach().cpu()
+                            l_ctx_coords = level_out.get("context_coords")
+                            if l_ctx_coords is not None:
+                                l_ctx_coords = l_ctx_coords[i].detach().cpu()
+                            l_pred = level_out.get("pred")
+                            l_pred_probs = None
+                            if l_pred is not None:
+                                l_pred_probs = torch.sigmoid(l_pred[i]).detach().cpu()
+                            levels.append({
+                                "target_coords": l_coords,
+                                "context_coords": l_ctx_coords,
+                                "patch_size": level_out.get("patch_size", 16),
+                                "level_res": level_out.get("level_res", 32),
+                                "pred_probs": l_pred_probs,
+                            })
 
                     label_samples[label_id] = {
                         "image": images[i].detach().cpu(),
@@ -391,10 +426,7 @@ def train_epoch(
                             if context_out is not None
                             else None
                         ),
-                        "target_coords": target_coords,
-                        "context_coords": context_coords,
-                        "patch_size": patch_size,
-                        "level_res": level_res,
+                        "levels": levels,
                     }
 
             # Context dice
@@ -712,21 +744,27 @@ def validate(
             label_dice_scores[label_id].append(dice_val)
             # Store one sample per label for wandb image logging
             if is_main and label_id not in label_samples:
-                # Get patch coordinates and info from level_outputs
-                target_coords = None
-                context_coords = None
-                patch_size = None
-                level_res = None
+                # Collect per-level info for visualization
+                levels = []
                 if level_outputs:
-                    level_out = level_outputs[-1]
-                    target_coords = level_out.get("coords")
-                    if target_coords is not None:
-                        target_coords = target_coords[i].detach().cpu()
-                    context_coords = level_out.get("context_coords")
-                    if context_coords is not None:
-                        context_coords = context_coords[i].detach().cpu()
-                    patch_size = level_out.get("patch_size", 16)
-                    level_res = level_out.get("level_res", 32)
+                    for level_out in level_outputs:
+                        l_coords = level_out.get("coords")
+                        if l_coords is not None:
+                            l_coords = l_coords[i].detach().cpu()
+                        l_ctx_coords = level_out.get("context_coords")
+                        if l_ctx_coords is not None:
+                            l_ctx_coords = l_ctx_coords[i].detach().cpu()
+                        l_pred = level_out.get("pred")
+                        l_pred_probs = None
+                        if l_pred is not None:
+                            l_pred_probs = torch.sigmoid(l_pred[i]).detach().cpu()
+                        levels.append({
+                            "target_coords": l_coords,
+                            "context_coords": l_ctx_coords,
+                            "patch_size": level_out.get("patch_size", 16),
+                            "level_res": level_out.get("level_res", 32),
+                            "pred_probs": l_pred_probs,
+                        })
 
                 label_samples[label_id] = {
                     "image": images[i].detach().cpu(),
@@ -742,10 +780,7 @@ def validate(
                         if context_out is not None
                         else None
                     ),
-                    "target_coords": target_coords,
-                    "context_coords": context_coords,
-                    "patch_size": patch_size,
-                    "level_res": level_res,
+                    "levels": levels,
                 }
 
         # Context dice

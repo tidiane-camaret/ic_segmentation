@@ -22,4 +22,4 @@ nvidia-smi
 
 # run with sbatch scripts/slurm_batch.sh
 
-uv run accelerate launch --multi_gpu scripts/train.py experiment=52_continuous_sampling cluster=dlclarge #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/warm-vortex-184/best_model.pt
+uv run accelerate launch --multi_gpu scripts/train.py experiment=60_2_levels cluster=dlclarge #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/warm-vortex-184/best_model.pt
