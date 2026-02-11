@@ -179,6 +179,19 @@ label_ids = ['liver',
  'humerus_left',
  'vertebrae_T10']
 
+
+# Train/Val split (80/20 split with fixed random seed for reproducibility)
+_rng = random.Random(42)
+_shuffled = label_ids.copy()
+_rng.shuffle(_shuffled)
+_split_idx = int(len(_shuffled) * 0.8)
+
+label_ids_train = _shuffled[:_split_idx]
+label_ids_val = _shuffled[_split_idx:]
+
+# Clean up temporary variables
+del _rng, _shuffled, _split_idx
+"""
 label_ids_train = [
     'liver',
     #'lung_upper_lobe_left',
@@ -215,19 +228,6 @@ label_ids_val = [
     'femur_left',
     #'femur_right'
 ]
-"""
-# Train/Val split (80/20 split with fixed random seed for reproducibility)
-_rng = random.Random(42)
-_shuffled = label_ids.copy()
-_rng.shuffle(_shuffled)
-_split_idx = int(len(_shuffled) * 0.8)
-
-label_ids_train = _shuffled[:_split_idx]
-label_ids_val = _shuffled[_split_idx:]
-
-# Clean up temporary variables
-del _rng, _shuffled, _split_idx
-
 
 
 def get_label_ids(split="all"):

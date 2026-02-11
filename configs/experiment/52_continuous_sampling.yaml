@@ -73,7 +73,7 @@ model:
     levels:
       - resolution: 32
         patch_size: 8
-        num_patches: 64  # Training patches (continuous sampler)
+        num_patches: 16  # Training patches (continuous sampler)
         num_patches_val: 64  # Validation patches (defaults to num_patches if omitted)
         sampling_temperature: 0.3
 
@@ -96,8 +96,8 @@ model:
       feature_grid_size: 32
       patch_feature_grid_size: 8  # Must match patch_size
       num_heads: 8
-      num_layers: 4
-      num_registers: 8
+      num_layers: 3
+      num_registers: 4
       target_self_attention: true
       dropout: 0.1
       append_zero_attn: true
