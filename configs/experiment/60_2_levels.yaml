@@ -1,6 +1,6 @@
 # @package _global_
 dataset: totalseg2d
-max_labels: 60 # null  # If set, use only the top n labels by volume (e.g., 20 for largest 20)
+max_labels: 30 # null  # If set, use only the top n labels by volume (e.g., 20 for largest 20)
 
 # trainable image encoder
 feature_mode: "on_the_fly"

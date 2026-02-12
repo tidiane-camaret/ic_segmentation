@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p ml_gpu-rtx2080
 #SBATCH -c 20
-#SBATCH --mem 24000  
+#SBATCH --mem 36000  
 #SBATCH --gres=gpu:2
 #SBATCH --time=12:00:00
 

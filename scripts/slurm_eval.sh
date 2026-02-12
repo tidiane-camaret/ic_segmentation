@@ -22,4 +22,4 @@ nvidia-smi
 
 # run with sbatch scripts/slurm_batch.sh
 
-uv run accelerate launch --multi_gpu scripts/eval.py experiment=51_trainable_encoder cluster=dlclarge dataset=totalseg2d method=universeg #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/warm-vortex-184/best_model.pt
+uv run accelerate launch --multi_gpu scripts/eval.py experiment=60_2_levels cluster=dlclarge dataset=medsegbench checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/deep-feather-217/best_model.pt
