@@ -21,6 +21,6 @@ paths:
 
 # Cluster-specific training settings
 train_batch_size: 10
-val_batch_size: 10
+val_batch_size: 30
 training:
-  num_workers: 16
+  num_workers: 18

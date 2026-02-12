@@ -71,33 +71,42 @@ class PatchAggregator(nn.Module):
         output_size: tuple[int, int],
         prev_pred: torch.Tensor = None,
     ) -> torch.Tensor:
-        """Aggregate patch predictions back to a full mask."""
+        """Aggregate patch predictions back to a full mask (vectorized)."""
         B, K, C, ps_h, ps_w = patch_logits.shape
         ps = self.patch_size
         H, W = output_size
         device = patch_logits.device
 
         weights = self._compute_patch_weights(patch_logits, coords, output_size)
-        output = torch.zeros(B, C, H, W, device=device)
-        counts = torch.zeros(B, C, H, W, device=device)
 
-        for b in range(B):
-            for k in range(K):
-                h, w = int(coords[b, k, 0].item()), int(coords[b, k, 1].item())
-                # Two-sided clipping: handle negative coords (border patches)
-                h_start = max(h, 0)
-                w_start = max(w, 0)
-                h_end = min(h + ps, H)
-                w_end = min(w + ps, W)
-                if h_start >= h_end or w_start >= w_end:
-                    continue
-                ph_start = h_start - h
-                pw_start = w_start - w
-                ph_end = ph_start + (h_end - h_start)
-                pw_end = pw_start + (w_end - w_start)
-                patch_weight = weights[b, k, :, ph_start:ph_end, pw_start:pw_end]
-                output[b, :, h_start:h_end, w_start:w_end] += patch_logits[b, k, :, ph_start:ph_end, pw_start:pw_end] * patch_weight
-                counts[b, :, h_start:h_end, w_start:w_end] += patch_weight
+        # Build output position grid for all patches (no Python loops / .item() syncs)
+        row_offsets = torch.arange(ps, device=device)
+        col_offsets = torch.arange(ps, device=device)
+        # [B, K, ps] + [ps] -> [B, K, ps]
+        patch_rows = coords[:, :, 0:1].long() + row_offsets.view(1, 1, -1)
+        patch_cols = coords[:, :, 1:2].long() + col_offsets.view(1, 1, -1)
+        # Expand to 2D grid: [B, K, ps, ps]
+        rows_2d = patch_rows.unsqueeze(-1).expand(B, K, ps, ps)
+        cols_2d = patch_cols.unsqueeze(-2).expand(B, K, ps, ps)
+
+        # Validity mask for boundary clipping
+        valid = (rows_2d >= 0) & (rows_2d < H) & (cols_2d >= 0) & (cols_2d < W)
+        valid_f = valid.unsqueeze(2).float()  # [B, K, 1, ps, ps]
+
+        # Flat scatter indices (clamped; invalid positions are masked via valid_f)
+        flat_idx = rows_2d.clamp(0, H - 1) * W + cols_2d.clamp(0, W - 1)  # [B, K, ps, ps]
+        flat_idx = flat_idx.reshape(B, -1).unsqueeze(1).expand(B, C, K * ps * ps)
+
+        # Prepare values with validity mask
+        weighted = (patch_logits * weights * valid_f).permute(0, 2, 1, 3, 4).reshape(B, C, -1)
+        w_masked = (weights * valid_f).permute(0, 2, 1, 3, 4).reshape(B, C, -1)
+
+        output = torch.zeros(B, C, H * W, device=device)
+        counts = torch.zeros(B, C, H * W, device=device)
+        output.scatter_add_(2, flat_idx, weighted)
+        counts.scatter_add_(2, flat_idx, w_masked)
+        output = output.reshape(B, C, H, W)
+        counts = counts.reshape(B, C, H, W)
 
         covered = counts > self.min_coverage
         counts_safe = counts.clamp(min=self.min_coverage)

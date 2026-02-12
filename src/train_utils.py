@@ -569,8 +569,6 @@ def train_epoch(
             )
 
         del outputs, losses
-        if idx % 10 == 0:
-            torch.cuda.empty_cache()
 
     n = len(train_loader)
     ctx_dice_final = (

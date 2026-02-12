@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p ml_gpu-rtx2080
 #SBATCH -c 20
-#SBATCH --mem 36000  
+#SBATCH --mem 48000
 #SBATCH --gres=gpu:2
 #SBATCH --time=12:00:00
 
@@ -20,6 +20,12 @@ export NCCL_TIMEOUT=1800
 # Ensure clean GPU state
 nvidia-smi
 
-# run with sbatch scripts/slurm_batch.sh
+# run with sbatch scripts/slurm_train.sh
 
-uv run accelerate launch --multi_gpu scripts/train.py experiment=60_2_levels cluster=dlclarge checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/rich-valley-210/best_model.pt
+uv run accelerate launch \
+    --multi_gpu \
+    --num_processes=2 \
+    scripts/train.py \
+    experiment=60_2_levels \
+    cluster=dlclarge \
+    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/rich-valley-210/best_model.pt

@@ -143,7 +143,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=cfg.training.get("num_workers", 4),
             split="train",
             shuffle=False,
-
+            random_context=False,
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )
@@ -162,7 +162,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=cfg.training.get("num_workers", 4),
             split="val",
             shuffle=False,
-
+            random_context=False,
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
         )

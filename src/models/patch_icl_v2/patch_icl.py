@@ -262,31 +262,40 @@ class PatchICL(nn.Module):
         context_out: torch.Tensor,
         context_weights: torch.Tensor,
         sampler: nn.Module,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[dict]], torch.Tensor]:
-        """Select patches from each context image using the given sampler."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[dict]] | None, torch.Tensor]:
+        """Select patches from all context images in a single batched sampler call."""
         B, k = context_in.shape[:2]
-        all_ctx_patches, all_ctx_labels, all_ctx_coords, all_aug_params, all_ctx_validity = [], [], [], [], []
 
-        for b in range(B):
-            batch_patches, batch_labels, batch_coords, batch_aug_params, batch_validity = [], [], [], [], []
-            for ctx_idx in range(k):
-                ctx_img = context_in[b, ctx_idx].unsqueeze(0)
-                ctx_mask = context_out[b, ctx_idx].unsqueeze(0)
-                ctx_weight = context_weights[b, ctx_idx].unsqueeze(0)
-                patches, labels, coords, _, aug_params, validity = sampler(ctx_img, ctx_mask, ctx_weight)
-                batch_patches.append(patches.squeeze(0))
-                batch_labels.append(labels.squeeze(0))
-                batch_coords.append(coords.squeeze(0))
-                batch_aug_params.append(aug_params)
-                batch_validity.append(validity.squeeze(0))
-            all_ctx_patches.append(torch.cat(batch_patches, dim=0))
-            all_ctx_labels.append(torch.cat(batch_labels, dim=0))
-            all_ctx_coords.append(torch.cat(batch_coords, dim=0))
-            all_aug_params.append(batch_aug_params)
-            all_ctx_validity.append(torch.cat(batch_validity, dim=0))
+        # Flatten [B, k, ...] -> [B*k, ...] and process all context images at once
+        ctx_in_flat = context_in.reshape(B * k, *context_in.shape[2:])
+        ctx_out_flat = context_out.reshape(B * k, *context_out.shape[2:])
+        ctx_w_flat = context_weights.reshape(B * k, *context_weights.shape[2:])
 
-        return (torch.stack(all_ctx_patches), torch.stack(all_ctx_labels),
-                torch.stack(all_ctx_coords), all_aug_params, torch.stack(all_ctx_validity))
+        patches, labels, coords, _, aug_params, validity = sampler(
+            ctx_in_flat, ctx_out_flat, ctx_w_flat
+        )
+        K_per = patches.shape[1]
+
+        # Reshape [B*k, K_per, ...] -> [B, k*K_per, ...]
+        patches = patches.reshape(B, k * K_per, *patches.shape[2:])
+        labels = labels.reshape(B, k * K_per, *labels.shape[2:])
+        coords = coords.reshape(B, k * K_per, *coords.shape[2:])
+        validity = validity.reshape(B, k * K_per, *validity.shape[2:])
+
+        # Restructure aug_params into [B][k] list-of-lists for downstream compatibility
+        ctx_aug_params: list[list[dict]] | None = None
+        if aug_params and any(v is not None for v in aug_params.values()):
+            ctx_aug_params = []
+            for b in range(B):
+                batch_aug = []
+                for c in range(k):
+                    idx = b * k + c
+                    single = {key: (val[idx:idx+1] if val is not None else None)
+                              for key, val in aug_params.items()}
+                    batch_aug.append(single)
+                ctx_aug_params.append(batch_aug)
+
+        return patches, labels, coords, ctx_aug_params, validity
 
     def _forward_level(
         self,
@@ -378,7 +387,7 @@ class PatchICL(nn.Module):
                         feature_grid_size=self.feature_grid_size,
                         target_patch_grid_size=self.patch_feature_grid_size,
                     )
-                    if self.augmenter is not None:
+                    if self.augmenter is not None and context_aug_params is not None:
                         for b in range(B):
                             ctx_aug = context_aug_params[b][ctx_idx]
                             if ctx_aug and any(v is not None for v in ctx_aug.values()):
@@ -412,7 +421,7 @@ class PatchICL(nn.Module):
                 end_idx = (ctx_idx + 1) * K_per_ctx
                 ctx_logits = context_patch_logits[:, start_idx:end_idx]
                 ctx_coords_slice = context_coords[:, start_idx:end_idx]
-                if self.augmenter is not None:
+                if self.augmenter is not None and context_aug_params is not None:
                     for b in range(B):
                         ctx_aug = context_aug_params[b][ctx_idx]
                         if ctx_aug and any(v is not None for v in ctx_aug.values()):

@@ -267,16 +267,24 @@ class ContinuousSampler(nn.Module):
         h_coords_pad = indices // valid_w
         w_coords_pad = indices % valid_w
 
-        # Extract patches from padded tensors
-        patches = torch.zeros(B, K, C, ps, ps, device=device)
-        patch_labels = torch.zeros(B, K, C_mask, ps, ps, device=device)
-        patch_validity = torch.zeros(B, K, 1, ps, ps, device=device)
-        for b in range(B):
-            for k in range(K):
-                h, w = h_coords_pad[b, k].item(), w_coords_pad[b, k].item()
-                patches[b, k] = image_pad[b, :, h:h+ps, w:w+ps]
-                patch_labels[b, k] = labels_pad[b, :, h:h+ps, w:w+ps]
-                patch_validity[b, k] = validity_map[0, :, h:h+ps, w:w+ps]
+        # Vectorized patch extraction using gather (no Python loops / .item() syncs)
+        row_offsets = torch.arange(ps, device=device)
+        col_offsets = torch.arange(ps, device=device)
+        rows_2d = (h_coords_pad.unsqueeze(-1) + row_offsets).unsqueeze(-1).expand(B, K, ps, ps)
+        cols_2d = (w_coords_pad.unsqueeze(-1) + col_offsets).unsqueeze(-2).expand(B, K, ps, ps)
+        flat_idx = (rows_2d * W_pad + cols_2d).reshape(B, K * ps * ps)
+
+        img_flat = image_pad.reshape(B, C, -1)
+        patches = img_flat.gather(2, flat_idx.unsqueeze(1).expand(B, C, -1))
+        patches = patches.reshape(B, C, K, ps, ps).permute(0, 2, 1, 3, 4)
+
+        lbl_flat = labels_pad.reshape(B, C_mask, -1)
+        patch_labels = lbl_flat.gather(2, flat_idx.unsqueeze(1).expand(B, C_mask, -1))
+        patch_labels = patch_labels.reshape(B, C_mask, K, ps, ps).permute(0, 2, 1, 3, 4)
+
+        val_flat = validity_map.reshape(1, 1, -1).expand(B, -1, -1)
+        patch_validity = val_flat.gather(2, flat_idx.unsqueeze(1))
+        patch_validity = patch_validity.reshape(B, 1, K, ps, ps).permute(0, 2, 1, 3, 4)
 
         # Convert to original-space coordinates (can be negative)
         h_coords = h_coords_pad - pad_before

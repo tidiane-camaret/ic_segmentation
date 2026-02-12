@@ -449,6 +449,7 @@ def get_dataloader(
     num_workers: int = 4,
     split: str = 'train',
     shuffle: bool = True,
+    random_context: bool = True,
     **dataset_kwargs
 ) -> DataLoader:
     """
@@ -478,6 +479,7 @@ def get_dataloader(
         image_size=image_size,
         spacing=spacing,
         split=split,
+        random_context=random_context,
         **dataset_kwargs
     )
 

@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH -p ml_gpu-rtx2080
 #SBATCH -c 20
-#SBATCH --mem 48000  # Doubled from 24GB to 48GB
-#SBATCH --gres=gpu:1
-#SBATCH --time=1:00:00
+#SBATCH --mem 48000 
+#SBATCH --gres=gpu:2
+#SBATCH --time=2:00:00
 
 
-# interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 48000 --gres=gpu:2 --time=12:00:00 --pty bash 
+# interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 48000 --gres=gpu:2 --time=2:00:00 --pty bash 
 # NCCL debugging and timeout settings
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
@@ -20,6 +20,15 @@ export NCCL_TIMEOUT=1800
 # Ensure clean GPU state
 nvidia-smi
 
-# run with sbatch scripts/slurm_batch.sh
+# run with sbatch scripts/slurm_eval.sh
 
-uv run accelerate launch --multi_gpu scripts/eval.py experiment=60_2_levels cluster=dlclarge dataset=medsegbench checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/deep-feather-217/best_model.pt
+#uv run accelerate launch --multi_gpu scripts/eval.py experiment=60_2_levels cluster=dlclarge dataset=medsegbench checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/deep-feather-217/best_model.pt
+uv run accelerate launch \
+    --multi_gpu \
+    --num_processes=2 \
+    scripts/eval.py \
+    experiment=60_2_levels \
+    dataset=totalseg2d \
+    max_labels=10 \
+    cluster=dlclarge \
+    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/deep-feather-217/best_model.pt

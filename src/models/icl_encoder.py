@@ -194,6 +194,9 @@ class ICLEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Extract features for target and context images.
 
+        Batches all images through img_blocks in a single forward pass to reduce
+        kernel launch overhead, then applies msk_blocks only to context.
+
         Args:
             target_images: [B, 1, H, W]
             context_images: [B, k, 1, H, W] (optional)
@@ -211,18 +214,51 @@ class ICLEncoder(nn.Module):
         k = context_images.shape[1]
         ctx_flat = context_images.view(B * k, *context_images.shape[2:])
 
-        if context_masks is not None:
-            # Separate paths: target without mask, context with mask
-            target_features = self.extract_features(target_images)
-            mask_flat = context_masks.view(B * k, *context_masks.shape[2:])
-            context_features = self.extract_features(ctx_flat, masks=mask_flat)
-            context_features = context_features.view(B, k, *context_features.shape[1:])
-        else:
-            # No masks: batch target + context together
+        if context_masks is None:
+            # No masks: batch target + context together through full encoder
             all_images = torch.cat([target_images, ctx_flat], dim=0)
             all_features = self.extract_features(all_images)
             target_features = all_features[:B]
             context_features = all_features[B:].view(B, k, *all_features.shape[1:])
+            return target_features, context_features
+
+        # With masks: run img_blocks on all images together, msk_blocks on context only
+        mask_flat = context_masks.view(B * k, *context_masks.shape[2:])
+        all_images = torch.cat([target_images, ctx_flat], dim=0)  # [B+B*k, 1, H, W]
+
+        if all_images.shape[-2:] != (INPUT_SIZE, INPUT_SIZE):
+            all_images = F.interpolate(all_images, size=(INPUT_SIZE, INPUT_SIZE),
+                                       mode="bilinear", align_corners=False)
+        if mask_flat.shape[-2:] != (INPUT_SIZE, INPUT_SIZE):
+            mask_flat = F.interpolate(mask_flat.float(), size=(INPUT_SIZE, INPUT_SIZE),
+                                      mode="nearest")
+
+        img_x = all_images
+        msk_x = mask_flat
+        target_feats: List[torch.Tensor] = []
+        context_feats: List[torch.Tensor] = []
+
+        for i in range(NUM_BLOCKS):
+            img_x = self.img_blocks[i](img_x)
+            msk_x = self.msk_blocks[i](msk_x)
+
+            if i in self.layer_indices:
+                target_feats.append(self._resize_feat(img_x[:B]))
+                context_feats.append(self._resize_feat(img_x[B:] + msk_x))
+
+            if i < NUM_BLOCKS - 1:
+                img_x = self.pool(img_x)
+                msk_x = self.pool(msk_x)
+
+        # Concatenate layers and reshape to [*, N, D]
+        t_feat = torch.cat(target_feats, dim=1)
+        Bt, Dt, Gt, _ = t_feat.shape
+        target_features = t_feat.reshape(Bt, Dt, Gt * Gt).permute(0, 2, 1)
+
+        c_feat = torch.cat(context_feats, dim=1)
+        Bc, Dc, Gc, _ = c_feat.shape
+        context_features = c_feat.reshape(Bc, Dc, Gc * Gc).permute(0, 2, 1)
+        context_features = context_features.view(B, k, *context_features.shape[1:])
 
         return target_features, context_features
 
