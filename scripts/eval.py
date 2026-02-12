@@ -10,6 +10,8 @@ from pathlib import Path
 
 import hydra
 import torch
+from datetime import datetime
+
 from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
@@ -120,6 +122,9 @@ def main(cfg: DictConfig) -> None:
             project=cfg.logging.wandb_project_eval,
             config=OmegaConf.to_container(cfg, resolve=True),  # wandb needs plain dict
         )
+        run_name = wandb.run.name
+    else:
+        run_name = f"run_{accelerator.process_index}_{accelerator.num_processes}"
     # Build dataloaders
     # Support separate max_ds_len for train/val, with fallback to single value
     max_ds_len_cfg = cfg.get("max_ds_len")
@@ -408,16 +413,16 @@ def main(cfg: DictConfig) -> None:
     # Validation with optional saving
     save_imgs = cfg.logging.get("save_imgs_masks", False)
     if save_imgs:
-        results_dir = Path(cfg.paths.get("RESULTS_DIR", ckpt_dir / "eval_results"))
-        val_save_dir = results_dir / f"{cfg.dataset}_{cfg.method}_eval"
+        date_str = datetime.today().strftime('%Y-%m-%d')
+        save_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}"
         if accelerator.is_main_process:
-            print(f"Saving evaluation images to: {val_save_dir}")
+            print(f"Saving evaluation images to: {save_dir}")
     else:
-        val_save_dir = None
+        save_dir = None
 
     val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
         model, val_loader, device,
-        save_dir=val_save_dir, max_save_batches=len(val_loader),
+        save_dir=save_dir, max_save_batches=len(val_loader),
         accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0
     )
     if accelerator.is_main_process:

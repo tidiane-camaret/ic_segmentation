@@ -1,7 +1,7 @@
 """Simplified training script for PatchICL with Hydra config."""
 import sys
 from pathlib import Path
-
+from datetime import datetime
 import hydra
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
@@ -35,9 +35,10 @@ def main(cfg: DictConfig) -> None:
     else:
         run_name = f"run_{accelerator.process_index}_{accelerator.num_processes}"
     # Create checkpoint dir
-    ckpt_dir = Path(cfg.paths.ckpts.save_dir) / run_name
+    date_str = datetime.today().strftime('%Y-%m-%d')
+    save_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}"
     if accelerator.is_main_process:
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        save_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
 
     # Image augmentation config (only for training)
@@ -309,8 +310,8 @@ def main(cfg: DictConfig) -> None:
     best_dice = 0.0
     save_imgs = cfg.logging.get("save_imgs_masks", False)
     save_every_n_epochs = cfg.logging.get("save_every_n_epochs", 5)
-    train_save_dir = ckpt_dir / "train_images" if save_imgs else None
-    val_save_dir = ckpt_dir / "val_images" if save_imgs else None
+    train_save_dir = save_dir / "train_images" if save_imgs else None
+    val_save_dir = save_dir / "val_images" if save_imgs else None
 
     if save_imgs and accelerator.is_main_process:
         print(f"Saving images: train every {save_every_n_epochs} epochs to {train_save_dir}")
@@ -385,7 +386,7 @@ def main(cfg: DictConfig) -> None:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "best_dice": best_dice,
                     "config": OmegaConf.to_container(cfg, resolve=True),
-                }, ckpt_dir / "best_model.pt")
+                }, save_dir / "best_model.pt")
 
     if accelerator.is_main_process:
         print(f"\nTraining complete! Best Dice: {best_dice:.5f}")
