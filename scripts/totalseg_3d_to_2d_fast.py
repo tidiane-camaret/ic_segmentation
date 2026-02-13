@@ -123,7 +123,7 @@ def main(cfg: DictConfig) -> None:
 
     totalseg_dir = Path(cfg.paths.totalseg)
     # New output dir for HDF5 files
-    totalseg_2d_dir_h5 = Path(cfg.paths.totalsegmri2d_h5) 
+    totalseg_2d_dir_h5 = Path(cfg.paths.totalseg2d_h5) 
     stats_path = Path(cfg.paths.totalseg_stats)
 
     print(f"Input dir: {totalseg_dir}")
