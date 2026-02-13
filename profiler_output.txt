@@ -1,0 +1,140 @@
+Using device: cuda
+Using train label split: 1 labels (top 2 by volume)
+Augmentation enabled: rotation=±15.0°, scale=±10%, elastic, intensity
+CarveMix enabled: p=0.5, margin=(0.1, 0.5), harmonize=True, sigma=5.0
+Advanced augmentation enabled: windowing_jitter=100, fg_crop_p=0.3, mask_perturb_p=0.3, degrade_p=0.2, asym_intensity_p=0.5
+Loaded stats for 1228 cases
+Built mapping for 1 labels (stats has 117 unique labels)
+Filtered to 1082 cases for split 'train'
+Created 2712 samples
+Shuffled samples
+Filtered 8 empty-mask entries from valid_contexts
+Cache: 2712 entries, 0.22 GB
+Dataset size: 100, batch size: 1
+ICLEncoder: layers=all, feature_dim=256, output=32x32, freeze=False, params=519296
+Model parameters: 7,583,873
+
+================================================================================
+BATCH INFO
+================================================================================
+Images shape: torch.Size([1, 1, 128, 128])
+Labels shape: torch.Size([1, 1, 128, 128])
+Context in shape: torch.Size([1, 3, 1, 128, 128])
+Context out shape: torch.Size([1, 3, 1, 128, 128])
+
+Warming up...
+
+
+################################################################################
+# PROFILING DATA LOADING
+################################################################################
+
+================================================================================
+DATALOADER PROFILING
+================================================================================
+
+================================================================================
+TIMING REPORT (CPU wall time / CUDA kernel time)
+================================================================================
+total_batch_load                        :     1.98ms CPU /     1.82ms CUDA ( 59.6%)
+to_device_context                       :     0.49ms CPU /     0.40ms CUDA ( 14.8%)
+to_device_images                        :     0.37ms CPU /     0.27ms CUDA ( 11.1%)
+to_device_labels                        :     0.32ms CPU /     0.22ms CUDA (  9.5%)
+get_batch_from_iterator                 :     0.17ms CPU /     0.07ms CUDA (  5.0%)
+--------------------------------------------------------------------------------
+TOTAL                                   :    33.29ms CPU /    27.72ms CUDA
+
+
+################################################################################
+# PROFILING FORWARD PASS (DETAILED)
+################################################################################
+
+================================================================================
+DETAILED FORWARD PASS PROFILING
+================================================================================
+
+================================================================================
+TIMING REPORT (CPU wall time / CUDA kernel time)
+================================================================================
+2.level_0_total                         :   159.31ms CPU /   159.23ms CUDA ( 24.7%)
+2.level_1_total                         :    85.61ms CPU /    85.44ms CUDA ( 13.3%)
+2e.level_0_context_sampling             :    84.67ms CPU /    84.43ms CUDA ( 13.1%)
+1.feature_extraction_total              :    53.07ms CPU /    52.84ms CUDA (  8.2%)
+2g.level_0_backbone_total               :    32.84ms CPU /    32.66ms CUDA (  5.1%)
+2g.level_1_backbone_total               :    32.15ms CPU /    31.98ms CUDA (  5.0%)
+2e.level_1_context_sampling             :    28.98ms CPU /    28.73ms CUDA (  4.5%)
+2b.level_0_target_sampling              :    24.57ms CPU /    24.38ms CUDA (  3.8%)
+2g2.level_0_attention                   :    23.34ms CPU /    23.07ms CUDA (  3.6%)
+2g2.level_1_attention                   :    22.48ms CPU /    22.30ms CUDA (  3.5%)
+1c.encoder_forward                      :    21.80ms CPU /    21.58ms CUDA (  3.4%)
+2b.level_1_target_sampling              :    12.39ms CPU /    12.22ms CUDA (  1.9%)
+2f.level_0_extract_context_features     :     8.14ms CPU /     7.95ms CUDA (  1.3%)
+2g3.level_1_cnn_decoder                 :     5.37ms CPU /     5.18ms CUDA (  0.8%)
+2g3.level_0_cnn_decoder                 :     4.95ms CPU /     4.77ms CUDA (  0.8%)
+1c_3_img_block                          :     4.70ms CPU /     2.33ms CUDA (  0.7%)
+2f.level_1_extract_context_features     :     4.49ms CPU /     4.30ms CUDA (  0.7%)
+2c.level_0_extract_target_features      :     4.00ms CPU /     3.91ms CUDA (  0.6%)
+2h.level_1_aggregation                  :     3.32ms CPU /     3.14ms CUDA (  0.5%)
+2g1.level_0_cnn_encoder                 :     3.29ms CPU /     3.01ms CUDA (  0.5%)
+2g1.level_1_cnn_encoder                 :     3.14ms CPU /     2.93ms CUDA (  0.5%)
+1c_2_img_block                          :     3.01ms CPU /     2.77ms CUDA (  0.5%)
+1c_0_img_block                          :     2.58ms CPU /     2.50ms CUDA (  0.4%)
+2c.level_1_extract_target_features      :     2.36ms CPU /     2.18ms CUDA (  0.4%)
+2h.level_0_aggregation                  :     2.30ms CPU /     2.08ms CUDA (  0.4%)
+1c_2_msk_block                          :     2.14ms CPU /     1.74ms CUDA (  0.3%)
+1c_0_msk_block                          :     1.93ms CPU /     1.64ms CUDA (  0.3%)
+1c_1_msk_block                          :     1.75ms CPU /     1.53ms CUDA (  0.3%)
+1c_1_img_block                          :     1.73ms CPU /     1.49ms CUDA (  0.3%)
+1c_3_msk_block                          :     1.39ms CPU /     1.16ms CUDA (  0.2%)
+2d.level_0_context_downsample           :     1.08ms CPU /     0.89ms CUDA (  0.2%)
+2a.level_0_downsample                   :     0.49ms CPU /     0.40ms CUDA (  0.1%)
+1a.prepare_inputs                       :     0.46ms CPU /     0.36ms CUDA (  0.1%)
+2a.level_1_downsample                   :     0.45ms CPU /     0.23ms CUDA (  0.1%)
+2d.level_1_context_downsample           :     0.41ms CPU /     0.23ms CUDA (  0.1%)
+1b.resize_inputs                        :     0.17ms CPU /     0.00ms CUDA (  0.0%)
+--------------------------------------------------------------------------------
+TOTAL                                   :   644.86ms CPU /   635.60ms CUDA
+
+
+################################################################################
+# PROFILING BACKWARD PASS
+################################################################################
+
+================================================================================
+BACKWARD PASS PROFILING
+================================================================================
+
+================================================================================
+TIMING REPORT (CPU wall time / CUDA kernel time)
+================================================================================
+forward                                 :   323.10ms CPU /   323.01ms CUDA ( 55.7%)
+backward                                :   256.67ms CPU /   256.42ms CUDA ( 44.3%)
+--------------------------------------------------------------------------------
+TOTAL                                   :   579.76ms CPU /   579.43ms CUDA
+
+
+################################################################################
+# FULL TRAINING ITERATION TIMING
+################################################################################
+
+================================================================================
+TIMING REPORT (CPU wall time / CUDA kernel time)
+================================================================================
+total_iteration                         :   693.73ms CPU /   693.53ms CUDA ( 50.0%)
+forward                                 :   338.59ms CPU /   338.50ms CUDA ( 24.4%)
+backward                                :   305.79ms CPU /   305.64ms CUDA ( 22.1%)
+optimizer_step                          :    27.90ms CPU /    27.72ms CUDA (  2.0%)
+loss                                    :    18.16ms CPU /    17.96ms CUDA (  1.3%)
+zero_grad                               :     1.67ms CPU /     1.56ms CUDA (  0.1%)
+data_to_device                          :     0.72ms CPU /     0.46ms CUDA (  0.1%)
+--------------------------------------------------------------------------------
+TOTAL                                   : 13865.65ms CPU / 13853.72ms CUDA
+
+
+################################################################################
+# PYTORCH CUDA PROFILER
+################################################################################
+
+================================================================================
+PYTORCH PROFILER (CUDA kernels)
+================================================================================

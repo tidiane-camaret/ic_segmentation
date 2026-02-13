@@ -3,17 +3,18 @@
 Usage:
     python scripts/profile_training.py +experiment=60_2_levels
 """
+
 import sys
-from pathlib import Path
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from pathlib import Path
 
 import hydra
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import ProfilerActivity, profile, record_function
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.losses import build_loss_fn
@@ -45,18 +46,16 @@ class Timer:
             self.cuda_times[name].append(cuda_elapsed)
 
     def report(self):
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("TIMING REPORT (CPU wall time / CUDA kernel time)")
-        print("="*80)
+        print("=" * 80)
 
         total_cpu = sum(sum(v) for v in self.times.values())
         total_cuda = sum(sum(v) for v in self.cuda_times.values())
 
         # Sort by total time
         sorted_names = sorted(
-            self.times.keys(),
-            key=lambda n: sum(self.times[n]),
-            reverse=True
+            self.times.keys(), key=lambda n: sum(self.times[n]), reverse=True
         )
 
         for name in sorted_names:
@@ -66,17 +65,19 @@ class Timer:
             avg_cuda = sum(cuda_times) / len(cuda_times)
             total_cpu_name = sum(cpu_times)
             pct = total_cpu_name / total_cpu * 100 if total_cpu > 0 else 0
-            print(f"{name:40s}: {avg_cpu:8.2f}ms CPU / {avg_cuda:8.2f}ms CUDA ({pct:5.1f}%)")
+            print(
+                f"{name:40s}: {avg_cpu:8.2f}ms CPU / {avg_cuda:8.2f}ms CUDA ({pct:5.1f}%)"
+            )
 
-        print("-"*80)
+        print("-" * 80)
         print(f"{'TOTAL':40s}: {total_cpu:8.2f}ms CPU / {total_cuda:8.2f}ms CUDA")
 
 
 def profile_dataloader(train_loader, device, num_batches=5):
     """Profile data loading time."""
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("DATALOADER PROFILING")
-    print("="*80)
+    print("=" * 80)
 
     timer = Timer()
 
@@ -153,9 +154,9 @@ def profile_model_forward(model, batch, device, timer, unwrapped_model):
 
 def profile_forward_detailed(model, batch, device, unwrapped_model):
     """Detailed profiling of forward pass internals."""
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("DETAILED FORWARD PASS PROFILING")
-    print("="*80)
+    print("=" * 80)
 
     timer = Timer()
 
@@ -183,7 +184,11 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
                 k = context_in.shape[1] if context_in is not None else 0
                 if context_in is not None:
                     ctx_flat = context_in.view(B * k, *context_in.shape[2:])
-                    mask_flat = context_out.view(B * k, *context_out.shape[2:]) if context_out is not None else None
+                    mask_flat = (
+                        context_out.view(B * k, *context_out.shape[2:])
+                        if context_out is not None
+                        else None
+                    )
                     all_images = torch.cat([images, ctx_flat], dim=0)
                 else:
                     all_images = images
@@ -191,9 +196,16 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
 
             with timer.track("1b.resize_inputs"):
                 if all_images.shape[-2:] != (128, 128):
-                    all_images = F.interpolate(all_images, size=(128, 128), mode="bilinear", align_corners=False)
+                    all_images = F.interpolate(
+                        all_images,
+                        size=(128, 128),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
                 if mask_flat is not None and mask_flat.shape[-2:] != (128, 128):
-                    mask_flat = F.interpolate(mask_flat.float(), size=(128, 128), mode="nearest")
+                    mask_flat = F.interpolate(
+                        mask_flat.float(), size=(128, 128), mode="nearest"
+                    )
 
             with timer.track("1c.encoder_forward"):
                 # Run through conv blocks
@@ -211,14 +223,16 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
                             msk_x = fe.pool(msk_x)
 
             # Get proper features
-            target_features, context_features = fe.extract_batch(images, context_in, context_out)
+            target_features, context_features = fe.extract_batch(
+                images, context_in, context_out
+            )
         else:
             target_features, context_features = None, None
 
     # 2. Per-level forward
     for level_idx in range(unwrapped_model.num_levels):
         level_cfg = unwrapped_model.levels[level_idx]
-        resolution = level_cfg['resolution']
+        resolution = level_cfg["resolution"]
         sampler = unwrapped_model.samplers[level_idx]
         aggregator = unwrapped_model.aggregators[level_idx]
 
@@ -239,10 +253,11 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
             with timer.track(f"2c.level_{level_idx}_extract_target_features"):
                 if target_features is not None:
                     from src.models.patch_icl_v2.patch_icl import extract_patch_features
+
                     target_patch_features = extract_patch_features(
                         features=target_features,
                         coords=coords,
-                        patch_size=level_cfg['patch_size'],
+                        patch_size=level_cfg["patch_size"],
                         level_resolution=resolution,
                         feature_grid_size=unwrapped_model.feature_grid_size,
                         target_patch_grid_size=unwrapped_model.patch_feature_grid_size,
@@ -255,15 +270,21 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
                 context_out_flat = context_out.view(B * k, *context_out.shape[2:])
 
                 with timer.track(f"2d.level_{level_idx}_context_downsample"):
-                    context_in_ds = unwrapped_model._downsample(context_in_flat, resolution).view(B, k, -1, resolution, resolution)
-                    context_out_ds = unwrapped_model._downsample_mask(context_out_flat, resolution).view(B, k, context_out.shape[2], resolution, resolution)
+                    context_in_ds = unwrapped_model._downsample(
+                        context_in_flat, resolution
+                    ).view(B, k, -1, resolution, resolution)
+                    context_out_ds = unwrapped_model._downsample_mask(
+                        context_out_flat, resolution
+                    ).view(B, k, context_out.shape[2], resolution, resolution)
                     context_weights = unwrapped_model._mask_to_weights(
                         context_out_ds.view(B * k, *context_out_ds.shape[2:])
                     ).view(B, k, 1, resolution, resolution)
 
                 with timer.track(f"2e.level_{level_idx}_context_sampling"):
-                    ctx_patches, ctx_labels, ctx_coords, _, ctx_validity = unwrapped_model._select_context_patches(
-                        context_in_ds, context_out_ds, context_weights, sampler
+                    ctx_patches, ctx_labels, ctx_coords, _, ctx_validity = (
+                        unwrapped_model._select_context_patches(
+                            context_in_ds, context_out_ds, context_weights, sampler
+                        )
                     )
 
                 with timer.track(f"2f.level_{level_idx}_extract_context_features"):
@@ -273,11 +294,13 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
                         ctx_features_list = []
                         for ctx_idx in range(k):
                             ctx_feats = context_features[:, ctx_idx]
-                            ctx_coords_slice = ctx_coords[:, ctx_idx * K_per_ctx:(ctx_idx + 1) * K_per_ctx]
+                            ctx_coords_slice = ctx_coords[
+                                :, ctx_idx * K_per_ctx : (ctx_idx + 1) * K_per_ctx
+                            ]
                             extracted = extract_patch_features(
                                 features=ctx_feats,
                                 coords=ctx_coords_slice,
-                                patch_size=level_cfg['patch_size'],
+                                patch_size=level_cfg["patch_size"],
                                 level_resolution=resolution,
                                 feature_grid_size=unwrapped_model.feature_grid_size,
                                 target_patch_grid_size=unwrapped_model.patch_feature_grid_size,
@@ -291,9 +314,19 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
                     K_ctx = context_patch_features.shape[1]
                     coord_scale = H / resolution
 
-                    img_patches = torch.cat([target_patch_features, context_patch_features], dim=1)
-                    all_coords = torch.cat([coords.float() * coord_scale, ctx_coords.float() * coord_scale], dim=1)
-                    ctx_id_labels = torch.zeros(B, K + K_ctx, dtype=torch.long, device=device)
+                    img_patches = torch.cat(
+                        [target_patch_features, context_patch_features], dim=1
+                    )
+                    all_coords = torch.cat(
+                        [
+                            coords.float() * coord_scale,
+                            ctx_coords.float() * coord_scale,
+                        ],
+                        dim=1,
+                    )
+                    ctx_id_labels = torch.zeros(
+                        B, K + K_ctx, dtype=torch.long, device=device
+                    )
                     K_per_ctx = K_ctx // k
                     for ctx_idx in range(k):
                         start = K + ctx_idx * K_per_ctx
@@ -302,7 +335,9 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
 
                     with timer.track(f"2g1.level_{level_idx}_cnn_encoder"):
                         encoded, skips = unwrapped_model.backbone.encoder(img_patches)
-                        encoded = encoded + unwrapped_model.backbone.level_embed[level_idx].view(1, 1, -1)
+                        encoded = encoded + unwrapped_model.backbone.level_embed[
+                            level_idx
+                        ].view(1, 1, -1)
 
                     with timer.track(f"2g2.level_{level_idx}_attention"):
                         is_context = ctx_id_labels > 0
@@ -324,9 +359,9 @@ def profile_forward_detailed(model, batch, device, unwrapped_model):
 
 def profile_backward(model, batch, device, unwrapped_model):
     """Profile backward pass."""
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("BACKWARD PASS PROFILING")
-    print("="*80)
+    print("=" * 80)
 
     timer = Timer()
 
@@ -364,9 +399,9 @@ def profile_backward(model, batch, device, unwrapped_model):
 
 def run_pytorch_profiler(model, train_loader, device, num_batches=3):
     """Run PyTorch profiler for detailed CUDA analysis."""
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("PYTORCH PROFILER (CUDA kernels)")
-    print("="*80)
+    print("=" * 80)
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
@@ -403,6 +438,7 @@ def run_pytorch_profiler(model, train_loader, device, num_batches=3):
 
             with record_function("compute_loss"):
                 from accelerate import Accelerator
+
                 accelerator = Accelerator()
                 unwrapped = accelerator.unwrap_model(model)
                 losses = unwrapped.compute_loss(outputs, labels)
@@ -440,16 +476,26 @@ def main(cfg: DictConfig) -> None:
     # Image augmentation config
     img_aug_cfg = cfg.get("image_augmentation", {})
     use_image_augmentation = img_aug_cfg.get("enabled", False)
-    augment_config = OmegaConf.to_container(img_aug_cfg, resolve=True) if use_image_augmentation else None
+    augment_config = (
+        OmegaConf.to_container(img_aug_cfg, resolve=True)
+        if use_image_augmentation
+        else None
+    )
 
     # Create dataloader
     dataset_type = cfg.get("dataset", "totalseg2d")
     feature_mode = cfg.get("feature_mode", "precomputed")
 
     if dataset_type == "totalseg2d":
-        from src.dataloaders.totalseg2d_dataloader import get_dataloader as get_totalseg2d_dataloader
+        from src.dataloaders.totalseg2d_dataloader import (
+            get_dataloader as get_totalseg2d_dataloader,
+        )
 
-        train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
+        train_labels = (
+            cfg.train_label_ids
+            if isinstance(cfg.train_label_ids, str)
+            else list(cfg.train_label_ids)
+        )
 
         max_ds_len_cfg = cfg.get("max_ds_len")
         if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
@@ -459,11 +505,17 @@ def main(cfg: DictConfig) -> None:
 
         carve_mix_cfg = cfg.get("carve_mix", {})
         use_carve_mix = carve_mix_cfg.get("enabled", False)
-        carve_mix_config = OmegaConf.to_container(carve_mix_cfg, resolve=True) if use_carve_mix else None
+        carve_mix_config = (
+            OmegaConf.to_container(carve_mix_cfg, resolve=True)
+            if use_carve_mix
+            else None
+        )
 
         adv_aug_cfg = cfg.get("advanced_augmentation", {})
         use_adv_aug = adv_aug_cfg.get("enabled", False)
-        adv_aug_config = OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
+        adv_aug_config = (
+            OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
+        )
 
         # Limit dataset for profiling
         max_ds_len_train = min(max_ds_len_train or 1000, 100)
@@ -491,9 +543,13 @@ def main(cfg: DictConfig) -> None:
             max_labels=cfg.get("max_labels", None),
         )
     else:
-        raise ValueError(f"Profiling only supports totalseg2d dataset, got {dataset_type}")
+        raise ValueError(
+            f"Profiling only supports totalseg2d dataset, got {dataset_type}"
+        )
 
-    print(f"Dataset size: {len(train_loader.dataset)}, batch size: {cfg.train_batch_size}")
+    print(
+        f"Dataset size: {len(train_loader.dataset)}, batch size: {cfg.train_batch_size}"
+    )
 
     # Create model
     from src.models.patch_icl_v2 import PatchICL
@@ -510,20 +566,27 @@ def main(cfg: DictConfig) -> None:
 
         if extractor_type == "icl_encoder":
             from src.models.icl_encoder import ICLEncoder
+
             feature_extractor = ICLEncoder(
                 layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
                 output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
                 freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
             )
 
-    model = PatchICL(patch_icl_cfg, context_size=cfg.get("context_size", 0), feature_extractor=feature_extractor)
+    model = PatchICL(
+        patch_icl_cfg,
+        context_size=cfg.get("context_size", 0),
+        feature_extractor=feature_extractor,
+    )
 
     # Loss functions
     loss_cfg = patch_icl_cfg.get("loss", {})
     patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
     aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
     patch_criterion = build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args"))
-    aggreg_criterion = build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args"))
+    aggreg_criterion = build_loss_fn(
+        aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args")
+    )
     model.set_loss_functions(patch_criterion, aggreg_criterion)
 
     model = model.to(device)
@@ -535,12 +598,12 @@ def main(cfg: DictConfig) -> None:
     # Get a batch for profiling
     batch = next(iter(train_loader))
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("BATCH INFO")
-    print("="*80)
+    print("=" * 80)
     print(f"Images shape: {batch['image'].shape}")
     print(f"Labels shape: {batch['label'].shape}")
-    if batch.get('context_in') is not None:
+    if batch.get("context_in") is not None:
         print(f"Context in shape: {batch['context_in'].shape}")
         print(f"Context out shape: {batch['context_out'].shape}")
 
@@ -557,34 +620,40 @@ def main(cfg: DictConfig) -> None:
             context_out = context_out.to(device)
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
-        outputs = model(images, labels=labels, context_in=context_in, context_out=context_out, mode="train")
+        outputs = model(
+            images,
+            labels=labels,
+            context_in=context_in,
+            context_out=context_out,
+            mode="train",
+        )
         loss = model.compute_loss(outputs, labels)["total_loss"]
         loss.backward()
         model.zero_grad()
     torch.cuda.synchronize()
 
     # 1. Profile data loading
-    print("\n\n" + "#"*80)
+    print("\n\n" + "#" * 80)
     print("# PROFILING DATA LOADING")
-    print("#"*80)
+    print("#" * 80)
     profile_dataloader(train_loader, device, num_batches=10)
 
     # 2. Detailed forward profiling
-    print("\n\n" + "#"*80)
+    print("\n\n" + "#" * 80)
     print("# PROFILING FORWARD PASS (DETAILED)")
-    print("#"*80)
+    print("#" * 80)
     profile_forward_detailed(model, batch, device, model)
 
     # 3. Profile backward
-    print("\n\n" + "#"*80)
+    print("\n\n" + "#" * 80)
     print("# PROFILING BACKWARD PASS")
-    print("#"*80)
+    print("#" * 80)
     profile_backward(model, batch, device, model)
 
     # 4. Full training iteration timing
-    print("\n\n" + "#"*80)
+    print("\n\n" + "#" * 80)
     print("# FULL TRAINING ITERATION TIMING")
-    print("#"*80)
+    print("#" * 80)
     timer = Timer()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
@@ -610,9 +679,11 @@ def main(cfg: DictConfig) -> None:
 
             with timer.track("forward"):
                 outputs = model(
-                    images, labels=labels,
-                    context_in=context_in, context_out=context_out,
-                    mode="train"
+                    images,
+                    labels=labels,
+                    context_in=context_in,
+                    context_out=context_out,
+                    mode="train",
                 )
 
             with timer.track("loss"):
@@ -628,16 +699,17 @@ def main(cfg: DictConfig) -> None:
     timer.report()
 
     # 5. PyTorch profiler for CUDA kernel analysis
-    print("\n\n" + "#"*80)
+    print("\n\n" + "#" * 80)
     print("# PYTORCH CUDA PROFILER")
-    print("#"*80)
+    print("#" * 80)
     model.zero_grad()
     run_pytorch_profiler(model, train_loader, device, num_batches=3)
 
-    print("\n\n" + "="*80)
+    print("\n\n" + "=" * 80)
     print("PROFILING COMPLETE")
-    print("="*80)
-    print("""
+    print("=" * 80)
+    print(
+        """
 ANALYSIS TIPS:
 1. If data_to_device time is high → CPU-GPU transfer bottleneck, consider pinned memory
 2. If dataloader time is high → Data augmentation or disk I/O bottleneck
@@ -645,8 +717,13 @@ ANALYSIS TIPS:
 4. If attention time is high → Reduce num_patches or use more efficient attention
 5. If backward time >> forward time → Memory pressure, consider gradient checkpointing
 6. Check chrome trace for detailed kernel-level analysis
-""")
+"""
+    )
 
 
 if __name__ == "__main__":
-    main()
+    from contextlib import redirect_stdout
+
+    output_path = "profiler_output.txt"
+    with open(output_path, "w") as f, redirect_stdout(f):
+        main()

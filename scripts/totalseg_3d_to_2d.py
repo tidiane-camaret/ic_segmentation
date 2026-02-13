@@ -86,9 +86,9 @@ def process_label_full(args):
 def main(cfg: DictConfig) -> None:
     import pickle
 
-    totalseg_dir = Path(cfg.paths.totalsegmri)
+    totalseg_dir = Path(cfg.paths.totalseg)
     totalseg_2d_dir = Path(cfg.paths.totalsegmri2d)
-    stats_path = Path(cfg.paths.totalsegmri_stats)
+    stats_path = Path(cfg.paths.totalseg_stats)
 
     print(f"Input dir: {totalseg_dir}")
     print(f"Output dir: {totalseg_2d_dir}")
