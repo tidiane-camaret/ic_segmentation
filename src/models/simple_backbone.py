@@ -419,6 +419,7 @@ class CrossPatchAttention(nn.Module):
         target_self_attention: bool = False,
         dropout: float = 0.0,
         append_zero_attn: bool = False,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -427,6 +428,7 @@ class CrossPatchAttention(nn.Module):
         self.num_registers = num_registers
         self.image_size = image_size
         self.target_self_attention = target_self_attention
+        self.gradient_checkpointing = gradient_checkpointing
 
         # Register tokens for global context
         if num_registers > 0:
@@ -521,15 +523,30 @@ class CrossPatchAttention(nn.Module):
         # Run through attention layers (per-layer type embed + RoPE)
         all_attn_weights = []
         for layer in self.layers:
-            x, attn_w = layer(
-                x, float_mask,
-                is_context=is_context_with_reg,
-                coords=coords,
-                rope_cache=self.rope_cache,
-                image_size=self.image_size,
-                num_registers=num_reg,
-                return_attn_weights=return_attn_weights,
-            )
+            if self.gradient_checkpointing and self.training and not return_attn_weights:
+                # Use gradient checkpointing to save memory (recompute activations in backward)
+                from torch.utils.checkpoint import checkpoint
+                x, attn_w = checkpoint(
+                    layer,
+                    x, float_mask,
+                    is_context_with_reg,
+                    coords,
+                    self.rope_cache,
+                    self.image_size,
+                    num_reg,
+                    False,  # return_attn_weights must be False for checkpointing
+                    use_reentrant=False,
+                )
+            else:
+                x, attn_w = layer(
+                    x, float_mask,
+                    is_context=is_context_with_reg,
+                    coords=coords,
+                    rope_cache=self.rope_cache,
+                    image_size=self.image_size,
+                    num_registers=num_reg,
+                    return_attn_weights=return_attn_weights,
+                )
             if attn_w is not None:
                 all_attn_weights.append(attn_w)
 
@@ -719,6 +736,7 @@ class SimpleBackbone(nn.Module):
         decoder_use_skip_connections: bool = True,
         append_zero_attn: bool = False,
         max_levels: int = 4,
+        gradient_checkpointing: bool = False,
     ):
         """
         Args:
@@ -760,6 +778,7 @@ class SimpleBackbone(nn.Module):
             image_size=image_size,
             max_seq_len=max_seq_len,
             target_self_attention=target_self_attention,
+            gradient_checkpointing=gradient_checkpointing,
             dropout=dropout,
             append_zero_attn=append_zero_attn,
         )

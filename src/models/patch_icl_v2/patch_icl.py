@@ -9,9 +9,18 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from src.models.patch_icl_v2.aggregate import PatchAggregator, GaussianAggregator, create_aggregator
-from src.models.patch_icl_v2.sampling import ContinuousSampler, SlidingWindowSampler, PatchAugmenter, create_sampler
+from src.models.patch_icl_v2.aggregate import (
+    GaussianAggregator,
+    PatchAggregator,
+    create_aggregator,
+)
+from src.models.patch_icl_v2.metrics import compute_dice, GT_AREA_THRESHOLD
+from src.models.patch_icl_v2.sampling import (
+    ContinuousSampler,
+    PatchAugmenter,
+    SlidingWindowSampler,
+    create_sampler,
+)
 from src.models.simple_backbone import SimpleBackbone
 
 
@@ -25,15 +34,14 @@ def extract_patch_features(
 ) -> torch.Tensor:
     """Extract patch features from pre-computed full-image feature maps.
 
-    Extracts at full feature resolution, then downsizes to target_patch_grid_size
-    if it differs from the native patch size in feature space.
+    Uses grid_sample for efficient extraction with optimized backward pass.
 
     Args:
-        features: [B, N, D] - Pre-computed features (N = feature_grid_size^2)
+        features: [B, N, D] - Pre-computed features (N = actual_grid_size^2)
         coords: [B, K, 2] - Patch coordinates (h, w) at level resolution
         patch_size: Size of patches at level resolution
         level_resolution: Resolution of the current level
-        feature_grid_size: Size of feature grid (e.g., 128 for ICLEncoder layer 0)
+        feature_grid_size: Size of feature grid (may differ from actual, will be inferred)
         target_patch_grid_size: Desired spatial size per patch for the backbone encoder.
             If None or equal to native size, no resizing is done.
 
@@ -45,43 +53,56 @@ def extract_patch_features(
     N = features.shape[1]
     D = features.shape[2]
 
-    scale = feature_grid_size / level_resolution
+    # Infer actual grid size from feature count
+    actual_grid_size = int(N ** 0.5)
+    assert actual_grid_size * actual_grid_size == N, f"Features must be square grid, got N={N}"
+
+    scale = actual_grid_size / level_resolution
     patch_size_in_features = max(1, int(patch_size * scale))
-    tokens_per_patch = patch_size_in_features * patch_size_in_features
 
-    fh = (coords[:, :, 0].float() * scale).long()
-    fw = (coords[:, :, 1].float() * scale).long()
-    max_start = feature_grid_size - patch_size_in_features
-    fh = fh.clamp(0, max_start)
-    fw = fw.clamp(0, max_start)
+    # Use target grid size for extraction if specified
+    extract_size = target_patch_grid_size if target_patch_grid_size else patch_size_in_features
 
-    offset_h = torch.arange(patch_size_in_features, device=device)
-    offset_w = torch.arange(patch_size_in_features, device=device)
-    offset_grid_h, offset_grid_w = torch.meshgrid(offset_h, offset_w, indexing='ij')
-    offset_grid_h = offset_grid_h.reshape(-1)
-    offset_grid_w = offset_grid_w.reshape(-1)
+    # Reshape features to spatial format: [B, D, H, W]
+    features_spatial = features.view(B, actual_grid_size, actual_grid_size, D)
+    features_spatial = features_spatial.permute(0, 3, 1, 2)  # [B, D, H, W]
 
-    fh_expanded = fh.unsqueeze(-1) + offset_grid_h.view(1, 1, -1)
-    fw_expanded = fw.unsqueeze(-1) + offset_grid_w.view(1, 1, -1)
-    flat_indices = fh_expanded * feature_grid_size + fw_expanded
-    flat_indices = flat_indices.clamp(0, N - 1)
+    # Compute patch centers in normalized coordinates [-1, 1]
+    # coords are top-left corners at level_resolution, convert to feature space centers
+    fh = coords[:, :, 0].float() * scale + patch_size_in_features / 2
+    fw = coords[:, :, 1].float() * scale + patch_size_in_features / 2
 
-    batch_indices = torch.arange(B, device=device).view(B, 1, 1).expand(B, K, tokens_per_patch)
-    patch_features = features[batch_indices, flat_indices]
+    # Normalize to [-1, 1] for grid_sample
+    center_h = (fh / actual_grid_size) * 2 - 1
+    center_w = (fw / actual_grid_size) * 2 - 1
 
-    # Downsample patches to target grid size if needed
-    if (target_patch_grid_size is not None
-            and patch_size_in_features != target_patch_grid_size):
-        patch_features = patch_features.view(
-            B * K, patch_size_in_features, patch_size_in_features, D
-        ).permute(0, 3, 1, 2)  # [B*K, D, h, w]
-        patch_features = F.adaptive_avg_pool2d(
-            patch_features, (target_patch_grid_size, target_patch_grid_size)
-        )
-        patch_features = patch_features.permute(0, 2, 3, 1).contiguous()
-        patch_features = patch_features.view(
-            B, K, target_patch_grid_size * target_patch_grid_size, D
-        )
+    # Create sampling grid for each patch: [B, K, extract_size, extract_size, 2]
+    # Grid offsets relative to center, in normalized coords
+    half_patch = (patch_size_in_features / actual_grid_size)  # in normalized space
+    offset = torch.linspace(-half_patch, half_patch, extract_size, device=device)
+    grid_y, grid_x = torch.meshgrid(offset, offset, indexing='ij')
+    grid_offsets = torch.stack([grid_x, grid_y], dim=-1)  # [extract_size, extract_size, 2]
+
+    # Add offsets to centers: [B, K, 1, 1, 2] + [1, 1, H, W, 2] -> [B, K, H, W, 2]
+    centers = torch.stack([center_w, center_h], dim=-1)  # [B, K, 2] (x, y order for grid_sample)
+    grid = centers.unsqueeze(2).unsqueeze(2) + grid_offsets.view(1, 1, extract_size, extract_size, 2)
+
+    # Reshape for batch grid_sample: [B*K, extract_size, extract_size, 2]
+    grid = grid.view(B * K, extract_size, extract_size, 2)
+
+    # Expand features for each patch: [B, D, H, W] -> [B*K, D, H, W]
+    features_expanded = features_spatial.unsqueeze(1).expand(-1, K, -1, -1, -1)
+    features_expanded = features_expanded.reshape(B * K, D, actual_grid_size, actual_grid_size)
+
+    # Extract patches using grid_sample (efficient backward)
+    patch_features = F.grid_sample(
+        features_expanded, grid,
+        mode='bilinear', padding_mode='border', align_corners=False
+    )  # [B*K, D, extract_size, extract_size]
+
+    # Reshape to [B, K, tokens, D]
+    patch_features = patch_features.view(B, K, D, extract_size * extract_size)
+    patch_features = patch_features.permute(0, 1, 3, 2)  # [B, K, tokens, D]
 
     return patch_features
 
@@ -129,7 +150,7 @@ class PatchICL(nn.Module):
         # Sampler config (type shared, per-level instances)
         sampler_cfg = config.get('sampler', {})
         self.sampler_type = sampler_cfg.get('type', 'continuous')
-        self.sliding_window_stride = sampler_cfg.get('sliding_window_stride', None)
+        self.default_stride = sampler_cfg.get('stride', None)
 
         # Augmenter (shared)
         aug_cfg = sampler_cfg.get('augmentation', {})
@@ -147,13 +168,14 @@ class PatchICL(nn.Module):
         self.samplers = nn.ModuleList()
         for level_cfg in levels_cfg:
             level_sampler_type = level_cfg.get('sampling_method', self.sampler_type)
+            level_stride = level_cfg.get('stride', self.default_stride)
             self.samplers.append(create_sampler(
                 sampler_type=level_sampler_type,
                 patch_size=level_cfg['patch_size'],
                 num_patches=level_cfg['num_patches'],
                 num_patches_val=level_cfg.get('num_patches_val', level_cfg['num_patches']),
                 temperature=level_cfg.get('sampling_temperature', 0.3),
-                stride=self.sliding_window_stride,
+                stride=level_stride,
                 augmenter=self.augmenter,
             ))
         self.sampler = self.samplers[0]  # backward compat
@@ -208,6 +230,7 @@ class PatchICL(nn.Module):
             decoder_use_skip_connections=backbone_cfg.get('decoder_use_skip_connections', True),
             append_zero_attn=backbone_cfg.get('append_zero_attn', False),
             max_levels=self.num_levels,
+            gradient_checkpointing=backbone_cfg.get('gradient_checkpointing', False),
         )
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
@@ -241,6 +264,46 @@ class PatchICL(nn.Module):
         if mask.shape[1] == 1:
             return mask
         return mask.max(dim=1, keepdim=True)[0]
+
+    def _create_coverage_mask(
+        self,
+        coords: torch.Tensor,
+        patch_size: int,
+        output_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """Create coverage mask from patch coordinates (vectorized).
+
+        Args:
+            coords: [B, K, 2] - Patch coordinates (h, w) at level resolution
+            patch_size: Size of patches
+            output_size: (H, W) output resolution
+
+        Returns:
+            coverage_mask: [B, 1, H, W] - 1 where patches cover, 0 elsewhere
+        """
+        B, K, _ = coords.shape
+        H, W = output_size
+        device = coords.device
+
+        # Create grid of coordinates
+        h_grid = torch.arange(H, device=device).view(1, 1, H, 1)
+        w_grid = torch.arange(W, device=device).view(1, 1, 1, W)
+
+        # Patch bounds [B, K, 1, 1]
+        h_start = coords[:, :, 0:1].unsqueeze(-1).float()
+        w_start = coords[:, :, 1:2].unsqueeze(-1).float()
+        h_end = h_start + patch_size
+        w_end = w_start + patch_size
+
+        # Check if each pixel is within any patch [B, K, H, W]
+        in_h = (h_grid >= h_start) & (h_grid < h_end)
+        in_w = (w_grid >= w_start) & (w_grid < w_end)
+        in_patch = in_h & in_w
+
+        # Any patch covers this pixel
+        coverage = in_patch.any(dim=1, keepdim=True).float()
+
+        return coverage
 
     def _extract_features(
         self,
@@ -492,32 +555,34 @@ class PatchICL(nn.Module):
         if target_features is None and self.feature_extractor is not None:
             target_features, context_features = self._extract_features(image, context_in, context_out)
 
-        # Process each level
-        prev_preds = []  # collect predictions from all previous levels
+        # Process each level with progressive refinement
+        combined_pred = None  # Progressively refined prediction
         level_outputs = []
 
         for i in range(self.num_levels):
-            resolution = self.levels[i]['resolution']
+            level_cfg = self.levels[i]
+            resolution = level_cfg['resolution']
+            patch_size = level_cfg['patch_size']
 
             # Determine sampling weights for this level
             use_oracle = self.oracle_train[i] if training else self.oracle_valid[i]
             if use_oracle and labels is not None:
                 labels_ds = self._downsample_mask(labels, resolution)
                 weights = self._mask_to_weights(labels_ds)
-            elif len(prev_preds) > 0:
-                # Average probs from all previous levels (sampler normalizes)
-                probs_list = []
-                for pp in prev_preds:
-                    pp_prob = torch.sigmoid(pp)
-                    if self.detach_between_levels:
-                        pp_prob = pp_prob.detach()
-                    probs_list.append(F.interpolate(pp_prob, size=(resolution, resolution), mode='bilinear', align_corners=False))
-                weights = torch.stack(probs_list).mean(dim=0)
+                refined_probs = None
+            elif combined_pred is not None:
+                # Use refined prediction from previous levels as sampling weights
+                combined_prob = torch.sigmoid(combined_pred)
+                if self.detach_between_levels:
+                    combined_prob = combined_prob.detach()
+                weights = F.interpolate(
+                    combined_prob, size=(resolution, resolution),
+                    mode='bilinear', align_corners=False
+                )
+                refined_probs = weights.clone()
             else:
                 weights = torch.ones(B, 1, resolution, resolution, device=device)
-
-            # Store averaged probs used for sampling (None for level 0 / oracle)
-            avg_probs = weights if len(prev_preds) > 0 and not use_oracle else None
+                refined_probs = None
 
             level_out, pred = self._forward_level(
                 level_idx=i,
@@ -531,12 +596,28 @@ class PatchICL(nn.Module):
                 H=H, W=W,
                 return_attn_weights=return_attn_weights,
             )
-            level_out['avg_prev_probs'] = avg_probs
-            level_outputs.append(level_out)
-            prev_preds.append(pred)
 
-        # Final prediction from last level
-        final_pred = F.interpolate(prev_preds[-1], size=(H, W), mode='bilinear', align_corners=False)
+            # Progressive refinement: blend current prediction with previous combined
+            coords = level_out['coords']
+            if combined_pred is not None:
+                # Create coverage mask for current level's patches
+                coverage = self._create_coverage_mask(coords, patch_size, (resolution, resolution))
+                # Upsample previous combined prediction to current resolution
+                combined_upsampled = F.interpolate(
+                    combined_pred, size=(resolution, resolution),
+                    mode='bilinear', align_corners=False
+                )
+                # Blend: use current pred where covered, keep previous elsewhere
+                combined_pred = coverage * pred + (1 - coverage) * combined_upsampled
+            else:
+                combined_pred = pred
+
+            level_out['refined_probs'] = refined_probs  # Probs used for sampling (after refinement)
+            level_out['coverage_mask'] = self._create_coverage_mask(coords, patch_size, (resolution, resolution))
+            level_outputs.append(level_out)
+
+        # Final prediction from refined combined prediction
+        final_pred = F.interpolate(combined_pred, size=(H, W), mode='bilinear', align_corners=False)
         coarse_pred = F.interpolate(level_outputs[0]['pred'], size=(H, W), mode='bilinear', align_corners=False)
 
         # Backward compat aliases from last level
@@ -658,24 +739,19 @@ class PatchICL(nn.Module):
             else:
                 losses[f'level_{i}_context_aggreg_loss'] = torch.tensor(0.0, device=device)
 
-        # Dice / soft-dice of averaged previous-level probs vs GT (logging only)
+        # Dice / soft-dice of refined probs vs GT (logging only, measures sampling guidance quality)
         for i, level_out in enumerate(outputs['level_outputs']):
-            avg_probs = level_out.get('avg_prev_probs')
-            if avg_probs is not None:
-                resolution = avg_probs.shape[-1]
+            refined_probs = level_out.get('refined_probs')
+            if refined_probs is not None:
+                resolution = refined_probs.shape[-1]
                 gt_ds = self._downsample_mask(labels, resolution)
                 gt_ds = self._mask_to_weights(gt_ds)
-                p_flat = avg_probs.flatten(1)
-                g_flat = gt_ds.flatten(1)
-                # Soft dice
-                intersection = (p_flat * g_flat).sum(dim=1)
-                soft_dice = (2.0 * intersection / (p_flat.sum(dim=1) + g_flat.sum(dim=1) + 1e-6)).mean()
-                losses[f'level_{i}_avg_probs_soft_dice'] = soft_dice
-                # Hard dice (threshold at 0.5)
-                p_bin = (p_flat > 0.5).float()
-                intersection_hard = (p_bin * g_flat).sum(dim=1)
-                hard_dice = (2.0 * intersection_hard / (p_bin.sum(dim=1) + g_flat.sum(dim=1) + 1e-6)).mean()
-                losses[f'level_{i}_avg_probs_dice'] = hard_dice
+                # Use centralized dice computation (refined_probs already probabilities)
+                dice_result = compute_dice(
+                    refined_probs, gt_ds, gt_threshold=GT_AREA_THRESHOLD, apply_sigmoid=False
+                )
+                losses[f'level_{i}_refined_probs_dice'] = dice_result['dice'].mean()
+                losses[f'level_{i}_refined_probs_soft_dice'] = dice_result['soft_dice'].mean()
 
         losses['total_loss'] = total_loss
 

@@ -11,6 +11,13 @@ from src.models.patch_icl_v2.aggregate import (
     PatchAggregator,
     create_aggregator,
 )
+from src.models.patch_icl_v2.metrics import (
+    PRED_THRESHOLD,
+    GT_AREA_THRESHOLD,
+    compute_dice,
+    compute_all_metrics,
+    compute_per_sample_dice,
+)
 
 __all__ = [
     "PatchICL",
@@ -22,4 +29,9 @@ __all__ = [
     "GaussianAggregator",
     "PatchAggregator",
     "create_aggregator",
+    "PRED_THRESHOLD",
+    "GT_AREA_THRESHOLD",
+    "compute_dice",
+    "compute_all_metrics",
+    "compute_per_sample_dice",
 ]

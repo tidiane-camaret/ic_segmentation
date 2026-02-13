@@ -10,10 +10,12 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-
-# Thresholds for hard-dice metric binarization
-PRED_THRESHOLD = 0.5    # sigmoid probability → binary prediction
-GT_AREA_THRESHOLD = 0.25  # soft avg-pooled GT → binary (≥25% coverage = foreground)
+from src.models.patch_icl_v2.metrics import (
+    PRED_THRESHOLD,
+    GT_AREA_THRESHOLD,
+    compute_all_metrics,
+    compute_per_sample_dice,
+)
 
 
 def seed_everything(seed: int) -> None:
@@ -119,7 +121,7 @@ def _save_sample_images(
             l_patch_size = level_info.get("patch_size", 16)
             l_level_res = level_info.get("level_res", 32)
             l_pred_probs = level_info.get("pred_probs")
-            l_avg_prev_probs = level_info.get("avg_prev_probs")
+            l_refined_probs = level_info.get("refined_probs")
 
             # --- Top row: target + context images with patch boxes ---
             axes[top_row][0].imshow(img, cmap="gray")
@@ -203,14 +205,14 @@ def _save_sample_images(
                 axes[bot_row][2].set_title("Pred (N/A)")
             axes[bot_row][2].axis("off")
 
-            # Avg previous-level probs (sampling weights for this level)
-            if l_avg_prev_probs is not None and n_cols > 3:
-                ap = l_avg_prev_probs.squeeze().numpy()
-                im = axes[bot_row][3].imshow(ap, cmap="hot", vmin=0, vmax=1)
-                axes[bot_row][3].set_title(f"Prev probs ({ap.shape[0]}x{ap.shape[1]})")
+            # Refined probs (sampling weights for this level from progressive refinement)
+            if l_refined_probs is not None and n_cols > 3:
+                rp = l_refined_probs.squeeze().numpy()
+                im = axes[bot_row][3].imshow(rp, cmap="hot", vmin=0, vmax=1)
+                axes[bot_row][3].set_title(f"Refined probs ({rp.shape[0]}x{rp.shape[1]})")
                 plt.colorbar(im, ax=axes[bot_row][3], fraction=0.046, pad=0.04)
             elif n_cols > 3:
-                axes[bot_row][3].set_title("Prev probs (N/A)")
+                axes[bot_row][3].set_title("Refined probs (N/A)")
             if n_cols > 3:
                 axes[bot_row][3].axis("off")
 
@@ -234,6 +236,62 @@ def _save_sample_images(
     # Log all images at once to wandb
     if wandb_images and wandb_available and wandb.run is not None:
         wandb.log({f"{prefix}/saved_samples": wandb_images, "epoch": epoch})
+
+
+def _collect_sample_for_viz(
+    i: int,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    outputs: dict,
+    context_in: torch.Tensor | None,
+    context_out: torch.Tensor | None,
+    dice_val: float,
+) -> dict:
+    """Collect sample data for visualization."""
+    level_outputs = outputs.get("level_outputs", [])
+
+    # Get pred_probs and pred_binary from last level or final_logit
+    if level_outputs:
+        pred_probs = torch.sigmoid(level_outputs[-1]["pred"][i]).detach().cpu()
+    else:
+        pred_probs = torch.sigmoid(outputs["final_logit"][i]).detach().cpu()
+    pred_binary = (pred_probs > PRED_THRESHOLD).float()
+
+    # Collect per-level info
+    levels = []
+    for level_out in level_outputs:
+        l_coords = level_out.get("coords")
+        if l_coords is not None:
+            l_coords = l_coords[i].detach().cpu()
+        l_ctx_coords = level_out.get("context_coords")
+        if l_ctx_coords is not None:
+            l_ctx_coords = l_ctx_coords[i].detach().cpu()
+        l_pred = level_out.get("pred")
+        l_pred_probs = None
+        if l_pred is not None:
+            l_pred_probs = torch.sigmoid(l_pred[i]).detach().cpu()
+        l_refined = level_out.get("refined_probs")
+        if l_refined is not None:
+            l_refined = l_refined[i].detach().cpu()
+        levels.append({
+            "target_coords": l_coords,
+            "context_coords": l_ctx_coords,
+            "patch_size": level_out.get("patch_size", 16),
+            "level_res": level_out.get("level_res", 32),
+            "pred_probs": l_pred_probs,
+            "refined_probs": l_refined,
+        })
+
+    return {
+        "image": images[i].detach().cpu(),
+        "label": labels[i].detach().cpu(),
+        "pred": pred_binary,
+        "pred_probs": pred_probs,
+        "dice": dice_val,
+        "context_in": context_in[i].detach().cpu() if context_in is not None else None,
+        "context_out": context_out[i].detach().cpu() if context_out is not None else None,
+        "levels": levels,
+    }
 
 
 def train_epoch(
@@ -323,175 +381,48 @@ def train_epoch(
         losses = unwrapped_model.compute_loss(outputs, labels)
         loss = losses["total_loss"]
 
-        # Compute Dice scores
+        # Compute Dice scores using centralized metrics
         with torch.no_grad():
-            # Local dice (patch level)
-            patch_logits = outputs["patch_logits"]
-            patch_labels = outputs["patch_labels"]
-            patch_probs = torch.sigmoid(patch_logits)
-            patch_pred_binary = (patch_probs > PRED_THRESHOLD).float()
-            patch_labels_float = patch_labels.float()
-            patch_labels_binary = (patch_labels > GT_AREA_THRESHOLD).float()
-            # Hard dice
-            patch_intersection = (patch_pred_binary * patch_labels_binary).sum(
-                dim=(1, 2, 3, 4)
-            )
-            patch_union = patch_pred_binary.sum(
-                dim=(1, 2, 3, 4)
-            ) + patch_labels_binary.sum(dim=(1, 2, 3, 4))
-            local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
-            total_local_dice += local_dice.mean().item()
-            # Soft dice
-            soft_intersection = (patch_probs * patch_labels_float).sum(dim=(1, 2, 3, 4))
-            soft_denom = patch_probs.sum(dim=(1, 2, 3, 4)) + patch_labels_float.sum(
-                dim=(1, 2, 3, 4)
-            )
-            local_softdice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
-            total_local_softdice += local_softdice.mean().item()
+            metrics = compute_all_metrics(outputs, labels)
 
-            # Per-level dice (at each level's resolution)
-            level_outputs = outputs.get("level_outputs")
-            if level_outputs:
-                for li, level_out in enumerate(level_outputs):
-                    level_pred = level_out["pred"]
-                    level_res = level_pred.shape[-1]
-                    scale_factor = labels.shape[-1] // level_res
-                    labels_ds = F.avg_pool2d(
-                        labels.float(), kernel_size=scale_factor, stride=scale_factor
-                    )
-                    lp_probs = torch.sigmoid(level_pred)
-                    lp_binary = (lp_probs > PRED_THRESHOLD).float()
-                    lp_labels_float = labels_ds
-                    lp_labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
-                    sp_dims = tuple(range(2, lp_binary.dim()))
-                    # Hard dice
-                    l_inter = (lp_binary * lp_labels_binary).sum(dim=sp_dims)
-                    l_union = lp_binary.sum(dim=sp_dims) + lp_labels_binary.sum(dim=sp_dims)
-                    l_dice = (2 * l_inter + 1e-6) / (l_union + 1e-6)
-                    dice_accum[f"level_{li}_dice"] += l_dice.mean().item()
-                    dice_count[f"level_{li}_dice"] += 1
-                    # Soft dice
-                    l_s_inter = (lp_probs * lp_labels_float).sum(dim=sp_dims)
-                    l_s_denom = lp_probs.sum(dim=sp_dims) + lp_labels_float.sum(dim=sp_dims)
-                    l_sdice = (2 * l_s_inter + 1e-6) / (l_s_denom + 1e-6)
-                    dice_accum[f"level_{li}_softdice"] += l_sdice.mean().item()
-                    dice_count[f"level_{li}_softdice"] += 1
+            # Accumulate metrics
+            total_local_dice += metrics.get('local_dice', torch.tensor(0.0)).item()
+            total_local_softdice += metrics.get('local_soft_dice', torch.tensor(0.0)).item()
+            total_final_dice += metrics.get('final_dice', torch.tensor(0.0)).item()
+            total_final_softdice += metrics.get('final_soft_dice', torch.tensor(0.0)).item()
 
-                # Use last level for final_dice (backward compat)
-                pred_probs = torch.sigmoid(level_outputs[-1]["pred"])
-                pred_binary = (pred_probs > PRED_THRESHOLD).float()
-                last_res = level_outputs[-1]["pred"].shape[-1]
-                sf = labels.shape[-1] // last_res
-                labels_ds_last = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
-                labels_float = labels_ds_last
-                labels_binary = (labels_ds_last > GT_AREA_THRESHOLD).float()
-            else:
-                pred_probs = torch.sigmoid(outputs["final_logit"])
-                pred_binary = (pred_probs > PRED_THRESHOLD).float()
-                labels_float = labels.float()
-                labels_binary = (labels > GT_AREA_THRESHOLD).float()
-            spatial_dims = tuple(range(2, pred_binary.dim()))
-            # Hard dice
-            intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
-            union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(
-                dim=spatial_dims
-            )
-            final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
-            total_final_dice += final_dice.mean().item()
-            # Soft dice
-            soft_inter = (pred_probs * labels_float).sum(dim=spatial_dims)
-            soft_denom = pred_probs.sum(dim=spatial_dims) + labels_float.sum(
-                dim=spatial_dims
-            )
-            final_softdice = (2 * soft_inter + 1e-6) / (soft_denom + 1e-6)
-            total_final_softdice += final_softdice.mean().item()
+            if 'context_dice' in metrics:
+                total_context_dice += metrics['context_dice'].item()
+                total_context_softdice += metrics['context_soft_dice'].item()
+                context_dice_count += 1
 
-            # Per-label tracking
+            # Per-level dice accumulation
+            level_outputs = outputs.get("level_outputs", [])
+            for li in range(len(level_outputs)):
+                for suffix in ['dice', 'soft_dice']:
+                    key = f"level_{li}_{suffix}"
+                    if key in metrics:
+                        dice_accum[key] += metrics[key].item()
+                        dice_count[key] += 1
+
+            # Per-sample dice for per-label tracking
+            per_sample_dice = compute_per_sample_dice(outputs, labels)
             batch_label_ids = batch.get("label_ids") or batch.get(
                 "label_id", [None] * images.shape[0]
             )
             for i in range(images.shape[0]):
                 label_id = batch_label_ids[i] if batch_label_ids else "unknown"
-                dice_val = (
-                    final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
-                )
+                dice_val = per_sample_dice[i].item()
                 if label_id not in label_dice_scores:
                     label_dice_scores[label_id] = []
                 label_dice_scores[label_id].append(dice_val)
+
                 # Store one sample per label for image logging (wandb or disk)
                 should_save = (use_wandb or save_dir is not None) and is_main
                 if should_save and label_id not in label_samples:
-                    # Collect per-level info for visualization
-                    levels = []
-                    if level_outputs:
-                        for level_out in level_outputs:
-                            l_coords = level_out.get("coords")
-                            if l_coords is not None:
-                                l_coords = l_coords[i].detach().cpu()
-                            l_ctx_coords = level_out.get("context_coords")
-                            if l_ctx_coords is not None:
-                                l_ctx_coords = l_ctx_coords[i].detach().cpu()
-                            l_pred = level_out.get("pred")
-                            l_pred_probs = None
-                            if l_pred is not None:
-                                l_pred_probs = torch.sigmoid(l_pred[i]).detach().cpu()
-                            l_avg_prev = level_out.get("avg_prev_probs")
-                            if l_avg_prev is not None:
-                                l_avg_prev = l_avg_prev[i].detach().cpu()
-                            levels.append({
-                                "target_coords": l_coords,
-                                "context_coords": l_ctx_coords,
-                                "patch_size": level_out.get("patch_size", 16),
-                                "level_res": level_out.get("level_res", 32),
-                                "pred_probs": l_pred_probs,
-                                "avg_prev_probs": l_avg_prev,
-                            })
-
-                    label_samples[label_id] = {
-                        "image": images[i].detach().cpu(),
-                        "label": labels[i].detach().cpu(),
-                        "pred": pred_binary[i].detach().cpu(),
-                        "pred_probs": pred_probs[i].detach().cpu(),
-                        "dice": dice_val,
-                        "context_in": (
-                            context_in[i].detach().cpu()
-                            if context_in is not None
-                            else None
-                        ),
-                        "context_out": (
-                            context_out[i].detach().cpu()
-                            if context_out is not None
-                            else None
-                        ),
-                        "levels": levels,
-                    }
-
-            # Context dice
-            if level_outputs:
-                context_pred = level_outputs[-1].get("context_pred")
-                context_labels = level_outputs[-1].get("context_labels")
-                if context_pred is not None and context_labels is not None:
-                    ctx_probs = torch.sigmoid(context_pred)
-                    ctx_pred_binary = (ctx_probs > PRED_THRESHOLD).float()
-                    ctx_labels_float = context_labels.float()
-                    ctx_labels_binary = (context_labels > GT_AREA_THRESHOLD).float()
-                    # Hard dice
-                    ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(
-                        dim=(2, 3, 4)
+                    label_samples[label_id] = _collect_sample_for_viz(
+                        i, images, labels, outputs, context_in, context_out, dice_val
                     )
-                    ctx_union = ctx_pred_binary.sum(
-                        dim=(2, 3, 4)
-                    ) + ctx_labels_binary.sum(dim=(2, 3, 4))
-                    ctx_dice = (2 * ctx_intersection + 1e-6) / (ctx_union + 1e-6)
-                    total_context_dice += ctx_dice.mean().item()
-                    # Soft dice
-                    ctx_soft_inter = (ctx_probs * ctx_labels_float).sum(dim=(2, 3, 4))
-                    ctx_soft_denom = ctx_probs.sum(
-                        dim=(2, 3, 4)
-                    ) + ctx_labels_float.sum(dim=(2, 3, 4))
-                    ctx_softdice = (2 * ctx_soft_inter + 1e-6) / (ctx_soft_denom + 1e-6)
-                    total_context_softdice += ctx_softdice.mean().item()
-                    context_dice_count += 1
 
         # Backward
         scaled_loss = loss / grad_accumulate_steps
@@ -543,12 +474,12 @@ def train_epoch(
                 "train_batch/local_dice": total_local_dice / n_batches,
                 "train_batch/final_dice": total_final_dice / n_batches,
                 "train_batch/context_dice": ctx_dice_avg,
-                "train_batch/local_softdice": total_local_softdice / n_batches,
-                "train_batch/final_softdice": total_final_softdice / n_batches,
-                "train_batch/context_softdice": ctx_softdice_avg,
+                "train_batch/local_soft_dice": total_local_softdice / n_batches,
+                "train_batch/final_soft_dice": total_final_softdice / n_batches,
+                "train_batch/context_soft_dice": ctx_softdice_avg,
                 "global_step": global_step,
             }
-            # Log all compute_loss keys (includes avg_probs dices)
+            # Log all compute_loss keys (includes refined_probs dices)
             for key in loss_accum:
                 log_dict[f"train_batch/{key}"] = loss_accum[key] / loss_count[key]
             # Log per-level dice metrics
@@ -598,9 +529,9 @@ def train_epoch(
         "local_dice": total_local_dice / n,
         "final_dice": total_final_dice / n,
         "context_dice": ctx_dice_final,
-        "local_softdice": total_local_softdice / n,
-        "final_softdice": total_final_softdice / n,
-        "context_softdice": ctx_softdice_final,
+        "local_soft_dice": total_local_softdice / n,
+        "final_soft_dice": total_final_softdice / n,
+        "context_soft_dice": ctx_softdice_final,
         "per_label": label_avg_dice,
     })
     # Add per-level dice metrics
@@ -687,109 +618,30 @@ def validate(
         loss = unwrapped_model.aggreg_criterion(predictions, labels.float())
         total_loss += loss.item()
 
-        # Local dice
-        patch_logits = outputs["patch_logits"]
-        patch_labels = outputs["patch_labels"]
-        patch_probs = torch.sigmoid(patch_logits)
-        patch_pred_binary = (patch_probs > PRED_THRESHOLD).float()
-        patch_labels_float = patch_labels.float()
-        patch_labels_binary = (patch_labels > GT_AREA_THRESHOLD).float()
-        # Hard dice
-        patch_intersection = (patch_pred_binary * patch_labels_binary).sum(
-            dim=(1, 2, 3, 4)
-        )
-        patch_union = patch_pred_binary.sum(dim=(1, 2, 3, 4)) + patch_labels_binary.sum(
-            dim=(1, 2, 3, 4)
-        )
-        local_dice = (2 * patch_intersection + 1e-6) / (patch_union + 1e-6)
-        total_local_dice += local_dice.mean().item()
-        # Soft dice
-        soft_intersection = (patch_probs * patch_labels_float).sum(dim=(1, 2, 3, 4))
-        soft_denom = patch_probs.sum(dim=(1, 2, 3, 4)) + patch_labels_float.sum(
-            dim=(1, 2, 3, 4)
-        )
-        local_softdice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
-        total_local_softdice += local_softdice.mean().item()
+        # Compute all dice metrics using centralized function
+        metrics = compute_all_metrics(outputs, labels)
 
-        # Per-level dice
+        total_local_dice += metrics.get('local_dice', torch.tensor(0.0)).item()
+        total_local_softdice += metrics.get('local_soft_dice', torch.tensor(0.0)).item()
+        total_final_dice += metrics.get('final_dice', torch.tensor(0.0)).item()
+        total_final_softdice += metrics.get('final_soft_dice', torch.tensor(0.0)).item()
+
+        if 'context_dice' in metrics:
+            total_context_dice += metrics['context_dice'].item()
+            total_context_softdice += metrics['context_soft_dice'].item()
+            context_dice_count += 1
+
+        # Per-level dice accumulation
         level_outputs = outputs.get("level_outputs", [])
-        if level_outputs:
-            for li, level_out in enumerate(level_outputs):
-                level_pred = level_out["pred"]
-                level_res = level_pred.shape[-1]
-                scale_factor = labels.shape[-1] // level_res
-                labels_ds = F.avg_pool2d(
-                    labels.float(), kernel_size=scale_factor, stride=scale_factor
-                )
-                lp_probs = torch.sigmoid(level_pred)
-                lp_binary = (lp_probs > PRED_THRESHOLD).float()
-                lp_labels_float = labels_ds
-                lp_labels_binary = (labels_ds > GT_AREA_THRESHOLD).float()
-                sp_dims = tuple(range(2, lp_binary.dim()))
-                # Hard dice
-                l_inter = (lp_binary * lp_labels_binary).sum(dim=sp_dims)
-                l_union = lp_binary.sum(dim=sp_dims) + lp_labels_binary.sum(dim=sp_dims)
-                l_dice = (2 * l_inter + 1e-6) / (l_union + 1e-6)
-                dice_accum[f"level_{li}_dice"] += l_dice.mean().item()
-                dice_count[f"level_{li}_dice"] += 1
-                # Soft dice
-                l_s_inter = (lp_probs * lp_labels_float).sum(dim=sp_dims)
-                l_s_denom = lp_probs.sum(dim=sp_dims) + lp_labels_float.sum(dim=sp_dims)
-                l_sdice = (2 * l_s_inter + 1e-6) / (l_s_denom + 1e-6)
-                dice_accum[f"level_{li}_softdice"] += l_sdice.mean().item()
-                dice_count[f"level_{li}_softdice"] += 1
-
-                # Avg previous-level probs dice (sampling guidance quality)
-                avg_prev = level_out.get("avg_prev_probs")
-                if avg_prev is not None:
-                    ap_res = avg_prev.shape[-1]
-                    ap_sf = labels.shape[-1] // ap_res
-                    ap_gt = F.avg_pool2d(labels.float(), kernel_size=ap_sf, stride=ap_sf)
-                    ap_gt_binary = (ap_gt > GT_AREA_THRESHOLD).float()
-                    ap_flat = avg_prev.flatten(1)
-                    gt_flat = ap_gt_binary.flatten(1)
-                    # Soft dice
-                    ap_s_inter = (ap_flat * ap_gt.flatten(1)).sum(dim=1)
-                    ap_s_denom = ap_flat.sum(dim=1) + ap_gt.flatten(1).sum(dim=1)
-                    ap_sdice = (2 * ap_s_inter + 1e-6) / (ap_s_denom + 1e-6)
-                    dice_accum[f"level_{li}_avg_probs_soft_dice"] += ap_sdice.mean().item()
-                    dice_count[f"level_{li}_avg_probs_soft_dice"] += 1
-                    # Hard dice
-                    ap_bin = (ap_flat > 0.5).float()
-                    ap_h_inter = (ap_bin * gt_flat).sum(dim=1)
-                    ap_h_denom = ap_bin.sum(dim=1) + gt_flat.sum(dim=1)
-                    ap_hdice = (2 * ap_h_inter + 1e-6) / (ap_h_denom + 1e-6)
-                    dice_accum[f"level_{li}_avg_probs_dice"] += ap_hdice.mean().item()
-                    dice_count[f"level_{li}_avg_probs_dice"] += 1
-
-            # Use last level for final_dice (backward compat)
-            pred_probs = torch.sigmoid(level_outputs[-1]["pred"])
-            pred_binary = (pred_probs > PRED_THRESHOLD).float()
-            last_res = level_outputs[-1]["pred"].shape[-1]
-            sf = labels.shape[-1] // last_res
-            labels_ds_last = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
-            labels_float = labels_ds_last
-            labels_binary = (labels_ds_last > GT_AREA_THRESHOLD).float()
-        else:
-            pred_probs = torch.sigmoid(predictions)
-            pred_binary = (pred_probs > PRED_THRESHOLD).float()
-            labels_float = labels.float()
-            labels_binary = (labels > GT_AREA_THRESHOLD).float()
-        spatial_dims = tuple(range(2, pred_binary.dim()))
-        # Hard dice
-        intersection = (pred_binary * labels_binary).sum(dim=spatial_dims)
-        union = pred_binary.sum(dim=spatial_dims) + labels_binary.sum(dim=spatial_dims)
-        final_dice = (2 * intersection + 1e-6) / (union + 1e-6)
-        total_final_dice += final_dice.mean().item()
-        # Soft dice
-        soft_inter = (pred_probs * labels_float).sum(dim=spatial_dims)
-        soft_denom = pred_probs.sum(dim=spatial_dims) + labels_float.sum(
-            dim=spatial_dims
-        )
-        final_softdice = (2 * soft_inter + 1e-6) / (soft_denom + 1e-6)
-        total_final_softdice += final_softdice.mean().item()
+        for li in range(len(level_outputs)):
+            for suffix in ['dice', 'soft_dice', 'refined_probs_dice', 'refined_probs_soft_dice']:
+                key = f"level_{li}_{suffix}"
+                if key in metrics:
+                    dice_accum[key] += metrics[key].item()
+                    dice_count[key] += 1
 
         # Per-case tracking
+        per_sample_dice = compute_per_sample_dice(outputs, labels)
         batch_case_ids = batch.get("case_id", [None] * images.shape[0])
         batch_label_ids = batch.get("label_ids") or batch.get(
             "label_id", [None] * images.shape[0]
@@ -801,86 +653,19 @@ def validate(
             )
             label_id = batch_label_ids[i] if batch_label_ids else "unknown"
             axis = batch_axes[i] if batch_axes else None
-            dice_val = (
-                final_dice[i].item() if final_dice.dim() > 0 else final_dice.item()
-            )
+            dice_val = per_sample_dice[i].item()
             case_results.append(
                 {"case_id": case_id, "label_id": label_id, "axis": axis, "dice": dice_val}
             )
             if label_id not in label_dice_scores:
                 label_dice_scores[label_id] = []
             label_dice_scores[label_id].append(dice_val)
-            # Store one sample per label for wandb image logging
+
+            # Store one sample per label for visualization
             if is_main and label_id not in label_samples:
-                # Collect per-level info for visualization
-                levels = []
-                if level_outputs:
-                    for level_out in level_outputs:
-                        l_coords = level_out.get("coords")
-                        if l_coords is not None:
-                            l_coords = l_coords[i].detach().cpu()
-                        l_ctx_coords = level_out.get("context_coords")
-                        if l_ctx_coords is not None:
-                            l_ctx_coords = l_ctx_coords[i].detach().cpu()
-                        l_pred = level_out.get("pred")
-                        l_pred_probs = None
-                        if l_pred is not None:
-                            l_pred_probs = torch.sigmoid(l_pred[i]).detach().cpu()
-                        l_avg_prev = level_out.get("avg_prev_probs")
-                        if l_avg_prev is not None:
-                            l_avg_prev = l_avg_prev[i].detach().cpu()
-                        levels.append({
-                            "target_coords": l_coords,
-                            "context_coords": l_ctx_coords,
-                            "patch_size": level_out.get("patch_size", 16),
-                            "level_res": level_out.get("level_res", 32),
-                            "pred_probs": l_pred_probs,
-                            "avg_prev_probs": l_avg_prev,
-                        })
-
-                label_samples[label_id] = {
-                    "image": images[i].detach().cpu(),
-                    "label": labels[i].detach().cpu(),
-                    "pred": pred_binary[i].detach().cpu(),
-                    "pred_probs": pred_probs[i].detach().cpu(),
-                    "dice": dice_val,
-                    "context_in": (
-                        context_in[i].detach().cpu() if context_in is not None else None
-                    ),
-                    "context_out": (
-                        context_out[i].detach().cpu()
-                        if context_out is not None
-                        else None
-                    ),
-                    "levels": levels,
-                }
-
-        # Context dice
-        if level_outputs:
-            context_pred = level_outputs[-1].get("context_pred")
-            context_labels = level_outputs[-1].get("context_labels")
-            if context_pred is not None and context_labels is not None:
-                ctx_probs = torch.sigmoid(context_pred)
-                ctx_pred_binary = (ctx_probs > PRED_THRESHOLD).float()
-                ctx_labels_float = context_labels.float()
-                ctx_labels_binary = (context_labels > GT_AREA_THRESHOLD).float()
-                # Hard dice
-                ctx_intersection = (ctx_pred_binary * ctx_labels_binary).sum(
-                    dim=(2, 3, 4)
+                label_samples[label_id] = _collect_sample_for_viz(
+                    i, images, labels, outputs, context_in, context_out, dice_val
                 )
-                ctx_union = ctx_pred_binary.sum(dim=(2, 3, 4)) + ctx_labels_binary.sum(
-                    dim=(2, 3, 4)
-                )
-                ctx_dice = (2 * ctx_intersection + 1e-6) / (ctx_union + 1e-6)
-                total_context_dice += ctx_dice.mean().item()
-                # Soft dice
-                ctx_soft_inter = (ctx_probs * ctx_labels_float).sum(dim=(2, 3, 4))
-                ctx_soft_denom = ctx_probs.sum(dim=(2, 3, 4)) + ctx_labels_float.sum(
-                    dim=(2, 3, 4)
-                )
-                ctx_softdice = (2 * ctx_soft_inter + 1e-6) / (ctx_soft_denom + 1e-6)
-                total_context_softdice += ctx_softdice.mean().item()
-                context_dice_count += 1
 
         # Update progress bar
         n_batches = batch_idx + 1
@@ -918,9 +703,9 @@ def validate(
     detailed_results = {
         "per_case": case_results,
         "per_label": label_avg_dice,
-        "local_softdice": total_local_softdice / n,
-        "final_softdice": total_final_softdice / n,
-        "context_softdice": ctx_softdice_final,
+        "local_soft_dice": total_local_softdice / n,
+        "final_soft_dice": total_final_softdice / n,
+        "context_soft_dice": ctx_softdice_final,
     }
     # Add per-level dice metrics
     for key in dice_accum:

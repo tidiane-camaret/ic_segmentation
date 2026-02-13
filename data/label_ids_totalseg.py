@@ -3,7 +3,6 @@ TotalSegmentator label IDs with train/val split.
 
 Labels are sorted by total volume (largest first).
 The split is created with a fixed random seed (42) for reproducibility.
-Train: 80% of labels, Val: 20% of labels
 """
 
 import random
@@ -132,11 +131,11 @@ label_ids = _all_label_ids
 
 
 def _split_labels(labels, seed=42):
-    """Split labels into train/val (80/20) with fixed seed."""
+    """Split labels into train/val with fixed seed."""
     rng = random.Random(seed)
     shuffled = labels.copy()
     rng.shuffle(shuffled)
-    split_idx = int(len(shuffled) * 0.8)
+    split_idx = int(len(shuffled) * 0.5)
     return shuffled[:split_idx], shuffled[split_idx:]
 
 

@@ -210,6 +210,7 @@ class ContinuousSampler(nn.Module):
         num_patches: int,
         num_patches_val: int | None = None,
         temperature: float = 1.0,
+        stride: int | None = None,
         augmenter: PatchAugmenter | None = None,
     ):
         super().__init__()
@@ -217,6 +218,7 @@ class ContinuousSampler(nn.Module):
         self.num_patches = num_patches
         self.num_patches_val = num_patches_val if num_patches_val is not None else num_patches
         self.temperature = temperature
+        self.stride = stride if stride is not None else 1
         self.augmenter = augmenter
 
     def forward(
@@ -233,7 +235,7 @@ class ContinuousSampler(nn.Module):
         K = self.num_patches if self.training else self.num_patches_val
         device = image.device
 
-        pad_before = ps // 2
+        pad_before = ps // 4
         pad_after = ps - pad_before - 1
 
         # Pad inputs so all center-inside patches can be fully extracted
@@ -259,13 +261,35 @@ class ContinuousSampler(nn.Module):
         lo = flat.min(dim=1, keepdim=True).values
         hi = flat.max(dim=1, keepdim=True).values
         pooled_weights = (pooled_weights - lo.view(B, 1, 1, 1)) / (hi.view(B, 1, 1, 1) - lo.view(B, 1, 1, 1) + 1e-6)
-        flat_weights = pooled_weights.reshape(B, -1) / self.temperature
-        probs = F.softmax(flat_weights, dim=1)
-
-        # Sample K indices without replacement
-        indices = torch.multinomial(probs, K, replacement=False)
-        h_coords_pad = indices // valid_w
-        w_coords_pad = indices % valid_w
+        
+        # Apply stride to space out possible sampling positions
+        if self.stride > 1:
+            # Subsample pooled_weights at stride intervals
+            pooled_weights_strided = pooled_weights[:, :, ::self.stride, ::self.stride]
+            flat_weights = pooled_weights_strided.reshape(B, -1) / self.temperature
+            
+            # Gumbel-Top-K sampling from strided positions
+            gumbel = -torch.log(-torch.log(torch.rand_like(flat_weights) + 1e-10) + 1e-10)
+            scores = flat_weights + gumbel
+            _, indices = torch.topk(scores, K, dim=1)
+            
+            # Map indices back to original coordinate space
+            strided_w = pooled_weights_strided.shape[3]
+            h_coords_strided = indices // strided_w
+            w_coords_strided = indices % strided_w
+            h_coords_pad = h_coords_strided * self.stride
+            w_coords_pad = w_coords_strided * self.stride
+        else:
+            # Original sampling without stride
+            flat_weights = pooled_weights.reshape(B, -1) / self.temperature
+            
+            # Gumbel-Top-K: equivalent to multinomial without replacement, but ~10x faster
+            # Adding Gumbel noise to log-probs and taking top-k gives same distribution
+            gumbel = -torch.log(-torch.log(torch.rand_like(flat_weights) + 1e-10) + 1e-10)
+            scores = flat_weights + gumbel
+            _, indices = torch.topk(scores, K, dim=1)
+            h_coords_pad = indices // valid_w
+            w_coords_pad = indices % valid_w
 
         # Vectorized patch extraction using gather (no Python loops / .item() syncs)
         row_offsets = torch.arange(ps, device=device)
@@ -334,7 +358,7 @@ class SlidingWindowSampler(nn.Module):
         ps = self.patch_size
         device = image.device
 
-        pad_before = ps // 2
+        pad_before = ps // 4
         pad_after = ps - pad_before - 1
 
         # Pad inputs
@@ -406,6 +430,7 @@ def create_sampler(
             num_patches=num_patches,
             num_patches_val=num_patches_val,
             temperature=temperature,
+            stride=stride,
             augmenter=augmenter,
         )
     elif sampler_type == "sliding_window":

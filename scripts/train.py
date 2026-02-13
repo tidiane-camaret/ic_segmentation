@@ -16,9 +16,13 @@ from src.train_utils import seed_everything, train_epoch, validate
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     """Main training function."""
-    # Initialize accelerator
+    # Initialize accelerator with optional mixed precision
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    mixed_precision = cfg.training.get("mixed_precision", None)  # "fp16", "bf16", or None
+    accelerator = Accelerator(
+        kwargs_handlers=[ddp_kwargs],
+        mixed_precision=mixed_precision,
+    )
     device = accelerator.device
 
     seed_everything(cfg.training.seed)
