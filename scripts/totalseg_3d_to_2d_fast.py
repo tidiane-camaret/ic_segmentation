@@ -1,11 +1,13 @@
-from pathlib import Path
-import nibabel as nib
-import hydra
-from omegaconf import DictConfig
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
 import h5py
+import hydra
+import nibabel as nib
 import numpy as np
+from omegaconf import DictConfig
+import random
 
 def extract_label_slices(label_file: Path, case_path: Path):
     """
@@ -54,14 +56,15 @@ def extract_label_slices(label_file: Path, case_path: Path):
                        "x": label_data[:, :, xc]}
 
         # Load image data
-        img_nii = nib.load(str(case_path / "mri.nii.gz"))
+        img_nii = nib.load(str(case_path / "ct.nii.gz"))
         img_data = img_nii.get_fdata()
         img_slices = {"z": img_data[zc, :, :],
                       "y": img_data[:, yc, :],
                       "x": img_data[:, :, xc]}
 
         return (img_slices, mask_slices), stats
-    except Exception:
+    except Exception as e:
+        print(f"    Error processing label {label_file.name}: {e}")
         return None, None
 
 
@@ -80,7 +83,10 @@ def process_case(args):
     
     h5_path = output_dir / f"{case_name}.h5"
     case_stats = {}
-    
+
+    if h5_path.exists():
+        return case_name, {}, None  # Already processed, skip
+
     labels_dir = case_dir / "segmentations"
     if not labels_dir.exists():
         return case_name, {}, f"No 'segmentations' directory in {case_dir}"
@@ -116,10 +122,18 @@ def process_case(args):
         return case_name, {}, str(e)
 
 
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg: DictConfig) -> None:
+
     import pickle
+
     from tqdm import tqdm
+
+
+    # Get max_files from config (can override via CLI: max_files=10)
+    max_files = getattr(cfg, 'max_files_3d_to_2d', None)
 
     totalseg_dir = Path(cfg.paths.totalseg)
     # New output dir for HDF5 files
@@ -141,6 +155,17 @@ def main(cfg: DictConfig) -> None:
         (str(case_dir), str(totalseg_2d_dir_h5))
         for case_dir in totalseg_dir.iterdir() if case_dir.is_dir()
     ]
+
+    # Randomize order with a fixed seed before limiting to max_files
+    # Seed can be configured via cfg.seed or cfg.training.seed, or defaults to 42
+    seed = cfg.get("seed", cfg.training.get("seed", 42))
+    random.seed(seed)
+    random.shuffle(tasks)
+    print(f"Randomized case order with seed: {seed}")
+
+    if max_files is not None:
+        tasks = tasks[:max_files]
+        print(f"Limiting to max_files={max_files}")
     print(f"Total cases to process: {len(tasks)}")
 
     # Process in parallel
@@ -186,4 +211,5 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
+    # Pass through CLI args to hydra
     main()

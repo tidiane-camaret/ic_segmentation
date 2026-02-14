@@ -125,7 +125,8 @@ def _save_sample_images(
 
             # --- Top row: target + context images with patch boxes ---
             axes[top_row][0].imshow(img, cmap="gray")
-            axes[top_row][0].imshow(gt, cmap="Reds", alpha=0.3)
+            axes[top_row][0].imshow(gt, cmap="Reds", alpha=0.4)
+            axes[top_row][0].contour(gt, colors='yellow', linewidths=1)
             if l_target_coords is not None and l_level_res is not None:
                 draw_patch_boxes(
                     axes[top_row][0], img, l_target_coords,
@@ -138,7 +139,8 @@ def _save_sample_images(
                 ctx_img = ctx_in[ci].squeeze().numpy()
                 ctx_mask = ctx_out[ci].squeeze().numpy()
                 axes[top_row][1 + ci].imshow(ctx_img, cmap="gray")
-                axes[top_row][1 + ci].imshow(ctx_mask, cmap="Reds", alpha=0.3)
+                axes[top_row][1 + ci].imshow(ctx_mask, cmap="Reds", alpha=0.4)
+                axes[top_row][1 + ci].contour(ctx_mask, colors='cyan', linewidths=1)
                 if (
                     l_context_coords is not None
                     and l_level_res is not None
@@ -160,7 +162,7 @@ def _save_sample_images(
             for j in range(1 + n_ctx, n_cols):
                 axes[top_row][j].axis("off")
 
-            # --- Bottom row: Downsized GT | Pred heatmap | Pred mask ---
+            # --- Bottom row: Downsized GT | Pred probs | Pred mask ---
             # Downsized GT
             if l_level_res is not None and l_level_res < gt.shape[0]:
                 gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
@@ -172,15 +174,15 @@ def _save_sample_images(
             axes[bot_row][0].set_title(f"GT ({gt_ds.shape[0]}x{gt_ds.shape[1]})")
             axes[bot_row][0].axis("off")
 
-            # Pred heatmap
+            # Pred probs
             if l_pred_probs is not None:
                 pp = l_pred_probs.squeeze().numpy()
-                pred_heatmap = (pp - pp.min()) / (pp.max() - pp.min() + 1e-8)
-                im = axes[bot_row][1].imshow(pred_heatmap, cmap="hot", vmin=0, vmax=1)
-                axes[bot_row][1].set_title(f"Heatmap ({pp.shape[0]}x{pp.shape[1]})")
+                pred_probs = (pp - pp.min()) / (pp.max() - pp.min() + 1e-8)
+                im = axes[bot_row][1].imshow(pred_probs, cmap="hot", vmin=0, vmax=1)
+                axes[bot_row][1].set_title(f"Pred. Probs ({pp.shape[0]}x{pp.shape[1]})")
                 plt.colorbar(im, ax=axes[bot_row][1], fraction=0.046, pad=0.04)
             else:
-                axes[bot_row][1].set_title("Heatmap (N/A)")
+                axes[bot_row][1].set_title("Pred. Probs (N/A)")
             axes[bot_row][1].axis("off")
 
             # Pred mask with per-level dice
@@ -209,10 +211,10 @@ def _save_sample_images(
             if l_refined_probs is not None and n_cols > 3:
                 rp = l_refined_probs.squeeze().numpy()
                 im = axes[bot_row][3].imshow(rp, cmap="hot", vmin=0, vmax=1)
-                axes[bot_row][3].set_title(f"Refined probs ({rp.shape[0]}x{rp.shape[1]})")
+                axes[bot_row][3].set_title(f"Refined Pred. Probs ({rp.shape[0]}x{rp.shape[1]})")
                 plt.colorbar(im, ax=axes[bot_row][3], fraction=0.046, pad=0.04)
             elif n_cols > 3:
-                axes[bot_row][3].set_title("Refined probs (N/A)")
+                axes[bot_row][3].set_title("Refined Pred. Probs (N/A)")
             if n_cols > 3:
                 axes[bot_row][3].axis("off")
 
@@ -614,8 +616,15 @@ def validate(
             context_features=context_features,
             mode="val",
         )
-        predictions = outputs["final_logit"]
-        loss = unwrapped_model.aggreg_criterion(predictions, labels.float())
+        # Compute val loss at level resolution (matches training loss)
+        level_outputs = outputs.get("level_outputs", [])
+        if level_outputs:
+            last_pred = level_outputs[-1]["pred"]
+            sf = labels.shape[-1] // last_pred.shape[-1]
+            labels_ds = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
+            loss = unwrapped_model.aggreg_criterion(last_pred, labels_ds)
+        else:
+            loss = unwrapped_model.aggreg_criterion(outputs["final_logit"], labels.float())
         total_loss += loss.item()
 
         # Compute all dice metrics using centralized function
@@ -642,7 +651,7 @@ def validate(
 
         # Per-case tracking
         per_sample_dice = compute_per_sample_dice(outputs, labels)
-        batch_case_ids = batch.get("case_id", [None] * images.shape[0])
+        batch_case_ids = batch.get("target_case_ids") or batch.get("case_id", [None] * images.shape[0])
         batch_label_ids = batch.get("label_ids") or batch.get(
             "label_id", [None] * images.shape[0]
         )

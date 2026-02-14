@@ -58,8 +58,12 @@ def compute_dice(
 
     # Soft dice
     if return_soft:
-        soft_intersection = (pred_probs * target_float).sum(dim=spatial_dims)
-        soft_denom = pred_probs.sum(dim=spatial_dims) + target_float.sum(dim=spatial_dims)
+        # Cast to float32 for stable calculation, especially with fp16
+        pred_probs_f32 = pred_probs.float()
+        target_float_f32 = target_float.float()
+
+        soft_intersection = (pred_probs_f32 * target_float_f32).sum(dim=spatial_dims)
+        soft_denom = pred_probs_f32.sum(dim=spatial_dims) + target_float_f32.sum(dim=spatial_dims)
         soft_dice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
         result['soft_dice'] = soft_dice
 
@@ -181,18 +185,17 @@ def compute_all_metrics(
     if level_outputs:
         metrics.update(compute_level_metrics(level_outputs, labels))
 
-        # Final dice from last level
-        last_level = level_outputs[-1]
-        last_pred = last_level['pred']
+        # Final dice at last level's resolution (matches training loss resolution)
+        last_pred = level_outputs[-1]['pred']
         last_res = last_pred.shape[-1]
         sf = labels.shape[-1] // last_res
         labels_ds = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
-
         dice_result = compute_dice(last_pred, labels_ds)
         metrics['final_dice'] = dice_result['dice'].mean()
         metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
 
         # Context metrics from last level
+        last_level = level_outputs[-1]
         context_pred = last_level.get('context_pred')
         context_labels = last_level.get('context_labels')
         if context_pred is not None and context_labels is not None:
@@ -233,6 +236,9 @@ def compute_per_sample_dice(
         dice_result = compute_dice(last_pred, labels_ds)
     else:
         final_logit = outputs.get('final_logit')
-        dice_result = compute_dice(final_logit, labels)
+        if final_logit is not None:
+            dice_result = compute_dice(final_logit, labels)
+        else:
+            raise ValueError("No level_outputs or final_logit in model outputs")
 
     return dice_result['dice']

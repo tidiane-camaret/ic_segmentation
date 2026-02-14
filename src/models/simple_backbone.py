@@ -222,7 +222,7 @@ class SimpleCNNEncoder(nn.Module):
             )
         """
         # Project and reshape to spatial: [B*K, D, h, w]
-        x = self.input_proj(features.view(-1, E))  # [B*K*NF, D]
+        x = self.input_proj(features.reshape(-1, E))  # [B*K*NF, D]
         x = x.view(B * K, NF, D).permute(0, 2, 1)  # [B*K, D, NF]
         x = x.view(B * K, D, h, w)  # [B*K, D, h, w]
 

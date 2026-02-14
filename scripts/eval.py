@@ -101,11 +101,13 @@ def main(cfg: DictConfig) -> None:
 
     # Get dataset class and dataloader
     if cfg.dataset == "totalseg2d":
-        from src.dataloaders.totalseg2d_dataloader import (
+        from src.dataloaders.totalseg2d_dataloader_fast import (
             get_dataloader as get_totalseg2d_dataloader,
         )
+        val_split_cfg = cfg.get("val_split", ["val", "test"])
+        val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
     elif cfg.dataset == "totalsegmri2d":
-        from src.dataloaders.totalseg2d_dataloader import (
+        from src.dataloaders.totalseg2d_dataloader_fast import (
             get_dataloader as get_totalseg2d_dataloader,
         )
     elif cfg.dataset == "medsegbench":
@@ -146,7 +148,7 @@ def main(cfg: DictConfig) -> None:
             crop_to_bbox=cfg.preprocessing.crop_to_bbox,
             bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
-            split="train",
+            split=val_split,
             shuffle=False,
             random_context=False,
             max_ds_len=max_ds_len_val,
@@ -165,7 +167,7 @@ def main(cfg: DictConfig) -> None:
             crop_to_bbox=cfg.preprocessing.crop_to_bbox,
             bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
-            split="val",
+            split=val_split,
             shuffle=False,
             random_context=False,
             max_ds_len=max_ds_len_val,

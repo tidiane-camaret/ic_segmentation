@@ -25,7 +25,8 @@ nvidia-smi
 uv run accelerate launch \
     --multi_gpu \
     --num_processes=2 \
+    --mixed_precision=fp16 \
     scripts/train.py \
-    experiment=60_2_levels \
+    experiment=70_attention \
     cluster=dlclarge \
-    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/rich-valley-210/best_model.pt
+    #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-14_magnetic-balloon-244/best_model.pt

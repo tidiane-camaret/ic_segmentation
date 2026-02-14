@@ -107,10 +107,16 @@ def main(cfg: DictConfig) -> None:
 
     else:
         # TotalSeg2D dataloader
-        from src.dataloaders.totalseg2d_dataloader import get_dataloader as get_totalseg2d_dataloader
+        from src.dataloaders.totalseg2d_dataloader_fast import get_dataloader as get_totalseg2d_dataloader
 
         train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
+
+        # Support list of splits for train/val
+        train_split_cfg = cfg.get("train_split", "train")
+        train_split = list(train_split_cfg) if OmegaConf.is_list(train_split_cfg) else train_split_cfg
+        val_split_cfg = cfg.get("val_split", ["val", "test"])
+        val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
 
         # Support separate max_ds_len for train/val, with fallback to single value
         max_ds_len_cfg = cfg.get("max_ds_len")
@@ -132,7 +138,7 @@ def main(cfg: DictConfig) -> None:
         adv_aug_config = OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
 
         train_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalseg2d,
+            root_dir=cfg.paths.totalseg2d_h5,
             stats_path=cfg.paths.totalseg_stats,
             label_id_list=train_labels,
             context_size=cfg.context_size,
@@ -141,7 +147,7 @@ def main(cfg: DictConfig) -> None:
             crop_to_bbox=cfg.preprocessing.crop_to_bbox,
             bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
-            split="train",
+            split=train_split,
             shuffle=True,
             max_ds_len=max_ds_len_train,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
@@ -154,7 +160,7 @@ def main(cfg: DictConfig) -> None:
             max_labels=cfg.get("max_labels", None),
         )
         val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalseg2d,
+            root_dir=cfg.paths.totalseg2d_h5,
             stats_path=cfg.paths.totalseg_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
@@ -163,7 +169,7 @@ def main(cfg: DictConfig) -> None:
             crop_to_bbox=cfg.preprocessing.crop_to_bbox,
             bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
-            split="val",
+            split=val_split,
             shuffle=False,
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),

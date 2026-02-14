@@ -212,6 +212,8 @@ class ContinuousSampler(nn.Module):
         temperature: float = 1.0,
         stride: int | None = None,
         augmenter: PatchAugmenter | None = None,
+        pad_before: int | None = None,
+        pad_after: int | None = None,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -220,6 +222,8 @@ class ContinuousSampler(nn.Module):
         self.temperature = temperature
         self.stride = stride if stride is not None else 1
         self.augmenter = augmenter
+        self.pad_before = pad_before
+        self.pad_after = pad_after
 
     def forward(
         self,
@@ -235,8 +239,8 @@ class ContinuousSampler(nn.Module):
         K = self.num_patches if self.training else self.num_patches_val
         device = image.device
 
-        pad_before = ps // 4
-        pad_after = ps - pad_before - 1
+        pad_before = self.pad_before if self.pad_before is not None else ps // 4
+        pad_after = self.pad_after if self.pad_after is not None else ps - pad_before - 1
 
         # Pad inputs so all center-inside patches can be fully extracted
         image_pad = F.pad(image, (pad_before, pad_after, pad_before, pad_after), mode='constant', value=0)
@@ -337,6 +341,8 @@ class SlidingWindowSampler(nn.Module):
         num_patches_val: int | None = None,
         stride: int | None = None,
         augmenter: PatchAugmenter | None = None,
+        pad_before: int | None = None,
+        pad_after: int | None = None,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -344,6 +350,8 @@ class SlidingWindowSampler(nn.Module):
         self.num_patches_val = num_patches_val if num_patches_val is not None else num_patches
         self.stride = stride  # None means auto-compute from num_patches
         self.augmenter = augmenter
+        self.pad_before = pad_before
+        self.pad_after = pad_after
 
     def forward(
         self,
@@ -358,8 +366,8 @@ class SlidingWindowSampler(nn.Module):
         ps = self.patch_size
         device = image.device
 
-        pad_before = ps // 4
-        pad_after = ps - pad_before - 1
+        pad_before = self.pad_before if self.pad_before is not None else ps // 4
+        pad_after = self.pad_after if self.pad_after is not None else ps - pad_before - 1
 
         # Pad inputs
         image_pad = F.pad(image, (pad_before, pad_after, pad_before, pad_after), mode='constant', value=0)
@@ -422,6 +430,8 @@ def create_sampler(
     temperature: float = 1.0,
     stride: int | None = None,
     augmenter: PatchAugmenter | None = None,
+    pad_before: int | None = None,
+    pad_after: int | None = None,
 ) -> nn.Module:
     """Factory function to create samplers from config."""
     if sampler_type == "continuous":
@@ -432,6 +442,8 @@ def create_sampler(
             temperature=temperature,
             stride=stride,
             augmenter=augmenter,
+            pad_before=pad_before,
+            pad_after=pad_after,
         )
     elif sampler_type == "sliding_window":
         return SlidingWindowSampler(
@@ -440,6 +452,8 @@ def create_sampler(
             num_patches_val=num_patches_val,
             stride=stride,
             augmenter=augmenter,
+            pad_before=pad_before,
+            pad_after=pad_after,
         )
     else:
         raise ValueError(f"Unknown sampler type: {sampler_type}. Use 'continuous' or 'sliding_window'.")

@@ -177,6 +177,8 @@ class PatchICL(nn.Module):
                 temperature=level_cfg.get('sampling_temperature', 0.3),
                 stride=level_stride,
                 augmenter=self.augmenter,
+                pad_before=level_cfg.get('pad_before'),
+                pad_after=level_cfg.get('pad_after'),
             ))
         self.sampler = self.samplers[0]  # backward compat
 

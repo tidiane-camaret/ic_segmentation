@@ -9,7 +9,7 @@ paths:
   medsegbench: ${.DATA_DIR}/medsegbench
   totalseg2d: ${.DATA_DIR}/TotalSeg2D
   totalseg_stats: ${.totalseg}/totalseg_stats.pkl
-  totalsegmri2d_h5: ${paths.DATA_DIR}/TotalSegMRI_2D_H5
+  totalseg2d_h5: ${.DATA_DIR}/TotalSeg2D_H5
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints
     medverse: ${..root}/checkpoints/Medverse.ckpt
@@ -21,7 +21,7 @@ paths:
     # patch_icl_v2: ${..RESULTS_DIR}/checkpoints/scarlet-firefly-161/best_model.pt
 
 # Cluster-specific training settings
-train_batch_size: 1
-val_batch_size: 1
+train_batch_size: 32
+val_batch_size: 32
 training:
   num_workers: 18

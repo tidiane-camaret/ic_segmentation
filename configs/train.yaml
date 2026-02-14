@@ -36,6 +36,7 @@ preprocessing:
   crop_to_bbox: false
   bbox_padding: 20
 
+max_files_3d_to_2d: null  # Limit number of cases/files to process (for debugging)
 # Dataloader
 train_batch_size: 50
 val_batch_size: 64
