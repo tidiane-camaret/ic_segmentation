@@ -188,15 +188,17 @@ def compute_context_metrics(
 def compute_all_metrics(
     outputs: dict[str, torch.Tensor],
     labels: torch.Tensor,
+    return_per_sample: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Compute all dice metrics from model outputs.
 
     Args:
         outputs: Model output dict from forward()
         labels: Full-resolution ground truth [B, C, H, W]
+        return_per_sample: If True, also return per-sample dice in 'per_sample_dice'
 
     Returns:
-        Dict with all dice metrics
+        Dict with all dice metrics, and optionally 'per_sample_dice': [B]
     """
     if labels.dim() == 3:
         labels = labels.unsqueeze(1)
@@ -230,6 +232,10 @@ def compute_all_metrics(
         metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
         metrics['final_pixel_mae'] = compute_pixel_mae(pred_upsampled, labels).mean()
 
+        # Store per-sample dice to avoid redundant interpolation
+        if return_per_sample:
+            metrics['per_sample_dice'] = dice_result['dice']
+
         # Context metrics from last level
         last_level = level_outputs[-1]
         context_pred = last_level.get('context_pred')
@@ -243,6 +249,8 @@ def compute_all_metrics(
             dice_result = compute_dice(final_logit, labels)
             metrics['final_dice'] = dice_result['dice'].mean()
             metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
+            if return_per_sample:
+                metrics['per_sample_dice'] = dice_result['dice']
 
     return metrics
 

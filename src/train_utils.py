@@ -2,6 +2,8 @@
 
 import os
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +11,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+
+# Global thread pool for async image saving (avoid creating threads per call)
+_IMAGE_SAVE_EXECUTOR: Optional[ThreadPoolExecutor] = None
+
+
+def _get_image_save_executor() -> ThreadPoolExecutor:
+    """Get or create the global thread pool for async image saving."""
+    global _IMAGE_SAVE_EXECUTOR
+    if _IMAGE_SAVE_EXECUTOR is None:
+        _IMAGE_SAVE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="img_save")
+    return _IMAGE_SAVE_EXECUTOR
 
 from src.models.patch_icl_v2.metrics import (
     PRED_THRESHOLD,
@@ -260,6 +273,26 @@ def _save_sample_images(
         wandb.log({f"{prefix}/saved_samples": wandb_images, "epoch": epoch})
 
 
+def _save_sample_images_async(
+    label_samples: dict,
+    save_dir: Path,
+    epoch: int,
+    prefix: str = "train",
+    max_samples: int = 20,
+) -> None:
+    """Save sample images asynchronously in background thread.
+
+    Copies data and submits to thread pool to avoid blocking training.
+    """
+    # Deep copy the samples dict to avoid race conditions
+    # (tensors are already .cpu() in _collect_sample_for_viz)
+    import copy
+    samples_copy = copy.deepcopy(label_samples)
+
+    executor = _get_image_save_executor()
+    executor.submit(_save_sample_images, samples_copy, save_dir, epoch, prefix, max_samples)
+
+
 def _collect_sample_for_viz(
     i: int,
     images: torch.Tensor,
@@ -416,7 +449,8 @@ def train_epoch(
         )
         if should_compute_metrics:
             with torch.no_grad():
-                metrics = compute_all_metrics(outputs, labels)
+                # Use return_per_sample=True to avoid redundant interpolation
+                metrics = compute_all_metrics(outputs, labels, return_per_sample=True)
 
                 # Accumulate metrics
                 total_local_dice += metrics.get("local_dice", torch.tensor(0.0)).item()
@@ -445,8 +479,10 @@ def train_epoch(
                             dice_accum[key] += metrics[key].item()
                             dice_count[key] += 1
 
-                # Per-sample dice for per-label tracking
-                per_sample_dice = compute_per_sample_dice(outputs, labels)
+                # Per-sample dice for per-label tracking (reuse from compute_all_metrics)
+                per_sample_dice = metrics.get("per_sample_dice")
+                if per_sample_dice is None:
+                    per_sample_dice = compute_per_sample_dice(outputs, labels)
                 batch_label_ids = batch.get("label_ids") or batch.get(
                     "label_id", [None] * images.shape[0]
                 )
@@ -599,14 +635,14 @@ def train_epoch(
         for label_id, scores in label_dice_scores.items()
     }
 
-    # Save train images to disk periodically
+    # Save train images to disk periodically (async to avoid blocking)
     if (
         save_dir is not None
         and is_main
         and label_samples
         and (epoch % save_every_n_epochs == 0)
     ):
-        _save_sample_images(
+        _save_sample_images_async(
             label_samples,
             save_dir,
             epoch,
@@ -724,8 +760,8 @@ def validate(
             )
         total_loss += loss.item()
 
-        # Compute all dice metrics using centralized function
-        metrics = compute_all_metrics(outputs, labels)
+        # Compute all dice metrics using centralized function (with per-sample dice)
+        metrics = compute_all_metrics(outputs, labels, return_per_sample=True)
 
         total_local_dice += metrics.get("local_dice", torch.tensor(0.0)).item()
         total_local_softdice += metrics.get("local_soft_dice", torch.tensor(0.0)).item()
@@ -753,8 +789,10 @@ def validate(
                     dice_accum[key] += metrics[key].item()
                     dice_count[key] += 1
 
-        # Per-case tracking
-        per_sample_dice = compute_per_sample_dice(outputs, labels)
+        # Per-case tracking (reuse per_sample_dice from compute_all_metrics)
+        per_sample_dice = metrics.get("per_sample_dice")
+        if per_sample_dice is None:
+            per_sample_dice = compute_per_sample_dice(outputs, labels)
         batch_case_ids = batch.get("target_case_ids") or batch.get(
             "case_id", [None] * images.shape[0]
         )
@@ -809,9 +847,9 @@ def validate(
         for label_id, scores in label_dice_scores.items()
     }
 
-    # Save images to disk if save_dir is provided
+    # Save images to disk if save_dir is provided (async to avoid blocking)
     if save_dir is not None and is_main and label_samples:
-        _save_sample_images(
+        _save_sample_images_async(
             label_samples,
             save_dir,
             epoch,

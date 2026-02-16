@@ -224,6 +224,9 @@ class TotalSeg2DDataset(Dataset):
 
         if self.random_coloring_nb > 0:
             self.color_palette = define_colors_by_mean_sep(num_colors=max(256, len(self.label_id_list)))
+
+        # Per-worker H5 file cache (populated lazily)
+        self._h5_cache: Dict[str, h5py.File] = {}
     
     # --- Methods like _filter_by_split, _find_cases_with_labels, etc. remain largely the same ---
     def _filter_by_split(self, split: Union[str, List[str]]):
@@ -247,12 +250,18 @@ class TotalSeg2DDataset(Dataset):
         # Rebuild mappings after filtering
         # (This is a simplified version of the logic in __init__)
 
+    def _get_h5_file(self, case_id: str) -> h5py.File:
+        """Get cached H5 file handle (lazy initialization per worker)."""
+        if case_id not in self._h5_cache:
+            h5_path = self.root_dir / f"{case_id}.h5"
+            self._h5_cache[case_id] = h5py.File(h5_path, 'r', swmr=True)
+        return self._h5_cache[case_id]
+
     def _load_slice(self, case_id: str, label_id: str, axis: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Load image and label slice from HDF5 file on-the-fly."""
-        h5_path = self.root_dir / f"{case_id}.h5"
-        with h5py.File(h5_path, 'r') as h5f:
-            img = h5f[f"{label_id}/{axis}_slice_img"][:]
-            mask = h5f[f"{label_id}/{axis}_slice"][:]
+        """Load image and label slice from HDF5 file (cached handle)."""
+        h5f = self._get_h5_file(case_id)
+        img = h5f[f"{label_id}/{axis}_slice_img"][:]
+        mask = h5f[f"{label_id}/{axis}_slice"][:]
         return img, mask
 
     def _load_carve_mix_donor(
@@ -532,6 +541,15 @@ class TotalSeg2DDataset(Dataset):
         if self.max_ds_len is not None:
             return min(self.max_ds_len, len(self.samples))
         return len(self.samples)
+
+    def __del__(self):
+        """Close cached H5 file handles on cleanup."""
+        for h5f in self._h5_cache.values():
+            try:
+                h5f.close()
+            except Exception:
+                pass
+        self._h5_cache.clear()
 
     def _apply_augmentation(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if not self.augment or self.spatial_transform is None:

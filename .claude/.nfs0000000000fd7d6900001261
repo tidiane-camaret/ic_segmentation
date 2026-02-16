@@ -22,9 +22,7 @@
       "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
       "Bash(uv run python:*)",
       "WebFetch(domain:ar5iv.labs.arxiv.org)",
-      "Bash(timeout 30 bash:*)",
-      "Bash(find:*)",
-      "WebFetch(domain:encord.com)"
+      "Bash(timeout 30 bash:*)"
     ],
     "deny": [
       "Read(./old/**)"

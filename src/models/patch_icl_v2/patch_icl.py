@@ -24,6 +24,63 @@ from src.models.patch_icl_v2.sampling import (
 from src.models.simple_backbone import SimpleBackbone
 
 
+def extract_mask_patches(
+    mask: torch.Tensor,
+    coords: torch.Tensor,
+    patch_size: int,
+    level_resolution: int,
+    target_size: int = 16,
+) -> torch.Tensor:
+    """Extract mask patches using grid_sample (memory-efficient version).
+
+    Args:
+        mask: [B, 1, H, W] - Logits or probabilities at level resolution
+        coords: [B, K, 2] - Patch coordinates (h, w) at level resolution
+        patch_size: Size of patches at level resolution
+        level_resolution: Resolution of the current level
+        target_size: Desired spatial size for output patches
+
+    Returns:
+        mask_patches: [B, K, 1, target_size, target_size]
+    """
+    B, C, H, W = mask.shape
+    K = coords.shape[1]
+    device = mask.device
+
+    # Compute patch centers in normalized coordinates [-1, 1]
+    fh = coords[:, :, 0].float() + patch_size / 2
+    fw = coords[:, :, 1].float() + patch_size / 2
+
+    center_h = (fh / level_resolution) * 2 - 1
+    center_w = (fw / level_resolution) * 2 - 1
+
+    # Create sampling grid offsets (shared across all patches)
+    half_patch = patch_size / level_resolution
+    offset = torch.linspace(-half_patch, half_patch, target_size, device=device)
+    grid_y, grid_x = torch.meshgrid(offset, offset, indexing='ij')
+    grid_offsets = torch.stack([grid_x, grid_y], dim=-1)  # [target_size, target_size, 2]
+
+    # Build grid: [B, K, target_size, target_size, 2]
+    centers = torch.stack([center_w, center_h], dim=-1)  # [B, K, 2]
+    grid = centers.view(B, K, 1, 1, 2) + grid_offsets.view(1, 1, target_size, target_size, 2)
+
+    # Memory-efficient extraction: process per batch
+    mask_patches_list = []
+    for b in range(B):
+        # [1, C, H, W] -> [K, C, H, W] via expand (no copy)
+        mask_b = mask[b:b+1].expand(K, -1, -1, -1)
+        grid_b = grid[b]  # [K, target_size, target_size, 2]
+        patches_b = F.grid_sample(
+            mask_b, grid_b, mode='bilinear', padding_mode='border', align_corners=False
+        )  # [K, C, target_size, target_size]
+        mask_patches_list.append(patches_b)
+
+    # Stack: [B, K, C, target_size, target_size]
+    mask_patches = torch.stack(mask_patches_list, dim=0)
+
+    return mask_patches
+
+
 def extract_patch_features(
     features: torch.Tensor,
     coords: torch.Tensor,
@@ -34,7 +91,8 @@ def extract_patch_features(
 ) -> torch.Tensor:
     """Extract patch features from pre-computed full-image feature maps.
 
-    Uses grid_sample for efficient extraction with optimized backward pass.
+    Uses grid_sample with memory-efficient batching (processes one batch at a time
+    instead of expanding to B*K copies).
 
     Args:
         features: [B, N, D] - Pre-computed features (N = actual_grid_size^2)
@@ -68,7 +126,6 @@ def extract_patch_features(
     features_spatial = features_spatial.permute(0, 3, 1, 2)  # [B, D, H, W]
 
     # Compute patch centers in normalized coordinates [-1, 1]
-    # coords are top-left corners at level_resolution, convert to feature space centers
     fh = coords[:, :, 0].float() * scale + patch_size_in_features / 2
     fw = coords[:, :, 1].float() * scale + patch_size_in_features / 2
 
@@ -76,31 +133,30 @@ def extract_patch_features(
     center_h = (fh / actual_grid_size) * 2 - 1
     center_w = (fw / actual_grid_size) * 2 - 1
 
-    # Create sampling grid for each patch: [B, K, extract_size, extract_size, 2]
-    # Grid offsets relative to center, in normalized coords
-    half_patch = (patch_size_in_features / actual_grid_size)  # in normalized space
+    # Create sampling grid offsets (shared across all patches)
+    half_patch = (patch_size_in_features / actual_grid_size)
     offset = torch.linspace(-half_patch, half_patch, extract_size, device=device)
     grid_y, grid_x = torch.meshgrid(offset, offset, indexing='ij')
     grid_offsets = torch.stack([grid_x, grid_y], dim=-1)  # [extract_size, extract_size, 2]
 
-    # Add offsets to centers: [B, K, 1, 1, 2] + [1, 1, H, W, 2] -> [B, K, H, W, 2]
-    centers = torch.stack([center_w, center_h], dim=-1)  # [B, K, 2] (x, y order for grid_sample)
-    grid = centers.unsqueeze(2).unsqueeze(2) + grid_offsets.view(1, 1, extract_size, extract_size, 2)
+    # Build grid: [B, K, extract_size, extract_size, 2]
+    centers = torch.stack([center_w, center_h], dim=-1)  # [B, K, 2]
+    grid = centers.view(B, K, 1, 1, 2) + grid_offsets.view(1, 1, extract_size, extract_size, 2)
 
-    # Reshape for batch grid_sample: [B*K, extract_size, extract_size, 2]
-    grid = grid.view(B * K, extract_size, extract_size, 2)
+    # Memory-efficient extraction: process per batch instead of expanding B*K
+    # This avoids creating K copies of the feature map
+    patch_features_list = []
+    for b in range(B):
+        # [1, D, H, W] -> [K, D, H, W] via expand (no copy)
+        feat_b = features_spatial[b:b+1].expand(K, -1, -1, -1)
+        grid_b = grid[b]  # [K, extract_size, extract_size, 2]
+        patches_b = F.grid_sample(
+            feat_b, grid_b, mode='bilinear', padding_mode='border', align_corners=False
+        )  # [K, D, extract_size, extract_size]
+        patch_features_list.append(patches_b)
 
-    # Expand features for each patch: [B, D, H, W] -> [B*K, D, H, W]
-    features_expanded = features_spatial.unsqueeze(1).expand(-1, K, -1, -1, -1)
-    features_expanded = features_expanded.reshape(B * K, D, actual_grid_size, actual_grid_size)
-
-    # Extract patches using grid_sample (efficient backward)
-    patch_features = F.grid_sample(
-        features_expanded, grid,
-        mode='bilinear', padding_mode='border', align_corners=False
-    )  # [B*K, D, extract_size, extract_size]
-
-    # Reshape to [B, K, tokens, D]
+    # Stack and reshape: [B, K, D, extract_size^2] -> [B, K, tokens, D]
+    patch_features = torch.stack(patch_features_list, dim=0)  # [B, K, D, h, w]
     patch_features = patch_features.view(B, K, D, extract_size * extract_size)
     patch_features = patch_features.permute(0, 1, 3, 2)  # [B, K, tokens, D]
 
@@ -234,6 +290,9 @@ class PatchICL(nn.Module):
             max_levels=self.num_levels,
             gradient_checkpointing=backbone_cfg.get('gradient_checkpointing', False),
             num_context_layers=backbone_cfg.get('num_context_layers', 0),
+            use_mask_prior=backbone_cfg.get('use_mask_prior', False),
+            mask_fusion_type=backbone_cfg.get('mask_fusion_type', 'additive'),
+            use_context_mask=backbone_cfg.get('use_context_mask', False),
         )
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
@@ -274,7 +333,9 @@ class PatchICL(nn.Module):
         patch_size: int,
         output_size: tuple[int, int],
     ) -> torch.Tensor:
-        """Create coverage mask from patch coordinates (vectorized).
+        """Create coverage mask from patch coordinates (memory-efficient).
+
+        Uses index_put_ with flattened indices to avoid large intermediate tensors.
 
         Args:
             coords: [B, K, 2] - Patch coordinates (h, w) at level resolution
@@ -288,25 +349,33 @@ class PatchICL(nn.Module):
         H, W = output_size
         device = coords.device
 
-        # Create grid of coordinates
-        h_grid = torch.arange(H, device=device).view(1, 1, H, 1)
-        w_grid = torch.arange(W, device=device).view(1, 1, 1, W)
+        # Initialize flat coverage mask [B, H*W]
+        coverage_flat = torch.zeros(B, H * W, device=device)
 
-        # Patch bounds [B, K, 1, 1]
-        h_start = coords[:, :, 0:1].unsqueeze(-1).float()
-        w_start = coords[:, :, 1:2].unsqueeze(-1).float()
-        h_end = h_start + patch_size
-        w_end = w_start + patch_size
+        # Create patch pixel offsets: [patch_size^2, 2]
+        ph = torch.arange(patch_size, device=device)
+        pw = torch.arange(patch_size, device=device)
+        offset_h, offset_w = torch.meshgrid(ph, pw, indexing='ij')
+        offsets_h = offset_h.flatten()  # [patch_size^2]
+        offsets_w = offset_w.flatten()  # [patch_size^2]
 
-        # Check if each pixel is within any patch [B, K, H, W]
-        in_h = (h_grid >= h_start) & (h_grid < h_end)
-        in_w = (w_grid >= w_start) & (w_grid < w_end)
-        in_patch = in_h & in_w
+        # Expand coords to all pixels in each patch
+        # coords: [B, K, 2], offsets: [patch_size^2]
+        # Result: pixel positions [B, K, patch_size^2]
+        h_coords = coords[:, :, 0:1] + offsets_h.view(1, 1, -1)  # [B, K, patch_size^2]
+        w_coords = coords[:, :, 1:2] + offsets_w.view(1, 1, -1)  # [B, K, patch_size^2]
 
-        # Any patch covers this pixel
-        coverage = in_patch.any(dim=1, keepdim=True).float()
+        # Clip to valid range and compute flat indices
+        h_coords = h_coords.clamp(0, H - 1).long()
+        w_coords = w_coords.clamp(0, W - 1).long()
+        flat_indices = h_coords * W + w_coords  # [B, K, patch_size^2]
 
-        return coverage
+        # Scatter ones to coverage mask
+        # Use batch index expansion for scatter
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand_as(flat_indices)
+        coverage_flat[batch_idx.flatten(), flat_indices.flatten()] = 1.0
+
+        return coverage_flat.view(B, 1, H, W)
 
     def _extract_features(
         self,
@@ -376,8 +445,13 @@ class PatchICL(nn.Module):
         H: int,
         W: int,
         return_attn_weights: bool = False,
+        mask_prior: torch.Tensor | None = None,
     ) -> tuple[dict, torch.Tensor]:
         """Process a single resolution level.
+
+        Args:
+            mask_prior: [B, 1, H_prev, W_prev] - logits from previous level, used to
+                condition attention via mask prior fusion (if backbone supports it).
 
         Returns:
             level_out: Dict with all level outputs (patches, logits, coords, etc.)
@@ -401,6 +475,22 @@ class PatchICL(nn.Module):
         patches, patch_labels, coords, _, aug_params, target_validity = sampler(image_ds, labels_ds, weights, None)
         K = patches.shape[1]
         coord_scale = H / resolution
+
+        # Extract mask prior patches for target patches (if available)
+        mask_prior_patches = None
+        if mask_prior is not None and getattr(self.backbone, 'use_mask_prior', False):
+            # Resize mask prior to current level resolution
+            mask_prior_ds = F.interpolate(
+                mask_prior, size=(resolution, resolution),
+                mode='bilinear', align_corners=False
+            )
+            mask_prior_patches = extract_mask_patches(
+                mask=mask_prior_ds,
+                coords=coords,
+                patch_size=patch_size,
+                level_resolution=resolution,
+                target_size=self.patch_feature_grid_size,
+            )
 
         # Extract target patch features
         target_patch_features = None
@@ -437,29 +527,60 @@ class PatchICL(nn.Module):
             )
             K_ctx = context_patches.shape[1]
 
-            # Extract context patch features
+            # Extract context patch features (batched for efficiency)
             context_patch_features = None
             if context_features is not None:
                 K_per_ctx = K_ctx // k
-                ctx_features_list = []
-                for ctx_idx in range(k):
-                    ctx_feats = context_features[:, ctx_idx]
-                    ctx_coords = context_coords[:, ctx_idx * K_per_ctx:(ctx_idx + 1) * K_per_ctx]
-                    extracted = extract_patch_features(
-                        features=ctx_feats,
-                        coords=ctx_coords,
-                        patch_size=patch_size,
-                        level_resolution=resolution,
-                        feature_grid_size=self.feature_grid_size,
-                        target_patch_grid_size=self.patch_feature_grid_size,
-                    )
-                    if self.augmenter is not None and context_aug_params is not None:
+                # Reshape: [B, k, N, D] -> [B*k, N, D] and coords accordingly
+                ctx_feats_flat = context_features.view(B * k, *context_features.shape[2:])
+                # context_coords: [B, K_ctx] where K_ctx = k * K_per_ctx
+                # Reshape to [B*k, K_per_ctx, 2]
+                ctx_coords_reshaped = context_coords.view(B, k, K_per_ctx, 2).permute(0, 1, 2, 3)
+                ctx_coords_flat = ctx_coords_reshaped.reshape(B * k, K_per_ctx, 2)
+
+                # Single batched extraction
+                ctx_extracted_flat = extract_patch_features(
+                    features=ctx_feats_flat,
+                    coords=ctx_coords_flat,
+                    patch_size=patch_size,
+                    level_resolution=resolution,
+                    feature_grid_size=self.feature_grid_size,
+                    target_patch_grid_size=self.patch_feature_grid_size,
+                )  # [B*k, K_per_ctx, tokens, D]
+
+                # Reshape back: [B*k, K_per_ctx, tokens, D] -> [B, k*K_per_ctx, tokens, D]
+                ctx_extracted = ctx_extracted_flat.view(B, k, K_per_ctx, *ctx_extracted_flat.shape[2:])
+                # Apply augmentation per context image if needed
+                if self.augmenter is not None and context_aug_params is not None:
+                    for ctx_idx in range(k):
                         for b in range(B):
                             ctx_aug = context_aug_params[b][ctx_idx]
                             if ctx_aug and any(v is not None for v in ctx_aug.values()):
-                                extracted[b:b+1] = self.augmenter.augment_features_only(extracted[b:b+1], ctx_aug)
-                    ctx_features_list.append(extracted)
-                context_patch_features = torch.cat(ctx_features_list, dim=1)
+                                ctx_extracted[b, ctx_idx] = self.augmenter.augment_features_only(
+                                    ctx_extracted[b:b+1, ctx_idx], ctx_aug
+                                ).squeeze(0)
+                # Merge k dimension into K: [B, k, K_per_ctx, tokens, D] -> [B, K_ctx, tokens, D]
+                context_patch_features = ctx_extracted.view(B, K_ctx, *ctx_extracted.shape[3:])
+
+            # Extract context mask patches (batched, if use_context_mask is enabled)
+            context_mask_patches = None
+            if getattr(self.backbone, 'use_context_mask', False):
+                K_per_ctx = K_ctx // k
+                # context_out_ds: [B, k, C, resolution, resolution] -> [B*k, 1, resolution, resolution]
+                ctx_mask_flat = context_out_ds[:, :, :1].reshape(B * k, 1, resolution, resolution)
+                ctx_coords_flat = context_coords.view(B, k, K_per_ctx, 2).reshape(B * k, K_per_ctx, 2)
+
+                # Single batched extraction
+                ctx_mask_extracted_flat = extract_mask_patches(
+                    mask=ctx_mask_flat,
+                    coords=ctx_coords_flat,
+                    patch_size=patch_size,
+                    level_resolution=resolution,
+                    target_size=self.patch_feature_grid_size,
+                )  # [B*k, K_per_ctx, 1, h, h]
+
+                # Reshape: [B*k, K_per_ctx, 1, h, h] -> [B, K_ctx, 1, h, h]
+                context_mask_patches = ctx_mask_extracted_flat.view(B, K_ctx, *ctx_mask_extracted_flat.shape[2:])
 
             # Prepare backbone inputs
             img_patches = torch.cat([target_patch_features, context_patch_features], dim=1)
@@ -475,6 +596,8 @@ class PatchICL(nn.Module):
                 img_patches=img_patches, coords=all_coords, ctx_id_labels=ctx_id_labels,
                 return_attn_weights=return_attn_weights, level_idx=level_idx,
                 num_target_patches=K,
+                mask_prior_patches=mask_prior_patches,
+                context_mask_patches=context_mask_patches,
             )
 
             all_logits = backbone_out['mask_patch_logit_preds']
@@ -503,6 +626,7 @@ class PatchICL(nn.Module):
                 img_patches=target_patch_features, coords=coords.float() * coord_scale,
                 ctx_id_labels=ctx_id_labels, return_attn_weights=return_attn_weights,
                 level_idx=level_idx,
+                mask_prior_patches=mask_prior_patches,
             )
             patch_logits = backbone_out['mask_patch_logit_preds']
 
@@ -588,6 +712,11 @@ class PatchICL(nn.Module):
                 weights = torch.ones(B, 1, resolution, resolution, device=device)
                 refined_probs = None
 
+            # Pass previous prediction as mask prior (level 0 has None)
+            mask_prior = None
+            if i > 0 and combined_pred is not None:
+                mask_prior = combined_pred.detach() if self.detach_between_levels else combined_pred
+
             level_out, pred = self._forward_level(
                 level_idx=i,
                 image=image,
@@ -599,6 +728,7 @@ class PatchICL(nn.Module):
                 weights=weights,
                 H=H, W=W,
                 return_attn_weights=return_attn_weights,
+                mask_prior=mask_prior,
             )
 
             # Progressive refinement: blend current prediction with previous combined

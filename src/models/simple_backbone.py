@@ -37,6 +37,64 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class LayerNorm2d(nn.Module):
+    """LayerNorm for 2D feature maps (SAM-style)."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, C, H, W]"""
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
+
+class MaskPriorEncoder(nn.Module):
+    """SAM-style CNN to encode mask patches to embedding vectors.
+
+    Architecture from SAM/MedSAM mask_downscaling:
+    - Conv2d(1, 16, kernel=2, stride=2) + LayerNorm2d + GELU  → h/2
+    - Conv2d(16, 32, kernel=2, stride=2) + LayerNorm2d + GELU → h/4
+    - Conv2d(32, embed_dim, kernel=1)                         → h/4
+    - AdaptiveAvgPool2d(1) → [B*K, embed_dim, 1, 1]
+    """
+
+    def __init__(self, embed_dim: int = 128, feature_grid_size: int = 16):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.mask_downscaling = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=2, stride=2),
+            LayerNorm2d(16),
+            nn.GELU(),
+            nn.Conv2d(16, 32, kernel_size=2, stride=2),
+            LayerNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, embed_dim, kernel_size=1),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, mask_patches: torch.Tensor) -> torch.Tensor:
+        """Encode mask patches to embeddings.
+
+        Args:
+            mask_patches: [B, K, 1, h, h] - mask patch values
+
+        Returns:
+            [B, K, embed_dim] - encoded mask embeddings
+        """
+        B, K = mask_patches.shape[:2]
+        x = mask_patches.view(B * K, 1, *mask_patches.shape[3:])
+        x = self.mask_downscaling(x)  # [B*K, embed_dim, h/4, w/4]
+        x = self.pool(x).view(B, K, -1)  # [B, K, embed_dim]
+        return x
+
+
 def build_rope_cache_2d(max_pos: int, dim: int, base: float = 10000.0) -> torch.Tensor:
     """
     Precompute 2D RoPE sin/cos cache for spatial positions.
@@ -741,6 +799,8 @@ class SimpleBackbone(nn.Module):
         append_zero_attn: bool = False,
         max_levels: int = 4,
         gradient_checkpointing: bool = False,
+        use_mask_prior: bool = False,
+        mask_fusion_type: str = "additive",
         **kwargs,
     ):
         """
@@ -760,11 +820,16 @@ class SimpleBackbone(nn.Module):
             decoder_use_skip_connections: If True, use U-Net skips in decoder
             append_zero_attn: Append zero token to K/V for attention sink
             max_levels: Number of resolution levels for level embedding
+            use_mask_prior: If True, fuse mask prior from previous level into encoded features
+            mask_fusion_type: How to fuse mask prior ("additive", "gated", or "concat")
         """
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.image_size = image_size
+        self.use_mask_prior = use_mask_prior
+        self.use_context_mask = kwargs.get('use_context_mask', False)
+        self.mask_fusion_type = mask_fusion_type
 
         # Learnable level embedding (Deformable DETR style)
         self.level_embed = nn.Parameter(torch.randn(max_levels, embed_dim) * 0.02)
@@ -797,6 +862,16 @@ class SimpleBackbone(nn.Module):
             use_skip_connections=decoder_use_skip_connections,
         )
 
+        # Mask encoder and fusion (shared for target prior and context masks)
+        if use_mask_prior or self.use_context_mask:
+            self.mask_encoder = MaskPriorEncoder(embed_dim, feature_grid_size)
+            if mask_fusion_type == "gated":
+                self.mask_gate = nn.Parameter(torch.tensor(0.1))  # init small for target
+                if self.use_context_mask:
+                    self.context_mask_gate = nn.Parameter(torch.tensor(0.1))  # separate gate for context
+            elif mask_fusion_type == "concat":
+                self.fusion_proj = nn.Linear(embed_dim * 2, embed_dim)
+
     def forward(
         self,
         img_patches: torch.Tensor,
@@ -805,6 +880,8 @@ class SimpleBackbone(nn.Module):
         return_attn_weights: bool = False,
         level_idx: int = 0,
         num_target_patches: int | None = None,
+        mask_prior_patches: torch.Tensor | None = None,
+        context_mask_patches: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass: encode → attention → decode.
@@ -817,6 +894,8 @@ class SimpleBackbone(nn.Module):
             level_idx: Resolution level index for level embedding
             num_target_patches: Number of target patches (first N tokens).
                 Enables context-first attention when num_context_layers > 0.
+            mask_prior_patches: [B, K_target, 1, h, h] - mask prior patches from previous level
+            context_mask_patches: [B, K_ctx, 1, h, h] - GT context mask patches
 
         Returns:
             Dict with:
@@ -843,6 +922,38 @@ class SimpleBackbone(nn.Module):
 
         # Add level embedding (Deformable DETR style)
         encoded = encoded + self.level_embed[level_idx].view(1, 1, -1)
+
+        # Fuse mask prior into target patch embeddings (before attention)
+        K_target = num_target_patches if num_target_patches is not None else K
+        if self.use_mask_prior and mask_prior_patches is not None:
+            mask_encoded = self.mask_encoder(mask_prior_patches)  # [B, K_target, embed_dim]
+
+            if self.mask_fusion_type == "additive":
+                # SAM-style additive fusion
+                encoded[:, :K_target] = encoded[:, :K_target] + mask_encoded
+            elif self.mask_fusion_type == "gated":
+                # Gated additive (learnable scale, inspired by MAIS)
+                gate = torch.sigmoid(self.mask_gate)
+                encoded[:, :K_target] = encoded[:, :K_target] + gate * mask_encoded
+            elif self.mask_fusion_type == "concat":
+                # Concatenation + projection
+                fused = torch.cat([encoded[:, :K_target], mask_encoded], dim=-1)
+                encoded[:, :K_target] = self.fusion_proj(fused)
+
+        # Fuse GT context masks into context patch embeddings (before attention)
+        if self.use_context_mask and context_mask_patches is not None:
+            ctx_mask_encoded = self.mask_encoder(context_mask_patches)  # [B, K_ctx, embed_dim]
+
+            if self.mask_fusion_type == "additive":
+                encoded[:, K_target:] = encoded[:, K_target:] + ctx_mask_encoded
+            elif self.mask_fusion_type == "gated":
+                # Use separate gate for context masks
+                ctx_gate = torch.sigmoid(self.context_mask_gate)
+                encoded[:, K_target:] = encoded[:, K_target:] + ctx_gate * ctx_mask_encoded
+            elif self.mask_fusion_type == "concat":
+                # Share fusion_proj for simplicity
+                ctx_fused = torch.cat([encoded[:, K_target:], ctx_mask_encoded], dim=-1)
+                encoded[:, K_target:] = self.fusion_proj(ctx_fused)
 
         # Cross-patch attention
         attended, extras = self.attention(

@@ -4,6 +4,71 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-02-16: Mask Prior Fusion Before Attention
+
+**Goal:** Use `combined_pred` from level i-1 to guide attention at level i, not just for sampling. Extract mask patches and fuse them with encoded image features before attention.
+
+**Approach:** SAM-style additive fusion with optional gated or concatenation modes.
+
+**Implementation:**
+1. `extract_mask_patches()` in `patch_icl.py` — Extracts mask patches using `grid_sample` (same logic as `extract_patch_features` but for 1-channel mask input).
+2. `LayerNorm2d` in `simple_backbone.py` — SAM-style 2D layer normalization.
+3. `MaskPriorEncoder` in `simple_backbone.py` — 3-layer CNN (SAM mask_downscaling architecture) that encodes `[B*K, 1, h, h]` mask patches to `[B, K, embed_dim]`.
+4. `SimpleBackbone` — New params `use_mask_prior` and `mask_fusion_type`. Fuses mask prior embeddings with target patch encodings before attention.
+5. `PatchICL._forward_level()` — Accepts `mask_prior`, extracts mask patches, passes to backbone.
+6. `PatchICL.forward()` — Passes `combined_pred` from previous level as `mask_prior` (level 0 gets None).
+
+**Fusion modes:**
+- `additive`: `encoded += mask_encoded` (SAM-style, default)
+- `gated`: `encoded += sigmoid(gate) * mask_encoded` (learnable scale, MAIS-inspired)
+- `concat`: `encoded = proj(cat(encoded, mask_encoded))` (Medverse-style)
+
+**Config:**
+```yaml
+backbone:
+  use_mask_prior: true
+  mask_fusion_type: "additive"  # or "gated", "concat"
+```
+
+**Tensor flow (level 1+):**
+```
+combined_pred [B, 1, prev_res, prev_res]
+    ↓ interpolate
+mask_prior_ds [B, 1, resolution, resolution]
+    ↓ extract_mask_patches
+mask_prior_patches [B, K_target, 1, h, h]
+    ↓ MaskPriorEncoder
+mask_encoded [B, K_target, embed_dim]
+    ↓ additive fusion
+encoded[:, :K_target] += mask_encoded
+    ↓ attention (now conditioned on mask prior)
+```
+
+**Extension: Context Mask Fusion**
+
+Also added option to fuse GT context masks into context patch embeddings. Since context masks are GT at both train and test time (user-provided), no train-test asymmetry concern.
+
+- `use_context_mask: true` — Extracts mask patches from context GT masks and fuses them into context patch embeddings.
+- Uses same `MaskPriorEncoder` and fusion type as target mask prior.
+- For gated fusion, uses separate `context_mask_gate` parameter.
+
+**Config:**
+```yaml
+backbone:
+  use_mask_prior: true      # Target: fuse previous level prediction
+  use_context_mask: true    # Context: fuse GT masks
+  mask_fusion_type: "additive"
+```
+
+**Files modified:**
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl_v2/patch_icl.py` | Added `extract_mask_patches()`, modified `_forward_level()` to extract mask patches for both target (from `combined_pred`) and context (from `context_out_ds`), modified `forward()` to pass `combined_pred` as `mask_prior`. |
+| `src/models/simple_backbone.py` | Added `LayerNorm2d`, `MaskPriorEncoder`, modified `SimpleBackbone.__init__()` with `use_mask_prior` and `use_context_mask`, modified `forward()` to fuse both target and context mask patches. |
+| `configs/experiment/70_attention.yaml` | Added `use_mask_prior: true`, `use_context_mask: true`, `mask_fusion_type: "additive"`. |
+
+---
+
 ## 2026-02-15: Context-First Sequential Attention
 
 **Problem:** The backbone uses fully bidirectional attention — context and target patches attend equally. No explicit mechanism forces context patches to first establish inter-context relationships before targets read from them. Using attention masks (to enforce context→target flow) disables the Flash SDP backend.
