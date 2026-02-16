@@ -6,10 +6,8 @@ import torch.nn as nn
 from typing import Dict, Optional
 
 class SoftDiceLoss(nn.Module):
-    """Pure PyTorch implementation of Soft Dice Loss.
-    Matches the logic of V3 but without the requirement for custom CUDA extensions.
-    """
-    def __init__(self, p: int = 1, smooth: float = 1.0) -> None:
+    """Pure PyTorch implementation of Soft Dice Loss."""
+    def __init__(self, p: int = 1, smooth: float = 1e-5) -> None:
         super().__init__()
         self.p = p
         self.smooth = smooth
@@ -39,7 +37,7 @@ class SoftDiceBCELoss(nn.Module):
     Provides the global overlap optimization of Dice and the local pixel 
     stability of BCE.
     """
-    def __init__(self, dice_weight: float = 1.0, bce_weight: float = 1.0, smooth: float = 1.0) -> None:
+    def __init__(self, dice_weight: float = 1.0, bce_weight: float = 1.0, smooth: float = 1e-5) -> None:
         super().__init__()
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
@@ -47,17 +45,52 @@ class SoftDiceBCELoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Ensure targets are float for BCE
         targets_float = targets.float()
-        
-        # Clamp logits to prevent extreme values (e.g. -10.0 from aggregator
-        # uncovered fill) from producing huge BCE gradients that cause NaN
-        predictions = predictions.clamp(-6.0, 6.0)
-        
+        # Clamp logits to prevent NaN from extreme aggregator values
+        predictions = predictions.clamp(-10.0, 10.0)
+
         dice_loss = self.dice(predictions, targets_float)
         bce_loss = self.bce(predictions, targets_float)
-        
+
         return (self.dice_weight * dice_loss) + (self.bce_weight * bce_loss)
+
+class SoftDiceFocalLoss(nn.Module):
+    """Hybrid Loss: Soft Dice + Focal Loss.
+    Focal loss down-weights easy background pixels, addressing foreground/background
+    imbalance better than BCE for small structures.
+    """
+    def __init__(
+        self,
+        dice_weight: float = 1.0,
+        focal_weight: float = 1.0,
+        smooth: float = 1e-5,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.dice = SoftDiceLoss(smooth=smooth)
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets_float = targets.float()
+        predictions = predictions.clamp(-10.0, 10.0)
+
+        dice_loss = self.dice(predictions, targets_float)
+
+        # Focal loss (inline to avoid extra sigmoid call)
+        probs = torch.sigmoid(predictions)
+        ce = nn.functional.binary_cross_entropy_with_logits(
+            predictions, targets_float, reduction="none"
+        )
+        p_t = probs * targets_float + (1 - probs) * (1 - targets_float)
+        alpha_t = self.alpha * targets_float + (1 - self.alpha) * (1 - targets_float)
+        focal_loss = (alpha_t * (1 - p_t) ** self.gamma * ce).mean()
+
+        return (self.dice_weight * dice_loss) + (self.focal_weight * focal_loss)
+
 
 class CrossEntropyLoss(nn.Module):
     """Cross-entropy loss wrapper for semantic segmentation."""
@@ -311,8 +344,9 @@ def build_loss_fn(loss_type: str, loss_args: Optional[Dict] = None) -> nn.Module
         ValueError: If loss_type is not supported
     """
     loss_registry = {
-        "softdice": SoftDiceLoss,        # Pure PyTorch version
+        "softdice": SoftDiceLoss,
         "softdiceBCE": SoftDiceBCELoss,
+        "softdiceFocal": SoftDiceFocalLoss,
         "crossentropy": CrossEntropyLoss,
         "binarycrossentropy": BinaryCrossEntropyWithLogits,
         "dice": DiceLoss,

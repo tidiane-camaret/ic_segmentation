@@ -15,6 +15,7 @@ from src.models.patch_icl_v2.metrics import (
     GT_AREA_THRESHOLD,
     compute_all_metrics,
     compute_per_sample_dice,
+    compute_pixel_mae,
 )
 
 
@@ -96,13 +97,15 @@ def _save_sample_images(
         # Build per-level info (backward compat with single-level samples)
         levels_info = sample.get("levels", [])
         if not levels_info:
-            levels_info = [{
-                "target_coords": sample.get("target_coords"),
-                "context_coords": sample.get("context_coords"),
-                "patch_size": sample.get("patch_size", 16),
-                "level_res": sample.get("level_res", 32),
-                "pred_probs": sample.get("pred_probs"),
-            }]
+            levels_info = [
+                {
+                    "target_coords": sample.get("target_coords"),
+                    "context_coords": sample.get("context_coords"),
+                    "patch_size": sample.get("patch_size", 16),
+                    "level_res": sample.get("level_res", 32),
+                    "pred_probs": sample.get("pred_probs"),
+                }
+            ]
 
         n_levels = len(levels_info)
         n_ctx = ctx_in.shape[0] if ctx_in is not None else 0
@@ -126,11 +129,15 @@ def _save_sample_images(
             # --- Top row: target + context images with patch boxes ---
             axes[top_row][0].imshow(img, cmap="gray")
             axes[top_row][0].imshow(gt, cmap="Reds", alpha=0.4)
-            axes[top_row][0].contour(gt, colors='yellow', linewidths=1)
+            axes[top_row][0].contour(gt, colors="yellow", linewidths=1)
             if l_target_coords is not None and l_level_res is not None:
                 draw_patch_boxes(
-                    axes[top_row][0], img, l_target_coords,
-                    l_patch_size, l_level_res, color="lime",
+                    axes[top_row][0],
+                    img,
+                    l_target_coords,
+                    l_patch_size,
+                    l_level_res,
+                    color="lime",
                 )
             axes[top_row][0].set_title(f"Level {li} (res {l_level_res}) - Target")
             axes[top_row][0].axis("off")
@@ -140,7 +147,7 @@ def _save_sample_images(
                 ctx_mask = ctx_out[ci].squeeze().numpy()
                 axes[top_row][1 + ci].imshow(ctx_img, cmap="gray")
                 axes[top_row][1 + ci].imshow(ctx_mask, cmap="Reds", alpha=0.4)
-                axes[top_row][1 + ci].contour(ctx_mask, colors='cyan', linewidths=1)
+                axes[top_row][1 + ci].contour(ctx_mask, colors="cyan", linewidths=1)
                 if (
                     l_context_coords is not None
                     and l_level_res is not None
@@ -149,10 +156,16 @@ def _save_sample_images(
                     try:
                         total_patches = l_context_coords.shape[0]
                         K_per_ctx = total_patches // n_ctx
-                        ci_coords = l_context_coords[ci * K_per_ctx : (ci + 1) * K_per_ctx]
+                        ci_coords = l_context_coords[
+                            ci * K_per_ctx : (ci + 1) * K_per_ctx
+                        ]
                         draw_patch_boxes(
-                            axes[top_row][1 + ci], ctx_img, ci_coords,
-                            l_patch_size, l_level_res, color="cyan",
+                            axes[top_row][1 + ci],
+                            ctx_img,
+                            ci_coords,
+                            l_patch_size,
+                            l_level_res,
+                            color="cyan",
                         )
                     except (IndexError, TypeError, ZeroDivisionError):
                         pass
@@ -167,7 +180,11 @@ def _save_sample_images(
             if l_level_res is not None and l_level_res < gt.shape[0]:
                 gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
                 scale = max(1, gt.shape[0] // l_level_res)
-                gt_ds = F.avg_pool2d(gt_t, kernel_size=scale, stride=scale).squeeze().numpy()
+                gt_ds = (
+                    F.avg_pool2d(gt_t, kernel_size=scale, stride=scale)
+                    .squeeze()
+                    .numpy()
+                )
             else:
                 gt_ds = gt
             axes[bot_row][0].imshow(gt_ds, cmap="gray")
@@ -193,9 +210,10 @@ def _save_sample_images(
                     pp = F.interpolate(
                         pp.unsqueeze(0).unsqueeze(0).float(),
                         size=(gt_ds.shape[0], gt_ds.shape[1]),
-                        mode='bilinear', align_corners=False,
+                        mode="bilinear",
+                        align_corners=False,
                     ).squeeze()
-                pp = pp.numpy() if hasattr(pp, 'numpy') else pp
+                pp = pp.numpy() if hasattr(pp, "numpy") else pp
                 pred_mask = (pp > PRED_THRESHOLD).astype(float)
                 gt_binary = (gt_ds > GT_AREA_THRESHOLD).astype(float)
                 inter = (pred_mask * gt_binary).sum()
@@ -211,7 +229,9 @@ def _save_sample_images(
             if l_refined_probs is not None and n_cols > 3:
                 rp = l_refined_probs.squeeze().numpy()
                 im = axes[bot_row][3].imshow(rp, cmap="hot", vmin=0, vmax=1)
-                axes[bot_row][3].set_title(f"Refined Pred. Probs ({rp.shape[0]}x{rp.shape[1]})")
+                axes[bot_row][3].set_title(
+                    f"Refined Pred. Probs ({rp.shape[0]}x{rp.shape[1]})"
+                )
                 plt.colorbar(im, ax=axes[bot_row][3], fraction=0.046, pad=0.04)
             elif n_cols > 3:
                 axes[bot_row][3].set_title("Refined Pred. Probs (N/A)")
@@ -275,14 +295,16 @@ def _collect_sample_for_viz(
         l_refined = level_out.get("refined_probs")
         if l_refined is not None:
             l_refined = l_refined[i].detach().cpu()
-        levels.append({
-            "target_coords": l_coords,
-            "context_coords": l_ctx_coords,
-            "patch_size": level_out.get("patch_size", 16),
-            "level_res": level_out.get("level_res", 32),
-            "pred_probs": l_pred_probs,
-            "refined_probs": l_refined,
-        })
+        levels.append(
+            {
+                "target_coords": l_coords,
+                "context_coords": l_ctx_coords,
+                "patch_size": level_out.get("patch_size", 16),
+                "level_res": level_out.get("level_res", 32),
+                "pred_probs": l_pred_probs,
+                "refined_probs": l_refined,
+            }
+        )
 
     return {
         "image": images[i].detach().cpu(),
@@ -291,7 +313,9 @@ def _collect_sample_for_viz(
         "pred_probs": pred_probs,
         "dice": dice_val,
         "context_in": context_in[i].detach().cpu() if context_in is not None else None,
-        "context_out": context_out[i].detach().cpu() if context_out is not None else None,
+        "context_out": (
+            context_out[i].detach().cpu() if context_out is not None else None
+        ),
         "levels": levels,
     }
 
@@ -309,6 +333,7 @@ def train_epoch(
     log_every=10,
     save_dir: Optional[Path] = None,
     save_every_n_epochs: int = 5,
+    compute_metrics_every: int = 10,
 ):
     """Run one training epoch."""
     model.train()
@@ -325,8 +350,9 @@ def train_epoch(
 
     # Metrics - dynamically accumulate all loss keys from compute_loss
     from collections import defaultdict
+
     loss_accum = defaultdict(float)  # sums for all compute_loss keys
-    loss_count = defaultdict(int)    # counts (some keys appear conditionally)
+    loss_count = defaultdict(int)  # counts (some keys appear conditionally)
     dice_accum = defaultdict(float)  # per-level dice accumulators
     dice_count = defaultdict(int)
     total_local_dice = 0.0
@@ -335,6 +361,7 @@ def train_epoch(
     total_local_softdice = 0.0
     total_final_softdice = 0.0
     total_context_softdice = 0.0
+    total_final_pixel_mae = 0.0
     context_dice_count = 0
     label_dice_scores = {}  # Per-label tracking
     label_samples = {}  # Store one sample per label for wandb image logging
@@ -383,48 +410,65 @@ def train_epoch(
         losses = unwrapped_model.compute_loss(outputs, labels)
         loss = losses["total_loss"]
 
-        # Compute Dice scores using centralized metrics
-        with torch.no_grad():
-            metrics = compute_all_metrics(outputs, labels)
+        # Compute Dice scores periodically (not every batch to save compute)
+        should_compute_metrics = (idx % compute_metrics_every == 0) or (
+            idx == len(train_loader) - 1
+        )
+        if should_compute_metrics:
+            with torch.no_grad():
+                metrics = compute_all_metrics(outputs, labels)
 
-            # Accumulate metrics
-            total_local_dice += metrics.get('local_dice', torch.tensor(0.0)).item()
-            total_local_softdice += metrics.get('local_soft_dice', torch.tensor(0.0)).item()
-            total_final_dice += metrics.get('final_dice', torch.tensor(0.0)).item()
-            total_final_softdice += metrics.get('final_soft_dice', torch.tensor(0.0)).item()
+                # Accumulate metrics
+                total_local_dice += metrics.get("local_dice", torch.tensor(0.0)).item()
+                total_local_softdice += metrics.get(
+                    "local_soft_dice", torch.tensor(0.0)
+                ).item()
+                total_final_dice += metrics.get("final_dice", torch.tensor(0.0)).item()
+                total_final_softdice += metrics.get(
+                    "final_soft_dice", torch.tensor(0.0)
+                ).item()
+                total_final_pixel_mae += metrics.get(
+                    "final_pixel_mae", torch.tensor(0.0)
+                ).item()
 
-            if 'context_dice' in metrics:
-                total_context_dice += metrics['context_dice'].item()
-                total_context_softdice += metrics['context_soft_dice'].item()
-                context_dice_count += 1
+                if "context_dice" in metrics:
+                    total_context_dice += metrics["context_dice"].item()
+                    total_context_softdice += metrics["context_soft_dice"].item()
+                    context_dice_count += 1
 
-            # Per-level dice accumulation
-            level_outputs = outputs.get("level_outputs", [])
-            for li in range(len(level_outputs)):
-                for suffix in ['dice', 'soft_dice']:
-                    key = f"level_{li}_{suffix}"
-                    if key in metrics:
-                        dice_accum[key] += metrics[key].item()
-                        dice_count[key] += 1
+                # Per-level dice accumulation
+                level_outputs = outputs.get("level_outputs", [])
+                for li in range(len(level_outputs)):
+                    for suffix in ["dice", "soft_dice"]:
+                        key = f"level_{li}_{suffix}"
+                        if key in metrics:
+                            dice_accum[key] += metrics[key].item()
+                            dice_count[key] += 1
 
-            # Per-sample dice for per-label tracking
-            per_sample_dice = compute_per_sample_dice(outputs, labels)
-            batch_label_ids = batch.get("label_ids") or batch.get(
-                "label_id", [None] * images.shape[0]
-            )
-            for i in range(images.shape[0]):
-                label_id = batch_label_ids[i] if batch_label_ids else "unknown"
-                dice_val = per_sample_dice[i].item()
-                if label_id not in label_dice_scores:
-                    label_dice_scores[label_id] = []
-                label_dice_scores[label_id].append(dice_val)
+                # Per-sample dice for per-label tracking
+                per_sample_dice = compute_per_sample_dice(outputs, labels)
+                batch_label_ids = batch.get("label_ids") or batch.get(
+                    "label_id", [None] * images.shape[0]
+                )
+                for i in range(images.shape[0]):
+                    label_id = batch_label_ids[i] if batch_label_ids else "unknown"
+                    dice_val = per_sample_dice[i].item()
+                    if label_id not in label_dice_scores:
+                        label_dice_scores[label_id] = []
+                    label_dice_scores[label_id].append(dice_val)
 
-                # Store one sample per label for image logging (wandb or disk)
-                should_save = (use_wandb or save_dir is not None) and is_main
-                if should_save and label_id not in label_samples:
-                    label_samples[label_id] = _collect_sample_for_viz(
-                        i, images, labels, outputs, context_in, context_out, dice_val
-                    )
+                    # Store one sample per label for image logging (wandb or disk)
+                    should_save = (use_wandb or save_dir is not None) and is_main
+                    if should_save and label_id not in label_samples:
+                        label_samples[label_id] = _collect_sample_for_viz(
+                            i,
+                            images,
+                            labels,
+                            outputs,
+                            context_in,
+                            context_out,
+                            dice_val,
+                        )
 
         # Backward
         scaled_loss = loss / grad_accumulate_steps
@@ -444,24 +488,39 @@ def train_epoch(
         # Track metrics
         # Accumulate all loss keys dynamically
         for key, val in losses.items():
-            v = val.item() if hasattr(val, 'item') else float(val)
+            v = val.item() if hasattr(val, "item") else float(val)
             loss_accum[key] += v
             loss_count[key] += 1
 
         # Update progress bar
         n_batches = idx + 1
-        avg_loss = loss_accum['total_loss'] / loss_count['total_loss'] if loss_count['total_loss'] else 0
+        avg_loss = (
+            loss_accum["total_loss"] / loss_count["total_loss"]
+            if loss_count["total_loss"]
+            else 0
+        )
+        # Use metric count for averaging since we don't compute every batch
+        metric_batches = (idx // compute_metrics_every) + 1
         pbar.set_postfix(
             {
                 "loss": f"{avg_loss:.4f}",
-                "dice": f"{total_final_dice / n_batches:.4f}",
-                "sdice": f"{total_final_softdice / n_batches:.4f}",
+                "mae": (
+                    f"{total_final_pixel_mae / metric_batches:.4f}"
+                    if metric_batches > 0
+                    else "N/A"
+                ),
+                "sdice": (
+                    f"{total_final_softdice / metric_batches:.4f}"
+                    if metric_batches > 0
+                    else "N/A"
+                ),
             }
         )
 
         # Log to wandb
         if use_wandb and is_main and idx % log_every == 0:
             global_step = epoch * len(train_loader) + idx
+            metric_batches = (idx // compute_metrics_every) + 1
             ctx_dice_avg = (
                 total_context_dice / context_dice_count
                 if context_dice_count > 0
@@ -473,11 +532,22 @@ def train_epoch(
                 else 0.0
             )
             log_dict = {
-                "train_batch/local_dice": total_local_dice / n_batches,
-                "train_batch/final_dice": total_final_dice / n_batches,
+                "train_batch/local_dice": (
+                    total_local_dice / metric_batches if metric_batches > 0 else 0
+                ),
+                "train_batch/final_dice": (
+                    total_final_dice / metric_batches if metric_batches > 0 else 0
+                ),
                 "train_batch/context_dice": ctx_dice_avg,
-                "train_batch/local_soft_dice": total_local_softdice / n_batches,
-                "train_batch/final_soft_dice": total_final_softdice / n_batches,
+                "train_batch/local_soft_dice": (
+                    total_local_softdice / metric_batches if metric_batches > 0 else 0
+                ),
+                "train_batch/final_soft_dice": (
+                    total_final_softdice / metric_batches if metric_batches > 0 else 0
+                ),
+                "train_batch/final_pixel_mae": (
+                    total_final_pixel_mae / metric_batches if metric_batches > 0 else 0
+                ),
                 "train_batch/context_soft_dice": ctx_softdice_avg,
                 "global_step": global_step,
             }
@@ -492,18 +562,32 @@ def train_epoch(
 
         # Print progress
         if print_every and idx % print_every == 0 and is_main:
-            avg_loss = loss_accum['total_loss'] / loss_count['total_loss'] if loss_count['total_loss'] else 0
+            avg_loss = (
+                loss_accum["total_loss"] / loss_count["total_loss"]
+                if loss_count["total_loss"]
+                else 0
+            )
+            metric_batches = (idx // compute_metrics_every) + 1
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
                 f"Loss: {avg_loss:.5f} | "
-                f"PatchDice: {total_local_dice / n_batches:.5f} | "
-                f"FinalDice: {total_final_dice / n_batches:.5f} | "
-                f"SoftDice: {total_final_softdice / n_batches:.5f}"
+                f"PatchDice: {total_local_dice / metric_batches:.5f} | "
+                f"FinalDice: {total_final_dice / metric_batches:.5f} | "
+                f"SoftDice: {total_final_softdice / metric_batches:.5f}"
             )
 
         del outputs, losses
 
-    n = len(train_loader)
+    # Use actual number of metric computations for final averaging
+    n_metric_computations = len(
+        [
+            i
+            for i in range(len(train_loader))
+            if i % compute_metrics_every == 0 or i == len(train_loader) - 1
+        ]
+    )
+    n_metric_computations = max(n_metric_computations, 1)  # Avoid division by zero
+
     ctx_dice_final = (
         total_context_dice / context_dice_count if context_dice_count > 0 else 0.0
     )
@@ -522,20 +606,29 @@ def train_epoch(
         and label_samples
         and (epoch % save_every_n_epochs == 0)
     ):
-        _save_sample_images(label_samples, save_dir, epoch, prefix="train", max_samples=len(label_samples))
+        _save_sample_images(
+            label_samples,
+            save_dir,
+            epoch,
+            prefix="train",
+            max_samples=len(label_samples),
+        )
 
     # Build result dict from all accumulated loss keys
     result = {key: loss_accum[key] / loss_count[key] for key in loss_accum}
-    # Add dice metrics
-    result.update({
-        "local_dice": total_local_dice / n,
-        "final_dice": total_final_dice / n,
-        "context_dice": ctx_dice_final,
-        "local_soft_dice": total_local_softdice / n,
-        "final_soft_dice": total_final_softdice / n,
-        "context_soft_dice": ctx_softdice_final,
-        "per_label": label_avg_dice,
-    })
+    # Add dice metrics (averaged over actual metric computation batches)
+    result.update(
+        {
+            "local_dice": total_local_dice / n_metric_computations,
+            "final_dice": total_final_dice / n_metric_computations,
+            "context_dice": ctx_dice_final,
+            "local_soft_dice": total_local_softdice / n_metric_computations,
+            "final_soft_dice": total_final_softdice / n_metric_computations,
+            "final_pixel_mae": total_final_pixel_mae / n_metric_computations,
+            "context_soft_dice": ctx_softdice_final,
+            "per_label": label_avg_dice,
+        }
+    )
     # Add per-level dice metrics
     for key in dice_accum:
         if dice_count[key] > 0:
@@ -562,6 +655,7 @@ def validate(
     )
 
     from collections import defaultdict
+
     dice_accum = defaultdict(float)
     dice_count = defaultdict(int)
     total_loss = 0.0
@@ -571,6 +665,7 @@ def validate(
     total_local_softdice = 0.0
     total_final_softdice = 0.0
     total_context_softdice = 0.0
+    total_final_pixel_mae = 0.0
     context_dice_count = 0
 
     # Per-case tracking
@@ -624,26 +719,35 @@ def validate(
             labels_ds = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
             loss = unwrapped_model.aggreg_criterion(last_pred, labels_ds)
         else:
-            loss = unwrapped_model.aggreg_criterion(outputs["final_logit"], labels.float())
+            loss = unwrapped_model.aggreg_criterion(
+                outputs["final_logit"], labels.float()
+            )
         total_loss += loss.item()
 
         # Compute all dice metrics using centralized function
         metrics = compute_all_metrics(outputs, labels)
 
-        total_local_dice += metrics.get('local_dice', torch.tensor(0.0)).item()
-        total_local_softdice += metrics.get('local_soft_dice', torch.tensor(0.0)).item()
-        total_final_dice += metrics.get('final_dice', torch.tensor(0.0)).item()
-        total_final_softdice += metrics.get('final_soft_dice', torch.tensor(0.0)).item()
+        total_local_dice += metrics.get("local_dice", torch.tensor(0.0)).item()
+        total_local_softdice += metrics.get("local_soft_dice", torch.tensor(0.0)).item()
+        total_final_dice += metrics.get("final_dice", torch.tensor(0.0)).item()
+        total_final_softdice += metrics.get("final_soft_dice", torch.tensor(0.0)).item()
+        total_final_pixel_mae += metrics.get("final_pixel_mae", torch.tensor(0.0)).item()
 
-        if 'context_dice' in metrics:
-            total_context_dice += metrics['context_dice'].item()
-            total_context_softdice += metrics['context_soft_dice'].item()
+        if "context_dice" in metrics:
+            total_context_dice += metrics["context_dice"].item()
+            total_context_softdice += metrics["context_soft_dice"].item()
             context_dice_count += 1
 
         # Per-level dice accumulation
         level_outputs = outputs.get("level_outputs", [])
         for li in range(len(level_outputs)):
-            for suffix in ['dice', 'soft_dice', 'refined_probs_dice', 'refined_probs_soft_dice']:
+            for suffix in [
+                "dice",
+                "soft_dice",
+                "pixel_mae",
+                "refined_probs_dice",
+                "refined_probs_soft_dice",
+            ]:
                 key = f"level_{li}_{suffix}"
                 if key in metrics:
                     dice_accum[key] += metrics[key].item()
@@ -651,7 +755,9 @@ def validate(
 
         # Per-case tracking
         per_sample_dice = compute_per_sample_dice(outputs, labels)
-        batch_case_ids = batch.get("target_case_ids") or batch.get("case_id", [None] * images.shape[0])
+        batch_case_ids = batch.get("target_case_ids") or batch.get(
+            "case_id", [None] * images.shape[0]
+        )
         batch_label_ids = batch.get("label_ids") or batch.get(
             "label_id", [None] * images.shape[0]
         )
@@ -664,7 +770,12 @@ def validate(
             axis = batch_axes[i] if batch_axes else None
             dice_val = per_sample_dice[i].item()
             case_results.append(
-                {"case_id": case_id, "label_id": label_id, "axis": axis, "dice": dice_val}
+                {
+                    "case_id": case_id,
+                    "label_id": label_id,
+                    "axis": axis,
+                    "dice": dice_val,
+                }
             )
             if label_id not in label_dice_scores:
                 label_dice_scores[label_id] = []
@@ -681,7 +792,7 @@ def validate(
         pbar.set_postfix(
             {
                 "loss": f"{total_loss / n_batches:.4f}",
-                "dice": f"{total_final_dice / n_batches:.4f}",
+                "mae": f"{total_final_pixel_mae / n_batches:.4f}",
                 "sdice": f"{total_final_softdice / n_batches:.4f}",
             }
         )
@@ -698,7 +809,6 @@ def validate(
         for label_id, scores in label_dice_scores.items()
     }
 
-
     # Save images to disk if save_dir is provided
     if save_dir is not None and is_main and label_samples:
         _save_sample_images(
@@ -714,6 +824,7 @@ def validate(
         "per_label": label_avg_dice,
         "local_soft_dice": total_local_softdice / n,
         "final_soft_dice": total_final_softdice / n,
+        "final_pixel_mae": total_final_pixel_mae / n,
         "context_soft_dice": ctx_softdice_final,
     }
     # Add per-level dice metrics

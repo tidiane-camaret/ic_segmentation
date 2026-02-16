@@ -27,6 +27,7 @@ uv run accelerate launch \
     --num_processes=2 \
     --mixed_precision=fp16 \
     scripts/train.py \
+    +max_labels=100 \
     experiment=70_attention \
     cluster=dlclarge \
-    #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-14_magnetic-balloon-244/best_model.pt
+    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt

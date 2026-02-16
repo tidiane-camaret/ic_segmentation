@@ -111,10 +111,9 @@ class ICLEncoder(nn.Module):
 
     def train(self, mode: bool = True):
         """Keep in eval mode if frozen."""
-        super().train(mode)
-        if self._frozen:
-            self.eval()
-        return self
+        if self._frozen and mode:
+            return super().train(False)
+        return super().train(mode)
 
     def _resize_feat(self, feat: torch.Tensor) -> torch.Tensor:
         """Resize feature map to output_grid_size."""

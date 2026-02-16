@@ -1,752 +1,264 @@
-# Research Logs
+# Research Log
 
-## 2026-02-10: Center-based patch sampling + train/val patch counts
+Consolidated project log. Previous logs in `logs.md` and `configs/experiment/logs.md` have been merged here.
 
-### Center-based sampling (border patches)
+---
 
-**Problem:** Patches could only be sampled fully inside the image. For a 32×32 feature map with patch_size=8, only 25×25=625 valid positions existed, under-representing image borders.
+## 2026-02-15: Context-First Sequential Attention
 
-**Solution:** Allow any patch whose **center** is inside the image. Top-left coordinate now ranges from `-ps//2` to `H - 1 - ps//2`, giving H×W valid positions (32×32=1024).
+**Problem:** The backbone uses fully bidirectional attention — context and target patches attend equally. No explicit mechanism forces context patches to first establish inter-context relationships before targets read from them. Using attention masks (to enforce context→target flow) disables the Flash SDP backend.
+
+**Solution:** Two-stage sequential attention, both stages fully bidirectional (Flash-compatible):
+1. **Stage 1 (context-only):** Context patches self-attend through dedicated `context_layers` with separate `context_registers`. This enriches context representations with inter-example relationships.
+2. **Stage 2 (joint):** All patches (target + enriched context) attend together through the main `layers`, as before.
+
+When `num_context_layers: 0` (default), behavior is identical to before. The context stage is also skipped when there are no context patches or `num_target_patches` is not provided.
+
+**Config:**
+```yaml
+backbone:
+  num_context_layers: 1  # 0 = disabled (backward compatible)
+  num_layers: 2          # Joint stage layers (unchanged)
+```
+
+**Cost:** With `embed_dim=256`, one context layer adds ~530K params (~50K at dim=64). Negligible memory overhead since context-only attention operates on fewer tokens than the joint stage.
+
+**Bugfix:** Fixed infinite recursion in `ICLEncoder.train()` when `freeze=True` — `self.eval()` called `self.train(False)` which called `self.eval()` again.
+
+**Files modified:**
+| File | Changes |
+|------|---------|
+| `src/models/simple_backbone.py` | `CrossPatchAttention`: added `num_context_layers`, `context_layers`, `context_registers`, context-first stage in `forward()`. `SimpleBackbone`: passes `num_context_layers` and `num_target_patches` through. |
+| `src/models/patch_icl_v2/patch_icl.py` | Reads `num_context_layers` from config, passes `num_target_patches=K` to backbone. |
+| `src/models/icl_encoder.py` | Fixed `train()` recursion bug when frozen. |
+| `configs/experiment/70_attention.yaml` | Added `num_context_layers: 1`. |
+
+---
+
+## 2026-02-14: Unmasked Flash Attention + torch.compile
+
+**Changes to `simple_backbone.py`:**
+1. **Removed attention mask** — Previously blocked context→target attention (~17% of matrix) using a float mask with `-inf`, which disabled Flash SDP. Now uses full bidirectional attention, enabling Flash Attention backend.
+2. **Optimized RoPE** — Replaced manual sin/cos rotation with `torch.view_as_complex` multiplication (~1.3x faster). Removed `.item()` calls that break `torch.compile` graphs.
+3. **Added `torch.compile`** — New `backbone.compile: true` config flag (default false) compiles encoder, attention, and decoder submodules after DDP wrapping.
+
+**Config**: `target_self_attention` is now ignored (kept for backward compat). Set `backbone.compile: true` to enable compilation.
+
+---
+
+## 2026-02-11: Multi-Level Cascaded Training Support
+
+Refactored PatchICL from single-level to multi-level cascaded architecture.
+
+- `PatchICL.__init__`: Per-level samplers (`nn.ModuleList`), aggregators, oracle configs. All levels share `patch_size` (backbone constraint).
+- `_forward_level()`: Processes a single resolution level (sampling, feature extraction, backbone, aggregation).
+- `forward()`: Loops coarse-to-fine. Level 0 uses uniform/oracle weights; subsequent levels use `sigmoid(prev_level_pred)` as sampling weights. `detach_between_levels` (default True).
+- `compute_loss()`: Per-level losses with configurable `level_weights`. Averaged across levels for logging.
+- New config: `configs/experiment/60_2_levels.yaml` (resolution 16 + 32, 8+12 patches).
+
+**Design decisions:** Single backward after all levels (losses accumulated). Detach between levels by default (memory efficient, no gradient benefit since sampling is non-differentiable).
+
+---
+
+## 2026-02-10: Center-Based Patch Sampling + Train/Val Patch Counts
+
+### Center-based sampling
+
+**Problem:** Patches could only be sampled fully inside the image. For a 32x32 feature map with patch_size=8, only 25x25=625 valid positions existed, under-representing borders.
+
+**Solution:** Allow any patch whose **center** is inside the image. Top-left ranges from `-ps//2` to `H - 1 - ps//2`, giving HxW valid positions.
 
 **Implementation:**
-- **Samplers** (`sampling.py`): Pad image/labels/weights by `ps//2` before and `ps - ps//2 - 1` after. Sample from padded space, then convert coordinates back to original space (can be negative).
-- **Validity mask**: Binary `[B, K, 1, ps, ps]` tensor tracking which pixels are real (1) vs padding (0). Concatenated with labels during augmentation so rotation/flip applies consistently, then split back.
-- **Aggregator** (`aggregate.py`): Two-sided coordinate clipping handles negative coords — computes overlap between patch and output image.
-- **Loss** (`patch_icl.py`): `_masked_patch_loss()` sets invalid pixels to logit=-100 / label=0, making loss contribution ≈0 for any criterion (BCE, dice).
-- **Feature extraction**: `extract_patch_features()` already clamps coords to `[0, max_start]`, so negative coords safely map to edge features.
+- **Samplers** (`sampling.py`): Pad image/labels/weights. Sample from padded space, convert coords back (can be negative).
+- **Validity mask**: `[B, K, 1, ps, ps]` tracking real vs padding pixels. Concatenated with labels during augmentation for consistent transforms.
+- **Aggregator** (`aggregate.py`): Two-sided coordinate clipping handles negative coords.
+- **Loss** (`patch_icl.py`): `_masked_patch_loss()` sets invalid pixels to logit=-100 / label=0.
 
 ### Train/val patch counts
 
-**Problem:** Fixed `num_patches` for both training and validation. Want fewer patches during training (faster, regularization) and more during validation (better coverage).
+Added `num_patches_val` per level config. `ContinuousSampler` picks K based on `self.training`. Defaults to `num_patches` if omitted.
 
-**Solution:** Added `num_patches_val` per level config. `ContinuousSampler` picks based on `self.training`. Defaults to `num_patches` if omitted.
+---
 
-```yaml
-levels:
-  - resolution: 32
-    patch_size: 8
-    num_patches: 16        # Training
-    num_patches_val: 64    # Validation (defaults to num_patches)
-```
+## 2026-02-09: Unified Soft GT Downsampling (max_pool -> avg_pool)
 
-Downstream code already handles variable K via `K = patches.shape[1]`.
+**Problem:** GT masks downsampled inconsistently — `max_pool2d` (dilated), `F.interpolate` nearest (misses small FG), and `avg_pool2d > 0.25` (metrics) in three different places. Conflicting supervision.
 
-### Files modified
+**Solution:** All GT downsampling now uses `avg_pool2d`, producing soft [0, 1] area-fraction targets throughout. `SoftDiceBCE` handles continuous targets natively. Consistent with existing dice metrics.
 
-| File | Changes |
-|------|---------|
-| `src/models/patch_icl_v2/sampling.py` | Both samplers: pad inputs, create validity map, convert coords to original space, augment validity with labels. `ContinuousSampler`: added `num_patches_val`, picks K based on `self.training`. |
-| `src/models/patch_icl_v2/aggregate.py` | Two-sided coordinate clipping in scatter loop (handles negative h, w). |
-| `src/models/patch_icl_v2/patch_icl.py` | Thread validity through `_select_context_patches` and `forward`. `_masked_patch_loss()` helper. Read `num_patches_val` from level config, pass to `create_sampler`. |
-| `configs/experiment/52_continuous_sampling.yaml` | Added `num_patches_val: 64`. |
+---
 
-## 2026-02-09: Unified soft GT downsampling (max_pool → avg_pool)
+## 2026-02-06: Train/Val Dice Gap Analysis
 
-### Problem
+**Problem:** Train dice 0.3, val dice 0.1 (3x gap).
 
-GT masks were downsampled inconsistently across the pipeline — three different methods in different places:
+**Root causes identified:**
+1. Warmup bug: warmup_epochs=10 with num_epochs=10 (model never reached full LR)
+2. SlidingWindowSampler ignores `weights` — oracle settings have no effect
+3. Low context size (1 example)
+4. Context loss disabled
+5. No patch-level augmentation
+6. Train/val use different organs (by design — ICL generalization test)
 
-| Location | Method | Result |
-|----------|--------|--------|
-| `_downsample_mask()` (sampling weights + patch labels) | `max_pool2d` | Binary, dilated — any FG in 8×8 block → FG |
-| `compute_loss()` target aggreg loss | `F.interpolate` nearest | Picks 1 pixel per block, can miss small FG |
-| Dice metrics in `train_utils.py` | `avg_pool2d` > 0.25 | Area-fraction threshold |
+**New config `exp_11_improved.yaml`:** 100 epochs, warmup=5, context_size=3, continuous sampler, oracle train, 90-deg rotation + flips, context loss=0.5.
 
-This caused conflicting supervision: patch loss trained against dilated binary GT while the aggreg loss (after nearest downsample) could miss small structures entirely.
+---
 
-### Solution
+## 2026-02-05: Codebase Simplification + Architecture Experiments
 
-Replaced all GT downsampling with `avg_pool2d`, producing soft [0, 1] area-fraction targets throughout:
+### Codebase simplification (v1 -> v2)
 
-1. **`_downsample_mask()`**: `max_pool2d` → `avg_pool2d`. Affects sampling weights and patch labels (now soft).
-2. **Target aggreg loss** in `compute_loss()`: `F.interpolate(nearest)` → `F.avg_pool2d` from full-res labels.
-3. **Context aggreg loss** in `compute_loss()`: Was using `context_out_ds` (max_pool2d from forward pass). Now stores full-res context masks (`context_labels_fullres`) and recomputes soft targets with `avg_pool2d`.
+Reduced core code by 61% (4163 -> 1607 lines). Created `src/models/patch_icl_v2/` with only the samplers and aggregators actually used. Moved originals to `patch_icl_v1/`.
 
-### Rationale
+| Component | Before | After |
+|-----------|--------|-------|
+| patch_icl.py | 1209 | 496 |
+| sampling.py | 1272 | 345 |
+| aggregate.py | 491 | 173 |
+| train.py | 442 | 248 |
+| train_utils.py | 749 | 345 |
 
-- `avg_pool2d` preserves the true foreground area fraction per 8×8 block (e.g., 0.3 = 30% coverage)
-- `SoftDiceBCE` already handles continuous targets — BCE acts as label smoothing at boundaries, Soft Dice compares predicted probability against true coverage
-- Consistent with how dice metrics are already computed in `train_utils.py`
-- `max_pool2d` was too aggressive: inflated small structures and blurred boundaries by marking entire blocks as foreground
+Removed: UniformSampler, DeterministicTopKSampler, GumbelSoftmaxSampler, ConfidenceAggregator, LearnedAggregator, LearnedCombineAggregator, 3D dataset branches, SegFormer3D.
 
-### Impact on pipeline
+### Architecture experiments
 
-All GT downsampling is now `avg_pool2d`:
-- **Sampling weights**: soft values — ContinuousSampler will prefer dense FG regions (to be revisited)
-- **Patch labels**: soft [0, 1] — patch loss learns proportional coverage
-- **Aggreg loss GT**: soft [0, 1] — consistent with patch labels
-- **Dice metrics**: unchanged (already used `avg_pool2d`)
+Iterative experiments with baseline val_final_dice ~0.1:
 
-### Files modified
+| Experiment | Key Change | val_final_dice | Conclusion |
+|:-----------|:-----------|:---------------|:-----------|
+| Exp 1: Context Loss | Enabled context loss (0.5) | ~0.087 | Failure — overfit |
+| Exp 2: Shallow Backbone | 4 -> 2 attention layers | ~0.16 | Success — less overfitting |
+| Exp 3: Shallow + No Skips | 2 layers + no skip connections | ~0.25 | Major success — information bottleneck |
 
-| File | Changes |
-|------|---------|
-| `src/models/patch_icl_v2/patch_icl.py` | `_downsample_mask()`: max_pool → avg_pool; `compute_loss()`: avg_pool for target + context aggreg loss; forward: store `context_labels_fullres` |
+**Key finding:** Removing skip connections forces the decoder to rely solely on attention output, creating a bottleneck that produces better context-aware representations. This is now the default architecture.
+
+### Train/val gap investigation
+
+| Config | Train Dice | Val Dice | Gap |
+|--------|------------|----------|-----|
+| exp_03 (no skips + ctx loss) | 0.40 | 0.07 | 0.33 |
+| exp_03 (train labels for val) | 0.15 | 0.08 | 0.07 |
+
+Using same labels for train/val doesn't close the gap — the issue is not purely organ diversity. Likely causes: model memorizes spatial patch positions, sliding window creates train-specific patterns.
+
+---
 
 ## 2026-02-04: Feature Extraction Experiments Infrastructure
 
-### Overview
+Added experiment infrastructure in `Experiments/feature_extraction/` for comparing feature extractors:
+- **Layer comparison**: MedDINO layers [2, 5, 8, 11]
+- **Multi-layer fusion**: average, learned_weighted, concat_proj
+- **MedSAM v1**: Alternative extractor (ViT-B, 1.5M medical images)
 
-Added experiment infrastructure for comparing different feature extraction strategies for PatchICL:
-- Layer comparison: Compare MedDINO layers [2, 5, 8, 11]
-- Multi-layer fusion: Combine features with average, learned_weighted, or concat_proj
-- MedSAM v1 integration: Alternative feature extractor comparison
+Added `MultiLayerFeatureExtractor` to `meddino_extractor.py`. Fixed `feature_grid_size` default: 16 -> 14 (correct for MedDINO 14x14 grid).
 
-### New Files Created
-
-**Experiment Package (`Experiments/feature_extraction/`):**
-- `__init__.py`: Package documentation
-- `config.py`: Experiment configurations (LayerComparisonConfig, MultiLayerFusionConfig, MedSAMConfig)
-- `layer_comparison.py`: Compare single-layer features from different MedDINO layers
-- `multilayer_fusion.py`: Test fusion strategies for combining multiple layers
-- `medsam_extractor.py`: MedSAM v1 feature extractor with adapter for MedDINO compatibility
-- `run_experiments.py`: Main runner script for all experiments
-- `analysis.py`: Results visualization and comparison tables
-
-### Core File Modifications
-
-**`src/models/meddino_extractor.py`:**
-- Added `MultiLayerFeatureExtractor` class for fusing features from multiple layers
-- Supports fusion strategies: "average", "learned_weighted", "concat_proj"
-- Added `create_multilayer_extractor()` factory function
-
-**`src/models/patch_icl.py`:**
-- Fixed `feature_grid_size` default: 16 → 14 (correct for MedDINO 14×14 grid at 256×256)
-
-**`src/dataloaders/totalseg2d_dataloader.py`:**
-- Added `feature_layer_idx` parameter to control which MedDINO layer to load
-- Added `feature_layers` parameter for multi-layer loading
-- Updated `_load_features()` to support single-layer and multi-layer modes
-- Updated `get_dataloader()` to pass through new parameters
-
-### Usage
-
-```bash
-# Run layer comparison experiment
-python Experiments/feature_extraction/layer_comparison.py \
-    --checkpoint /path/to/model.pt \
-    --layers 2 5 8 11 \
-    --context-size 3
-
-# Run multi-layer fusion experiment
-python Experiments/feature_extraction/multilayer_fusion.py \
-    --checkpoint /path/to/model.pt \
-    --strategies average learned_weighted concat_proj
-
-# Run MedSAM comparison (requires: pip install git+https://github.com/bowang-lab/MedSAM.git)
-python Experiments/feature_extraction/medsam_extractor.py \
-    --checkpoint /path/to/model.pt
-
-# Run all experiments
-python Experiments/feature_extraction/run_experiments.py \
-    --checkpoint /path/to/model.pt \
-    --output-dir ./results/feature_extraction
-
-# Analyze results and generate plots
-python Experiments/feature_extraction/analysis.py \
-    --results-dir ./results/feature_extraction
-```
-
-### Experiment Details
-
-**Layer Comparison:**
-- Tests features from transformer layers 2, 5, 8, 11
-- Layer 2: Early (edges, textures)
-- Layer 5: Mid (patterns, structures)
-- Layer 8: Late-mid (object parts)
-- Layer 11: Final (semantic features, current default)
-
-**Multi-Layer Fusion:**
-- Average: Simple mean across layers
-- Learned weighted: Trainable softmax weights per layer
-- Concat + projection: Concatenate features + linear projection
-
-**MedSAM v1:**
-- Uses MedSAM ViT-B encoder (pre-trained on 1.5M medical images)
-- Adapts 64×64×256 features to 14×14×768 for compatibility
-- Requires separate installation from HuggingFace
-
-### Files Modified Summary
-
-| File | Changes |
-|------|---------|
-| `src/models/meddino_extractor.py` | Added MultiLayerFeatureExtractor, create_multilayer_extractor |
-| `src/models/patch_icl.py` | Fixed feature_grid_size default (16→14) |
-| `src/dataloaders/totalseg2d_dataloader.py` | Added feature_layer_idx, feature_layers params |
+---
 
 ## 2026-02-03: Refinement Bug Fixes + Sampling Improvements
 
-### Overview
+Fixed 4 critical bugs in iterative refinement:
 
-Fixed critical bugs in the iterative refinement mechanism and improved patch sampling to better handle boundary regions.
+1. **Confident predictions destroyed**: Uncovered regions filled with -10 logits. Fix: `prev_pred_for_agg` + `combine_mode: "coverage"` preserves uncovered regions.
+2. **False confidence**: Logits < -5 had sigmoid ~ 0, interpreted as "confident background". Fix: Detect and mark as high uncertainty.
+3. **Double-counting gradients**: Previous predictions flowed gradients through refinement. Fix: Detach before refinement.
+4. **Resolution ping-pong**: Uncertainty upsampled then immediately downsampled. Fix: Pass at level resolution.
 
-### Refinement Fixes
+**Sampling improvement:** Changed weight pooling from `avg_pool2d` to `max_pool2d` — boundary patches (50% FG) now score equally to interior patches (100% FG).
 
-**Problem 1: Confident predictions destroyed during refinement**
-
-When refinement sampled only uncertain regions, confident regions got no patches. The aggregator filled uncovered regions with -10 logits (≈0 probability), destroying good predictions from pass 1.
-
-**Fix:** Added `prev_pred_for_agg` parameter to `PatchICL_Level.forward()` that passes the previous prediction to the aggregator. Combined with `combine_mode: "coverage"`, uncovered regions now preserve their previous predictions.
-
-```python
-# In refinement loop
-prev_level_pred = level_out['pred'].detach()
-level_out = level(..., prev_pred_for_agg=prev_level_pred)
-
-# In aggregator with combine_mode="coverage"
-return torch.where(covered, aggregated, prev_pred)  # Preserve uncovered
-```
-
-**Problem 2: Uncovered regions appear "falsely confident"**
-
-Regions filled with -10 logits had sigmoid ≈ 0, which the uncertainty computation interpreted as "confident background" (uncertainty ≈ 0). These regions were never resampled.
-
-**Fix:** Detect logits < -5 and mark as high uncertainty:
-```python
-uncovered_mask = (pred < -5).any(dim=1, keepdim=True)
-uncertainty = torch.where(uncovered_mask, torch.ones_like(uncertainty), uncertainty)
-```
-
-**Problem 3: Wrong gradient flow (double-counting)**
-
-Previous predictions flowed gradients through refinement passes, causing confident regions to be counted in loss multiple times.
-
-**Fix:** Detach previous prediction before refinement:
-```python
-prev_level_pred = level_out['pred'].detach()
-```
-
-**Problem 4: Wasteful resolution ping-pong**
-
-Uncertainty was upsampled to full resolution, then immediately downsampled back in the level.
-
-**Fix:** Pass uncertainty at level resolution directly (level's `downsample()` handles it).
-
-### Config Changes
-
-Updated `configs/experiment/patch_icl_v2.yaml`:
-```yaml
-aggregator:
-  combine_mode: "coverage"  # Essential for refinement (was "average")
-  min_coverage: 0.01        # Meaningful threshold (was 0.000001)
-```
-
-### Sampling Improvements
-
-**Problem: Boundary patches under-sampled**
-
-`avg_pool2d` computed mean weight per patch, giving interior patches (all foreground) higher scores than boundary patches (mixed foreground/background). Boundaries are critical for segmentation accuracy but were under-sampled.
-
-| Patch Location | Avg Score | Max Score |
-|----------------|-----------|-----------|
-| Fully inside   | 1.0       | 1.0       |
-| Boundary (50%) | 0.5       | 1.0       |
-| Outside        | 0.0       | 0.0       |
-
-**Fix:** Changed to `max_pool2d` in `sampling.py`:
-```python
-# Before: avg_pool favors interior patches
-scores_map = F.avg_pool2d(weights, kernel_size=ps, stride=stride)
-
-# After: max_pool gives boundaries equal opportunity
-scores_map = F.max_pool2d(weights, kernel_size=ps, stride=stride)
-```
-
-### Output Saving Improvements
-
-**Problem:** Refinement passes were saved as separate "levels" with confusing names.
-
-**Fix:** Updated `save_predictions()` in `train_utils.py` to track level AND pass:
-```
-# Before (confusing)
-level0_patch_positions_mask.nii.gz
-level1_patch_positions_mask.nii.gz  # Actually refinement!
-
-# After (clear)
-level0_pass0_patch_positions_mask.nii.gz  # Initial
-level0_pass1_patch_positions_mask.nii.gz  # Refinement 1
-level0_pass2_patch_positions_mask.nii.gz  # Refinement 2
-```
-
-Also applies to attention weights and register tokens.
-
-### Files Modified
-
-| File | Changes |
-|------|---------|
-| `src/models/patch_icl.py` | `prev_pred_for_agg` param, uncertainty fix, detach, resolution fix |
-| `src/models/sampling.py` | `avg_pool2d` → `max_pool2d` |
-| `src/train_utils.py` | Level/pass tracking in `save_predictions()` |
-| `configs/experiment/patch_icl_v2.yaml` | `combine_mode`, `min_coverage` |
-| `README.md` | Added experiment and refinement documentation |
-
-### Summary of Refinement Flow (After Fixes)
-
-```
-Pass 1: Sample patches (uniform/weighted) → Predict → Aggregate
-                                                         ↓
-Pass 2: Compute uncertainty ← ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-        Sample from uncertain regions
-        Predict new patches
-        Aggregate: new predictions WHERE covered
-                   previous predictions WHERE uncovered (preserved)
-                                                         ↓
-Pass 3+: Repeat...                                       ↓
-                                                         ↓
-Final: Combined prediction with refined uncertain regions
-```
+---
 
 ## 2026-02-02: On-the-fly Feature Extraction (MedDINO + MedSAM2)
 
-### Overview
+Added on-the-fly feature extraction as alternative to precomputed features. Two extractors:
+- **MedDINOv3**: ViT-base, 768-dim, 256px input, ~350MB GPU
+- **MedSAM2**: Hiera (t/s/b+/l), 256-dim, 1024px input, ~150-900MB GPU
 
-Added support for computing features on-the-fly during training/inference, as an alternative to loading precomputed features from disk. Supports two feature extractors:
-- **MedDINOv3**: ViT-base model (768-dim features)
-- **MedSAM2**: SAM2.1-based Hiera backbone (256-dim features, from HuggingFace wanglab/MedSAM2)
+Config: `feature_mode: "on_the_fly"`, `feature_extractor_type: "meddino"/"medsam2"`. Dataloader skips `.npz` loading. ~10-30% slower than precomputed but enables experimentation without re-extracting features.
 
-### New Files
-
-**`src/models/meddino_extractor.py`**: Feature extraction module
-
-**MedDINO classes:**
-- `MedDINOProcessor`: Preprocesses images (percentile clipping, [0,1] rescale, RGB, ImageNet norm)
-- `MedDINOFeatureExtractor`: Wraps MedDINOv3 ViT-base, outputs [B, N, 768]
-- `create_meddino_extractor()`: Factory function
-
-**MedSAM2 classes:**
-- `MedSAM2Processor`: Preprocesses images (percentile clipping, [0,255] rescale, RGB, SAM norm)
-- `MedSAM2FeatureExtractor`: Wraps SAM2.1 Hiera encoder, outputs [B, N, 256]
-  - Supports Hiera tiny/small/base+/large variants via config
-  - Auto-downloads from HuggingFace (wanglab/MedSAM2) if no local checkpoint
-- `create_medsam2_extractor()`: Factory function
-- `create_feature_extractor(type, ...)`: Generic factory for either extractor
-
-### Config Changes
-
-New options in `configs/train.yaml`:
-```yaml
-feature_mode: "precomputed"  # or "on_the_fly"
-feature_extractor_type: "meddino"  # or "medsam2"
-feature_extraction_resolution: 256  # Use 256 for MedDINO, 1024 for MedSAM2
-meddino_layer_idx: 11  # MedDINO: which transformer layer
-medsam2_config: "sam2.1_hiera_l.yaml"  # MedSAM2: t/s/b+/l variants
-```
-
-### Model Changes
-
-**`src/models/patch_icl.py`**:
-- `PatchICL.__init__()` now accepts optional `feature_extractor` parameter
-- `PatchICL.set_feature_extractor()` method to set/update extractor post-init
-- `PatchICL._extract_features()` internal method for on-the-fly extraction
-- `PatchICL.forward()` automatically extracts features if none provided but extractor available
-
-### Training Script Changes
-
-**`scripts/train.py`**:
-- Added `feature_mode` and `feature_extractor_type` config parsing
-- When `feature_mode="on_the_fly"`:
-  - Creates MedDINO or MedSAM2 extractor based on `feature_extractor_type`
-  - Passes extractor to PatchICL
-  - Dataloader skips loading precomputed `.npz` files
-- When `feature_mode="precomputed"` (default): unchanged
-
-### Usage
-
-**Precomputed features (default):**
-```bash
-python scripts/train.py
-```
-
-**On-the-fly MedDINO:**
-```bash
-python scripts/train.py feature_mode=on_the_fly feature_extractor_type=meddino
-```
-
-**On-the-fly MedSAM2:**
-```bash
-python scripts/train.py feature_mode=on_the_fly feature_extractor_type=medsam2 feature_extraction_resolution=1024
-```
-
-### Feature Extractor Comparison
-
-| Aspect | MedDINO | MedSAM2 |
-|--------|---------|---------|
-| Architecture | ViT-base | Hiera (t/s/b+/l) |
-| Feature dim | 768 | 256 |
-| Recommended resolution | 256 | 1024 |
-| GPU memory | ~350 MB | ~150-900 MB |
-| Source | Local checkpoint | HuggingFace |
-
-### Performance Tradeoffs
-
-| Aspect | Precomputed | On-the-fly |
-|--------|-------------|------------|
-| Training speed | Faster | 10-30% slower |
-| Disk storage | ~300KB/image | ~100KB/image |
-| GPU memory | Lower | +1.5-2.5 GB |
-| Flexibility | Fixed | Can experiment |
-
-### Files Modified
-
-- `src/models/meddino_extractor.py` (NEW): MedDINO + MedSAM2 extractors
-- `src/models/patch_icl.py`: Added feature_extractor support
-- `scripts/train.py`: Feature mode + extractor type handling
-- `configs/train.yaml`: New config options
-- `configs/cluster/nfs.yaml`: Added medsam2 checkpoint path option
+---
 
 ## 2026-02-01: Eval Script Improvements + Attention Visualization
 
-### Checkpoint Loading in eval.py
+- **Checkpoint loading** in `eval.py` before evaluation
+- **Per-case/per-label dice**: `validate()` returns `detailed_results` with per-sample tracking
+- **Axis-based naming**: Output folders now `{case}_{label}_{axis}` instead of `{case}_{label}_b{batch}_s{sample}`
+- **Attention weight saving**: `return_attn_weights` flag through AttentionBlock -> CrossPatchAttention -> SimpleBackbone -> PatchICL. Saves per-layer `[H, K_total, K_total]` attention weights and `[R, D]` register tokens as `.npy`.
 
-Added checkpoint loading before evaluation:
-```python
-ckpt_path = cfg.paths.ckpts.get(str(cfg.method), None)  # e.g., paths.ckpts.patch_icl
-if ckpt_path:
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint["model_state_dict"])
-```
+---
 
-### Per-Case and Per-Label Dice Logging
+## 2026-01-27: SimpleBackbone + High-Capacity Config
 
-Modified `validate()` in `train_utils.py` to track individual dice scores:
-- Returns 5-tuple: `(loss, local_dice, final_dice, context_dice, detailed_results)`
-- `detailed_results["per_case"]`: List of `{case_id, label_id, axis, dice}` for each sample
-- `detailed_results["per_label"]`: Dict of average dice per label_id
+### SimpleBackbone
 
-Updated `eval.py` to log to wandb:
-- Per-label dice as `dice_label/{label_id}` metrics
-- Per-case results as a wandb Table with columns `[case_id, label_id, axis, dice]`
-
-### Axis-Based File Naming
-
-Changed output folder naming from `{case_id}_{label_id}_b{batch}_s{sample}` to `{case_id}_{label_id}_{axis}`:
-```
-Before: s0001_liver_b00_s02/
-After:  s0001_liver_z/
-```
-- `axis` is x, y, or z (the slice plane)
-- Extracted from batch via `batch.get("axes")`
-
-### Attention Weights and Register Token Saving
-
-Modified `simple_backbone.py` to optionally return attention internals:
-
-**AttentionBlock.forward:**
-- Added `return_attn_weights` parameter
-- When True, computes attention manually to capture weights
-- Returns `(x, attn_weights)` where `attn_weights` is `[B, H, K, K]`
-
-**CrossPatchAttention.forward:**
-- Collects attention from all layers into `all_attn_weights` list
-- Captures `register_tokens` after attention, before removal
-- Returns `(x, extras)` where `extras = {'attn_weights': [...], 'register_tokens': [B, R, D]}`
-
-**SimpleBackbone.forward:**
-- Passes through `return_attn_weights` flag
-- Includes `attn_weights` and `register_tokens` in output dict
-
-**PatchICL propagation:**
-- `PatchICL_Level.forward`: Added `return_attn_weights` param, captures backbone outputs
-- `PatchICL.forward`: Passes flag through, includes in final output
-
-**Saving in train_utils.py:**
-- `validate()`: Passes `return_attn_weights=True` only when saving outputs
-- `save_predictions()`: Saves per-layer attention as `.npy`:
-  - `level{idx}_layer{idx}_attn_weights.npy` - shape `[H, K_total, K_total]`
-  - `level{idx}_register_tokens.npy` - shape `[R, D]`
-
-**Attention weight structure:**
-```
-K_total = num_registers + num_target_patches + num_context_patches
-
-Sequence order:
-[0 : R]              → Register tokens
-[R : R + K_target]   → Target patches
-[R + K_target : end] → Context patches
-```
-
-**Files modified:**
-- `scripts/eval.py`: Checkpoint loading, per-case/label logging, axis naming
-- `src/train_utils.py`: `validate()` returns detailed_results, `save_predictions()` saves attention
-- `src/models/simple_backbone.py`: `return_attn_weights` through all layers
-- `src/models/patch_icl.py`: Propagate flag through PatchICL_Level and PatchICL
-
-## 2027-01-27: SimpleBackbone + High-Capacity Training Config
-
-### SimpleBackbone Implementation
-
-Created `src/models/simple_backbone.py` - a clean, focused replacement for the complex backbone.py (2,539 lines → 630 lines).
-
-**Architecture:**
-```
-SimpleCNNEncoder → CrossPatchAttention → SimpleCNNDecoder
-[B,K,49,1024]        [B,K,D]              [B,K,D] + skips
-     │                  │                      │
-     ▼                  ▼                      ▼
-Linear(1024→D)      + type_embed          TransConv + skips
-Reshape [B*K,D,7,7] + 2D RoPE             Bilinear upsample
-Conv layers         + registers            → [B,K,C,ps,ps]
-Pool [B,K,D]        Multi-layer attention
-```
-
-**Key features:**
-- **SimpleCNNEncoder**: Projects DINO features, 3-level CNN with skip connections (7×7 → 4×4 → 2×2 → pool)
-- **CrossPatchAttention**: Multi-layer attention with:
-  - Type embeddings (context vs target)
-  - 2D RoPE for spatial position encoding
-  - Register tokens for global context
-  - Configurable target self-attention
-  - Masked attention pattern (context↔context, target→context)
-- **SimpleCNNDecoder**: U-Net style with skip fusion, bilinear upsampling to any patch_size
-
-**Config example:**
-```yaml
-backbone:
-  type: "simple"
-  encoder:
-    embed_dim: 1024        # DINO input dim
-    embed_proj_dim: 512    # Working dimension
-  cross_attention:
-    num_heads: 8
-    num_layers: 4          # Stackable attention layers
-    num_registers: 8
-    target_self_attention: true
-    dropout: 0.1
-```
-
-### High-Capacity Training Config
-
-Created `configs/experiment/high_capacity.yaml` to improve training dice and GPU utilization.
-
-**Analysis of original config issues:**
-- Only 3.8GB / 49GB VRAM used (8%)
-- 16 patches at resolution 32 = poor coverage
-- embed_dim=128 = underpowered model
-- smoothL1 loss = wrong for segmentation
-- Context supervision disabled
-
-**New high-capacity config:**
-| Setting | Before | After | Impact |
-|---------|--------|-------|--------|
-| Parameters | ~2M | 37.7M | 19x capacity |
-| VRAM | 3.8GB (8%) | 21GB (43%) | 5.5x utilization |
-| Batch size | 50-64 | 192 | Better gradients |
-| Patches | 16 | 96 | 6x coverage |
-| Embed dim | 128 | 512 | 4x richer features |
-| Attention layers | 1 | 4 | Deeper reasoning |
-| Loss | smoothL1 | diceCE | Proper segmentation |
-| Context loss | 0 | 0.5 | Extra supervision |
-
-**VRAM scaling tests:**
-```
-num_layers=1: 21.7GB (44%), 28.2M params
-num_layers=2: 19.7GB (40%), 31.4M params
-num_layers=4: 20.5GB (42%), 37.7M params
-```
-More layers add ~3M params each but minimal VRAM (attention mask shared).
-
-**Files created/modified:**
-- `src/models/simple_backbone.py` (NEW): SimpleBackbone with 4 classes
-- `src/models/patch_icl.py`: Added SimpleBackbone import and factory case
-- `configs/experiment/high_capacity.yaml` (NEW): Optimized training config
-
-**Run:** `python scripts/train.py experiment=high_capacity`
-
-## 2026-01-26: Fixed Patch Rotation with Precomputed Features
-
-**Problem:** When using precomputed DINO features with patch augmentation (rotation/flip), there was a mismatch:
-- Image patches were extracted and rotated
-- Patch labels were rotated to match
-- But feature patches were extracted from precomputed maps at *original* positions (not rotated)
-- This caused features to not match the rotated visual content
-
-**Solution:** Apply the same augmentation to extracted features:
-1. Sample patch coordinates
-2. Extract image patches and labels at coords (with augmentation → get aug_params)
-3. Extract features at the same coords
-4. Apply the *same* augmentation (from aug_params) to features
-5. Process rotated features in backbone
-6. Inverse-rotate predictions before aggregation
-
-**Files modified:**
-- `src/models/sampling.py`:
-  - Added `_rotate_features_90()`, `_rotate_features_continuous()` for feature tensor rotation
-  - Added `_flip_features()`, `_scale_features()` for other augmentations
-  - Added `augment_features_only()` method to apply pre-determined aug_params to features
-  - Updated sampler forward methods to return augmented features
-- `src/models/patch_icl.py`:
-  - Updated `PatchICL_Level.forward()` to extract features after sampling, then augment them
-  - Updated `_select_context_patches()` to return aug_params for each context
-  - Added inverse augmentation to context patch logits before aggregation
-
-**Key insight:** Features are `[B, K, tokens, D]` where tokens=h×w (e.g., 7×7=49). Reshape to spatial `[B, K, D, h, w]`, apply same rotation as patches, reshape back.
-
-**Known limitation - Continuous rotation corner artifacts:**
-With continuous rotation (arbitrary angles), corners of the rotated feature patch sample from positions *outside* the extracted region, getting zeros (padding). This is because we only have features for the patch region itself, not neighboring regions.
+Created `src/models/simple_backbone.py` — clean replacement for backbone.py (2539 -> 630 lines).
 
 ```
-Original features (7x7):     After rotation (e.g., 30°):
-┌─────────┐                  ┌─────────┐
-│ f f f f │                  │ 0 f f 0 │  ← corners are ZEROS
-│ f f f f │   rotate →       │ f f f f │     (no features to interpolate)
-│ f f f f │                  │ f f f f │
-│ f f f f │                  │ 0 f f 0 │
-└─────────┘                  └─────────┘
+SimpleCNNEncoder -> CrossPatchAttention -> SimpleCNNDecoder
+[B,K,tokens,D]      [B,K,D]               [B,K,C,ps,ps]
 ```
 
-**Recommended workarounds:**
-1. **Use 90° rotation only** (`rotation: "90"`) - no interpolation needed, no artifacts
-2. **Small rotation angles** - for `rotation_range ≈ ±0.3 rad` (±17°), corner artifacts are minimal
-3. **Extract with margin** (future work) - extract larger feature region, rotate, then crop
+Key features: 3-level CNN encoder with skips, multi-layer attention with type embeddings + 2D RoPE + registers, U-Net decoder with skip fusion.
 
-## 2026-01-11: Improved Context Sampling with PatchWork Method
+### High-capacity config
 
-**Implemented label-balanced context patch sampling:**
-- Replaced threshold-based foreground sampling with PatchWork's probability-weighted method
-- Samples from all valid patch positions (not just sliding window grid), enabling much denser sampling
-- Uses formula `background_p = (1 - ratio) * pos / (numvx * ratio - pos)` to achieve 50% foreground/background ratio
-- Fixed coordinate tracking - now saves actual sampled positions instead of (0,0,0)
+Identified original config was only using 8% of 49GB VRAM:
 
-**Extended inspection system:**
-- Added saving of image context inputs (`prev_lvl_img.nii.gz`, `prev_lvl_pred_mask.nii.gz`) - predictions from previous autoregressive levels
-- Added full stitched predictions for each level (`{label}_level_{L}_full_pred_mask.nii.gz`)
-- Allows visualization of prediction refinement from coarse to fine resolution
+| Setting | Before | After |
+|---------|--------|-------|
+| Parameters | ~2M | 37.7M |
+| VRAM | 3.8GB (8%) | 21GB (43%) |
+| Embed dim | 128 | 512 |
+| Attention layers | 1 | 4 |
+| Loss | smoothL1 | diceCE |
 
-**Files modified:**
-- `src/medverse_foreground_sampling.py`: Implemented `_sample_patch_center_balanced()`, removed old `_compute_foreground_patch_centers()` and `_sample_context_patches()`
+---
 
-**Testing:** Run with `python scripts/eval_totalseg.py --enable-inspection --max-inspect-cases 1 --context-size 3 --no-wandb`
+## 2026-01-26: 2D RoPE + Feature Rotation for Precomputed Features
 
-## 2026-01-16: Token-based NMSW Architecture
+### 2D RoPE
 
-**Goal:** Replace sliding window inference with selective patch sampling to reduce compute.
+**Problem:** Original RoPE used sequential patch indices regardless of spatial location.
 
-**Analyzed NMSW (No More Sliding Window)** from `/software/notebooks/camaret/repos/open_nmsw`:
-- Global branch produces coarse prediction + objectness scores
-- Gumbel top-k selects important patches differentiably
-- Local branch processes only selected patches
-- Aggregation combines global + local predictions
+**Solution:** `apply_rope_2d()` uses actual patch (y, x) coordinates. First half of embedding rotated by x-coordinate, second half by y-coordinate.
 
-**Initial implementation:** Standard NMSW with SegFormer3D
-- Created `src/nmsw_sampling.py` (GumbelTopK, PatchSampler, PatchExtractor)
-- Created `src/nmsw_aggregation.py` (PatchAggregator with Gaussian weighting)
-- Created `src/nmsw_segformer.py` (NMSWSegFormer3D wrapper)
+### Feature rotation
 
-**Redesigned to Token-based approach:** User insight - patches should be very small (8³) and attend to each other via transformer.
+**Problem:** With precomputed features + patch augmentation, features were extracted at original positions but images/labels were rotated — mismatch.
 
-**Final architecture (TokenNMSW):**
-```
-Input [128³] → GlobalBranch (UNet) → Objectness scores
-     ↓
-Extract all 8³ patches → Gumbel top-k selects 200 patches
-     ↓
-PatchTokenizer (CNN: 8³→4³→2³→1³→embed) → [B, 200, 512]
-     ↓
-+ Positional encoding (3 options: sinusoidal/learnable/relative)
-     ↓
-CrossPatchTransformer (12 layers, 8 heads) → patches attend to each other
-     ↓
-PatchDecoder (CNN: 1³→8³) → [B, 200, 1, 8, 8, 8]
-     ↓
-Aggregate → Final prediction [128³]
-```
+**Solution:** Apply same augmentation to features: reshape `[B, K, tokens, D]` to `[B, K, D, h, w]`, apply rotation/flip, reshape back. Added `augment_features_only()` and inverse augmentation for predictions before aggregation.
 
-**Key design choices:**
-- Patch size: 8³ (fine granularity, ~4000 patches for 128³ volume)
-- Select 200 patches via Gumbel-softmax (differentiable)
-- Full transformer enables cross-patch communication
-- 3 positional encoding options for ablation
+**Known limitation:** Continuous rotation introduces corner artifacts on low-res feature grids (7x7). Recommend 90-degree rotation only.
 
-**Files created:**
-- `src/token_nmsw.py`: TokenNMSW, PatchTokenizer, CrossPatchTransformer, PatchDecoder, GlobalBranch, 3 positional encodings
-- `scripts/train_token_nmsw.py`: Training script with wandb logging
-
-**GPU optimization (49GB available, was using 1.8GB):**
-- `train_batch_size`: 2 → 16
-- `num_patches`: 100 → 200
-- `embed_dim`: 256 → 512
-- `num_layers`: 8 → 12
-
-**Config:** All parameters in `config.yaml` under `train_totalseg.token_nmsw`
-
-**Run:** `python scripts/train_token_nmsw.py` or `python scripts/train_token_nmsw.py --pos-encoding relative`
+---
 
 ## 2026-01-21: PatchICL Training Pipeline Bug Fixes
 
-**Fixed critical bugs preventing proper training:**
+Fixed critical bugs preventing proper training:
+- **embed_dim**: 768 -> 1024 (DINOv3 ViT-L)
+- **Features not passed to model**: `train_utils.py` extracted features but didn't pass to `model()`
+- **Warmup scheduler**: Implemented `LinearLR` + `SequentialLR` chain
+- **Coordinate scale mismatch**: Patch coords in 512 space but backbone assumed 224
+- **Oracle sampling**: Added separate `oracle_levels_train`/`oracle_levels_valid` configs
+- **Vectorized feature extraction**: Replaced Python loops with batch indexing
 
-### Config Fixes
-- `embed_dim`: 768 → 1024 (DINOv3 ViT-L produces 1024-dim features, not 768)
-- `val_batch_size`: Was using `train_batch_size` for validation loader
+---
 
-### Training Pipeline
-- **Features not passed to model**: `train_utils.py` extracted `target_features` and `context_features` from batch but didn't pass them to `model()`. Now properly passed.
-- **Warmup scheduler**: Config specified warmup but train.py used plain CosineAnnealingLR. Implemented `LinearLR` warmup with `SequentialLR` to chain warmup → main scheduler.
+## 2026-01-16: Token-based NMSW Architecture (Exploratory)
 
-### Position Embedding / Coordinate Bugs
-- **Scale mismatch**: Patch coordinates were in 512 space but backbone assumed 224. Added `actual_image_size` parameter to `PrecomputedFeatureBackbone` and `PrecomputedDinoBackbone` for correct scaling.
-- **Output size mismatch**: `SegmentationHead` output was `tokens_h × 16` but needed `patch_size`. Added `target_size` parameter with bilinear resize.
+Explored selective patch sampling via NMSW (No More Sliding Window). Evolved from standard NMSW to token-based approach:
 
-### Train/Test Distribution Mismatch
-- **Oracle sampling**: Training used GT mask for patch sampling but validation had no alternative. Added separate configs:
-  - `oracle_levels_train: [true]` - GT-guided sampling during training
-  - `oracle_levels_valid: [false]` - Uniform sampling during validation
-- PatchICL.forward() now selects oracle based on `self.training` mode
-
-### Performance
-- **Vectorized feature extraction**: `extract_patch_features()` used Python loops over B×K patches. Replaced with tensor operations (batch indexing).
-
-**Files modified:**
-- `config.yaml`: embed_dim, oracle_levels_train/valid
-- `scripts/train.py`: val_batch_size, warmup scheduler
-- `src/train_utils.py`: Pass features to model
-- `src/models/backbone.py`: actual_image_size, target_size
-- `src/models/patch_icl.py`: Separate train/valid oracle, vectorized extraction
-
-**Training now runs successfully.**
-
-## 2026-01-26: CrossPatchAttentionBackbone Improvements
-
-### 2D RoPE (Rotary Position Embeddings)
-
-**Problem:** Original RoPE used sequential patch indices (0, 1, 2, ...) regardless of actual spatial location. Patches at the same (x, y) position but different sequence positions got different embeddings.
-
-**Solution:** Implemented 2D RoPE that uses actual patch coordinates:
-- `build_rope_cache_2d(max_pos, dim)`: Precomputes sin/cos for spatial positions
-- `apply_rope_2d(x, coords, rope_cache, image_size)`: Applies 2D rotations based on coordinates
-  - First half of embedding rotated by x-coordinate
-  - Second half rotated by y-coordinate
-  - Coordinates normalized to [0, max_pos) range
-
-**Usage:** Enabled by default (`use_rope_2d=True`). Falls back to 1D RoPE if `coords=None`.
-
-```python
-# In forward():
-if self.use_rope_2d and coords is not None:
-    combined = apply_rope_2d(combined, coords, self.rope_cache, self.image_size)
-else:
-    combined = apply_rope(combined, self.rope_cache)
+```
+Input [128^3] -> GlobalBranch (UNet) -> Objectness scores
+-> Gumbel top-k selects 200 of ~4000 patches (8^3 each)
+-> PatchTokenizer (CNN) -> [B, 200, 512]
+-> CrossPatchTransformer (12 layers, 8 heads)
+-> PatchDecoder -> Aggregate -> Final prediction
 ```
 
-### Spatial Feature Grid for Segmentation Head
+This exploration informed the PatchICL architecture — the key insight that small patches attending to each other via transformer is effective.
 
-**Problem:** After cross-patch attention, features were flattened `[B, K, nb_features*D]`. The `SegmentationHead` started from 1×1 spatial and upsampled, losing the inherent 7×7 spatial structure of DINO features.
+---
 
-**Solution:** Reshape features to spatial grid before segmentation:
-```
-Attention output: [B, K, 2548]         # nb_features * D = 49 * 52
-Reshaped:         [B, K, 49, 52]       # Separate spatial and channel dims
-Spatial:          [B, K, 52, 7, 7]     # Permute to [B, K, D, h, w]
-```
+## 2026-01-11: Context Sampling with PatchWork Method
 
-**SegmentationHead changes:**
-- New parameter `feature_grid_size` (default 7 for 7×7 = 49 features)
-- Input changed from `[B, K, embed_dim]` to `[B, K, D, h, w]`
-- Dynamic upsampling: calculates blocks needed for `patch_size / feature_grid_size`
-- Preserves spatial structure throughout decoding
-
-**Files modified:**
-- `src/models/backbone.py`:
-  - Added `build_rope_cache_2d()`, `apply_rope_2d()`
-  - `CrossPatchAttentionBackbone`: Added `use_rope_2d` param, `feature_grid_size` computation
-  - `SegmentationHead`: Accepts spatial input `[B, K, D, h, w]`
+Replaced threshold-based foreground sampling with PatchWork's probability-weighted method. Achieves 50% foreground/background ratio using `background_p = (1 - ratio) * pos / (numvx * ratio - pos)`. Added inspection system for visualizing predictions at each autoregressive level.

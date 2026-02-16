@@ -13,7 +13,7 @@ Architecture:
     Reshape [B*K,D,8,8] Per-layer:             Upsample
     Conv layers           + type_embed         → [B,K,C,ps,ps]
     Pool [B,K,D]          + RoPE on Q,K
-                          Masked attention
+                          Full attention (Flash SDP)
 
 Config example:
     backbone:
@@ -79,7 +79,6 @@ def apply_rope_2d(
         x with 2D positional rotations applied: [B, K, dim]
     """
     B, K, D = x.shape
-    device = x.device
     half_dim = D // 2
     quarter_dim = D // 4
 
@@ -89,37 +88,25 @@ def apply_rope_2d(
     y_pos = coords_normalized[:, :, 0].long()
     x_pos = coords_normalized[:, :, 1].long()
 
-    # Validate RoPE indices are within bounds
-    max_y = y_pos.max().item()
-    max_x = x_pos.max().item()
-    if max_y >= max_pos or max_x >= max_pos:
-        raise ValueError(
-            f"apply_rope_2d: position indices out of bounds. "
-            f"max_y={max_y}, max_x={max_x}, max_pos={max_pos}, "
-            f"image_size={image_size}, coords range: [{coords.min().item()}, {coords.max().item()}]"
-        )
-
-    rope_cache = rope_cache.to(device)
     y_rope = rope_cache[y_pos]  # [B, K, dim/4, 2]
     x_rope = rope_cache[x_pos]
 
-    x_part = x[:, :, :half_dim].view(B, K, quarter_dim, 2)
-    y_part = x[:, :, half_dim:].view(B, K, quarter_dim, 2)
+    # Complex multiplication for RoPE rotation (cast to float32 for view_as_complex)
+    orig_dtype = x.dtype
+    x_part = x[:, :, :half_dim].float().reshape(B, K, quarter_dim, 2)
+    y_part = x[:, :, half_dim:].float().reshape(B, K, quarter_dim, 2)
+    x_rope = x_rope.float()
+    y_rope = y_rope.float()
 
-    x_cos, x_sin = x_rope[..., 0], x_rope[..., 1]
-    y_cos, y_sin = y_rope[..., 0], y_rope[..., 1]
+    x_complex = torch.view_as_complex(x_part.contiguous())
+    x_rope_complex = torch.view_as_complex(x_rope.contiguous())
+    x_rotated = torch.view_as_real(x_complex * x_rope_complex).reshape(B, K, half_dim)
 
-    x0, x1 = x_part[..., 0], x_part[..., 1]
-    x_out0 = x0 * x_cos - x1 * x_sin
-    x_out1 = x0 * x_sin + x1 * x_cos
-    x_rotated = torch.stack([x_out0, x_out1], dim=-1).view(B, K, half_dim)
+    y_complex = torch.view_as_complex(y_part.contiguous())
+    y_rope_complex = torch.view_as_complex(y_rope.contiguous())
+    y_rotated = torch.view_as_real(y_complex * y_rope_complex).reshape(B, K, half_dim)
 
-    y0, y1 = y_part[..., 0], y_part[..., 1]
-    y_out0 = y0 * y_cos - y1 * y_sin
-    y_out1 = y0 * y_sin + y1 * y_cos
-    y_rotated = torch.stack([y_out0, y_out1], dim=-1).view(B, K, half_dim)
-
-    return torch.cat([x_rotated, y_rotated], dim=-1)
+    return torch.cat([x_rotated, y_rotated], dim=-1).to(orig_dtype)
 
 
 class SimpleCNNEncoder(nn.Module):
@@ -301,7 +288,6 @@ class AttentionBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: torch.Tensor,
         is_context: torch.Tensor,
         coords: torch.Tensor | None = None,
         rope_cache: torch.Tensor | None = None,
@@ -312,7 +298,6 @@ class AttentionBlock(nn.Module):
         """
         Args:
             x: [B, K_total, D] - tokens (including registers)
-            attn_mask: [B, H, K_total, K_total] - float attention mask (-inf for blocked)
             is_context: [B, K_total] - True for context/register tokens
             coords: [B, K, 2] - patch coordinates (y, x), without registers
             rope_cache: [max_pos, dim/4, 2] - precomputed RoPE sin/cos
@@ -367,15 +352,11 @@ class AttentionBlock(nn.Module):
             zero_v = torch.zeros(B, H, 1, v.shape[-1], device=v.device, dtype=v.dtype)
             k = torch.cat([k, zero_k], dim=2)  # [B, H, K_total+1, head_dim]
             v = torch.cat([v, zero_v], dim=2)
-            # Extend mask: all queries can attend to the zero token (append 0.0 column)
-            zero_col = torch.zeros(B, H, K_total, 1, device=attn_mask.device, dtype=attn_mask.dtype)
-            attn_mask = torch.cat([attn_mask, zero_col], dim=-1)
 
         attn_weights = None
         if return_attn_weights:
             scale = 1.0 / math.sqrt(q.shape[-1])
             attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-            attn_scores = attn_scores + attn_mask
             attn_weights = F.softmax(attn_scores, dim=-1)
             if self.training and self.dropout.p > 0:
                 attn_weights = self.dropout(attn_weights)
@@ -383,7 +364,6 @@ class AttentionBlock(nn.Module):
         else:
             out = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attn_mask,
                 dropout_p=self.dropout.p if self.training else 0.0,
             )
 
@@ -399,13 +379,10 @@ class AttentionBlock(nn.Module):
 
 class CrossPatchAttention(nn.Module):
     """
-    Multi-layer attention module for cross-patch communication.
+    Multi-layer full attention module for cross-patch communication.
 
-    Implements the context/target attention pattern:
-    - Context patches: self-attention among themselves
-    - Target patches: cross-attention to context patches (optionally + self-attention)
-
-    Supports stacking multiple attention layers for deeper reasoning.
+    Uses unmasked bidirectional attention (enables Flash SDP backend).
+    Per-layer type embeddings distinguish context vs target tokens.
     """
 
     def __init__(
@@ -420,6 +397,7 @@ class CrossPatchAttention(nn.Module):
         dropout: float = 0.0,
         append_zero_attn: bool = False,
         gradient_checkpointing: bool = False,
+        num_context_layers: int = 0,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -427,8 +405,8 @@ class CrossPatchAttention(nn.Module):
         self.num_layers = num_layers
         self.num_registers = num_registers
         self.image_size = image_size
-        self.target_self_attention = target_self_attention
         self.gradient_checkpointing = gradient_checkpointing
+        self.num_context_layers = num_context_layers
 
         # Register tokens for global context
         if num_registers > 0:
@@ -438,11 +416,29 @@ class CrossPatchAttention(nn.Module):
         else:
             self.register_tokens = None
 
+        # Context-first self-attention: context patches attend to each other
+        # before the joint stage, so targets see pre-enriched context.
+        # Both stages are fully bidirectional (Flash SDP compatible).
+        if num_context_layers > 0:
+            self.context_layers = nn.ModuleList([
+                AttentionBlock(embed_dim, num_heads, dropout, append_zero_attn=append_zero_attn)
+                for _ in range(num_context_layers)
+            ])
+            if num_registers > 0:
+                self.context_registers = nn.Parameter(
+                    torch.randn(1, num_registers, embed_dim) * 0.02
+                )
+            else:
+                self.context_registers = None
+        else:
+            self.context_layers = None
+            self.context_registers = None
+
         # RoPE cache
         rope_cache = build_rope_cache_2d(max_seq_len, embed_dim)
         self.register_buffer("rope_cache", rope_cache, persistent=False)
 
-        # Stack of attention blocks
+        # Stack of attention blocks (joint stage)
         self.layers = nn.ModuleList([
             AttentionBlock(embed_dim, num_heads, dropout, append_zero_attn=append_zero_attn)
             for _ in range(num_layers)
@@ -451,49 +447,22 @@ class CrossPatchAttention(nn.Module):
         # Final layer norm
         self.final_norm = nn.LayerNorm(embed_dim)
 
-    def _build_attention_mask(
-        self, is_context: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Build attention mask for context/target pattern.
-
-        Args:
-            is_context: [B, K] - True for context/register tokens
-
-        Returns:
-            mask: [B, K, K] - True where attention is allowed
-        """
-        B, K = is_context.shape
-
-        is_ctx = is_context.unsqueeze(1)  # [B, 1, K] - which keys are context
-        is_tgt_q = (~is_context).unsqueeze(2)  # [B, K, 1] - which queries are target
-
-        # Context queries → context keys only
-        ctx_to_ctx = is_ctx.transpose(1, 2) & is_ctx  # [B, K, K]
-
-        if self.target_self_attention:
-            # Target queries → all keys (context + target)
-            tgt_mask = is_tgt_q.expand(-1, -1, K)
-        else:
-            # Target queries → context keys only
-            tgt_mask = is_tgt_q & is_ctx
-
-        attn_mask = ctx_to_ctx | tgt_mask
-        return attn_mask
-
     def forward(
         self,
         x: torch.Tensor,
         coords: torch.Tensor,
         is_context: torch.Tensor,
         return_attn_weights: bool = False,
+        num_target_patches: int | None = None,
     ) -> tuple[torch.Tensor, dict | None]:
         """
         Args:
-            x: [B, K, D] - patch tokens
+            x: [B, K, D] - patch tokens (target first, then context)
             coords: [B, K, 2] - patch coordinates (y, x)
             is_context: [B, K] - True for context patches
             return_attn_weights: If True, return attention weights and registers
+            num_target_patches: Number of target patches (first N tokens).
+                Required for context-first attention; if None, context stage is skipped.
 
         Returns:
             x: [B, K, D] - updated tokens
@@ -502,6 +471,49 @@ class CrossPatchAttention(nn.Module):
         B, K, D = x.shape
         device = x.device
 
+        # Stage 1: Context-first self-attention
+        # Context patches attend to each other before the joint stage,
+        # so targets see pre-enriched context representations.
+        if (self.context_layers is not None
+                and num_target_patches is not None
+                and num_target_patches < K):
+            K_t = num_target_patches
+            ctx_x = x[:, K_t:]           # [B, K_ctx, D]
+            ctx_coords = coords[:, K_t:]  # [B, K_ctx, 2]
+
+            # Add context-stage registers
+            num_ctx_reg = 0
+            if self.context_registers is not None:
+                ctx_regs = self.context_registers.expand(B, -1, -1)
+                ctx_x = torch.cat([ctx_regs, ctx_x], dim=1)
+                num_ctx_reg = self.context_registers.shape[1]
+
+            # All tokens in this stage are context (registers + context patches)
+            ctx_is_context = torch.ones(
+                B, ctx_x.shape[1], dtype=torch.bool, device=device
+            )
+
+            for layer in self.context_layers:
+                if self.gradient_checkpointing and self.training:
+                    from torch.utils.checkpoint import checkpoint
+                    ctx_x, _ = checkpoint(
+                        layer, ctx_x, ctx_is_context, ctx_coords,
+                        self.rope_cache, self.image_size, num_ctx_reg, False,
+                        use_reentrant=False,
+                    )
+                else:
+                    ctx_x, _ = layer(
+                        ctx_x, is_context=ctx_is_context, coords=ctx_coords,
+                        rope_cache=self.rope_cache, image_size=self.image_size,
+                        num_registers=num_ctx_reg, return_attn_weights=False,
+                    )
+
+            # Remove context registers, reassemble [target, enriched_context]
+            if num_ctx_reg > 0:
+                ctx_x = ctx_x[:, num_ctx_reg:]
+            x = torch.cat([x[:, :K_t], ctx_x], dim=1)
+
+        # Stage 2: Joint attention (all patches together)
         # Add registers
         if self.register_tokens is not None:
             registers = self.register_tokens.expand(B, -1, -1)
@@ -511,24 +523,16 @@ class CrossPatchAttention(nn.Module):
         else:
             is_context_with_reg = is_context
 
-        # Build attention mask (shared across layers)
-        K_total = x.shape[1]
-        attn_mask = self._build_attention_mask(is_context_with_reg)
-        float_mask = torch.zeros(B, K_total, K_total, device=device, dtype=x.dtype)
-        float_mask.masked_fill_(~attn_mask, float('-inf'))
-        float_mask = float_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-
         num_reg = self.num_registers if self.register_tokens is not None else 0
 
         # Run through attention layers (per-layer type embed + RoPE)
         all_attn_weights = []
         for layer in self.layers:
             if self.gradient_checkpointing and self.training and not return_attn_weights:
-                # Use gradient checkpointing to save memory (recompute activations in backward)
                 from torch.utils.checkpoint import checkpoint
                 x, attn_w = checkpoint(
                     layer,
-                    x, float_mask,
+                    x,
                     is_context_with_reg,
                     coords,
                     self.rope_cache,
@@ -539,7 +543,7 @@ class CrossPatchAttention(nn.Module):
                 )
             else:
                 x, attn_w = layer(
-                    x, float_mask,
+                    x,
                     is_context=is_context_with_reg,
                     coords=coords,
                     rope_cache=self.rope_cache,
@@ -737,6 +741,7 @@ class SimpleBackbone(nn.Module):
         append_zero_attn: bool = False,
         max_levels: int = 4,
         gradient_checkpointing: bool = False,
+        **kwargs,
     ):
         """
         Args:
@@ -749,7 +754,7 @@ class SimpleBackbone(nn.Module):
             image_size: Full image size for position normalization
             input_dim: Input DINO feature dimension (1024 for ViT-L)
             feature_grid_size: DINO feature grid size (8 for 8x8 grid)
-            target_self_attention: Allow targets to attend to each other
+            target_self_attention: Allow targets to attend to each other (ignored, full attention)
             dropout: Attention dropout rate
             max_seq_len: Maximum sequence length for RoPE cache
             decoder_use_skip_connections: If True, use U-Net skips in decoder
@@ -781,6 +786,7 @@ class SimpleBackbone(nn.Module):
             gradient_checkpointing=gradient_checkpointing,
             dropout=dropout,
             append_zero_attn=append_zero_attn,
+            num_context_layers=kwargs.get('num_context_layers', 0),
         )
 
         self.decoder = SimpleCNNDecoder(
@@ -798,6 +804,7 @@ class SimpleBackbone(nn.Module):
         ctx_id_labels: torch.Tensor = None,
         return_attn_weights: bool = False,
         level_idx: int = 0,
+        num_target_patches: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass: encode → attention → decode.
@@ -808,6 +815,8 @@ class SimpleBackbone(nn.Module):
             ctx_id_labels: [B, K] - 0 for target, >0 for context
             return_attn_weights: If True, return attention weights and register tokens
             level_idx: Resolution level index for level embedding
+            num_target_patches: Number of target patches (first N tokens).
+                Enables context-first attention when num_context_layers > 0.
 
         Returns:
             Dict with:
@@ -836,7 +845,10 @@ class SimpleBackbone(nn.Module):
         encoded = encoded + self.level_embed[level_idx].view(1, 1, -1)
 
         # Cross-patch attention
-        attended, extras = self.attention(encoded, coords, is_context, return_attn_weights)
+        attended, extras = self.attention(
+            encoded, coords, is_context, return_attn_weights,
+            num_target_patches=num_target_patches,
+        )
 
         # Decode
         mask_pred = self.decoder(attended, skips)

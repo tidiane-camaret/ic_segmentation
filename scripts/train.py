@@ -1,4 +1,5 @@
 """Simplified training script for PatchICL with Hydra config."""
+
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -18,7 +19,9 @@ def main(cfg: DictConfig) -> None:
     """Main training function."""
     # Initialize accelerator with optional mixed precision
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    mixed_precision = cfg.training.get("mixed_precision", None)  # "fp16", "bf16", or None
+    mixed_precision = cfg.training.get(
+        "mixed_precision", None
+    )  # "fp16", "bf16", or None
     accelerator = Accelerator(
         kwargs_handlers=[ddp_kwargs],
         mixed_precision=mixed_precision,
@@ -30,16 +33,19 @@ def main(cfg: DictConfig) -> None:
     if accelerator.is_main_process:
         print(f"Using device: {device}, num_processes: {accelerator.num_processes}")
 
-
     # Wandb logging
     if cfg.logging.use_wandb and accelerator.is_main_process:
         import wandb
-        wandb.init(project=cfg.logging.wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
+
+        wandb.init(
+            project=cfg.logging.wandb_project,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
         run_name = wandb.run.name
     else:
         run_name = f"run_{accelerator.process_index}_{accelerator.num_processes}"
     # Create checkpoint dir
-    date_str = datetime.today().strftime('%Y-%m-%d')
+    date_str = datetime.today().strftime("%Y-%m-%d")
     save_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}"
     if accelerator.is_main_process:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -48,14 +54,20 @@ def main(cfg: DictConfig) -> None:
     # Image augmentation config (only for training)
     img_aug_cfg = cfg.get("image_augmentation", {})
     use_image_augmentation = img_aug_cfg.get("enabled", False)
-    augment_config = OmegaConf.to_container(img_aug_cfg, resolve=True) if use_image_augmentation else None
+    augment_config = (
+        OmegaConf.to_container(img_aug_cfg, resolve=True)
+        if use_image_augmentation
+        else None
+    )
 
     # Dataloader
     dataset_type = cfg.get("dataset", "totalseg2d")
     feature_mode = cfg.get("feature_mode", "precomputed")
 
     if dataset_type == "medsegbench":
-        from src.dataloaders.medsegbench_dataloader import get_dataloader as get_medsegbench_dataloader
+        from src.dataloaders.medsegbench_dataloader import (
+            get_dataloader as get_medsegbench_dataloader,
+        )
 
         msb_cfg = cfg.get("medsegbench", {})
         msb_datasets = msb_cfg.get("datasets", None)
@@ -77,7 +89,9 @@ def main(cfg: DictConfig) -> None:
         max_samples = msb_cfg.get("max_samples_per_dataset", None)
 
         if accelerator.is_main_process:
-            print(f"MedSegBench train datasets: {msb_train_datasets}, val datasets: {msb_val_datasets}")
+            print(
+                f"MedSegBench train datasets: {msb_train_datasets}, val datasets: {msb_val_datasets}"
+            )
 
         train_loader = get_medsegbench_dataloader(
             data_root=cfg.paths.medsegbench,
@@ -107,16 +121,32 @@ def main(cfg: DictConfig) -> None:
 
     else:
         # TotalSeg2D dataloader
-        from src.dataloaders.totalseg2d_dataloader_fast import get_dataloader as get_totalseg2d_dataloader
+        from src.dataloaders.totalseg2d_dataloader_fast import (
+            get_dataloader as get_totalseg2d_dataloader,
+        )
 
-        train_labels = cfg.train_label_ids if isinstance(cfg.train_label_ids, str) else list(cfg.train_label_ids)
-        val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
+        train_labels = (
+            cfg.train_label_ids
+            if isinstance(cfg.train_label_ids, str)
+            else list(cfg.train_label_ids)
+        )
+        val_labels = (
+            cfg.val_label_ids
+            if isinstance(cfg.val_label_ids, str)
+            else list(cfg.val_label_ids)
+        )
 
         # Support list of splits for train/val
         train_split_cfg = cfg.get("train_split", "train")
-        train_split = list(train_split_cfg) if OmegaConf.is_list(train_split_cfg) else train_split_cfg
+        train_split = (
+            list(train_split_cfg)
+            if OmegaConf.is_list(train_split_cfg)
+            else train_split_cfg
+        )
         val_split_cfg = cfg.get("val_split", ["val", "test"])
-        val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
+        val_split = (
+            list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
+        )
 
         # Support separate max_ds_len for train/val, with fallback to single value
         max_ds_len_cfg = cfg.get("max_ds_len")
@@ -130,12 +160,18 @@ def main(cfg: DictConfig) -> None:
         # CarveMix config (only for training)
         carve_mix_cfg = cfg.get("carve_mix", {})
         use_carve_mix = carve_mix_cfg.get("enabled", False)
-        carve_mix_config = OmegaConf.to_container(carve_mix_cfg, resolve=True) if use_carve_mix else None
+        carve_mix_config = (
+            OmegaConf.to_container(carve_mix_cfg, resolve=True)
+            if use_carve_mix
+            else None
+        )
 
         # Advanced augmentation config (only for training)
         adv_aug_cfg = cfg.get("advanced_augmentation", {})
         use_adv_aug = adv_aug_cfg.get("enabled", False)
-        adv_aug_config = OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
+        adv_aug_config = (
+            OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
+        )
 
         train_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d_h5,
@@ -158,6 +194,7 @@ def main(cfg: DictConfig) -> None:
             advanced_augmentation=use_adv_aug,
             advanced_augmentation_config=adv_aug_config,
             max_labels=cfg.get("max_labels", None),
+            class_balanced=cfg.get("class_balanced", False),
         )
         val_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d_h5,
@@ -185,16 +222,23 @@ def main(cfg: DictConfig) -> None:
     patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
 
     if accelerator.is_main_process:
-        print(f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})")
+        print(
+            f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})"
+        )
 
     # Feature extractor for on-the-fly mode
     feature_extractor = None
     if feature_mode == "on_the_fly":
         fe_cfg = patch_icl_cfg.get("feature_extractor", None)
-        extractor_type = fe_cfg.get("type", "meddino").lower() if fe_cfg else cfg.get("feature_extractor_type", "meddino").lower()
+        extractor_type = (
+            fe_cfg.get("type", "meddino").lower()
+            if fe_cfg
+            else cfg.get("feature_extractor_type", "meddino").lower()
+        )
 
         if extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
             from src.models.meddino_extractor import create_meddino_extractor
+
             if accelerator.is_main_process:
                 print("Initializing MedDINOv3 for on-the-fly feature extraction...")
             if fe_cfg and fe_cfg.get("type") in ["meddino", "meddinov3", "meddino_v3"]:
@@ -218,6 +262,7 @@ def main(cfg: DictConfig) -> None:
 
         elif extractor_type in ["medsam_v1", "medsam_v1_layer"]:
             from src.models.medsam_extractor import MedSAMv1LayerExtractor
+
             if accelerator.is_main_process:
                 print("Initializing MedSAM v1 for on-the-fly feature extraction...")
             target_size = fe_cfg.get("target_size", 1024) if fe_cfg else 1024
@@ -232,9 +277,12 @@ def main(cfg: DictConfig) -> None:
             )
             if accelerator.is_main_process:
                 info = feature_extractor.get_feature_info()
-                print(f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, grid={info['output_grid_size']})")
+                print(
+                    f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, grid={info['output_grid_size']})"
+                )
         elif extractor_type == "universeg":
             from src.models.universeg_extractor import UniverSegExtractor
+
             if accelerator.is_main_process:
                 print("Initializing UniverSeg for on-the-fly feature extraction...")
             feature_extractor = UniverSegExtractor(
@@ -246,10 +294,13 @@ def main(cfg: DictConfig) -> None:
             )
             if accelerator.is_main_process:
                 info = feature_extractor.get_feature_info()
-                print(f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
-                      f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
+                print(
+                    f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
+                    f"dim={info['feature_dim']}, grid={info['output_grid_size']})"
+                )
         elif extractor_type == "icl_encoder":
             from src.models.icl_encoder import ICLEncoder
+
             if accelerator.is_main_process:
                 print("Initializing ICLEncoder for on-the-fly feature extraction...")
             feature_extractor = ICLEncoder(
@@ -259,42 +310,66 @@ def main(cfg: DictConfig) -> None:
             )
             if accelerator.is_main_process:
                 info = feature_extractor.get_feature_info()
-                print(f"Feature mode: on_the_fly (ICLEncoder layers={info['layer_indices']}, "
-                      f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
+                print(
+                    f"Feature mode: on_the_fly (ICLEncoder layers={info['layer_indices']}, "
+                    f"dim={info['feature_dim']}, grid={info['output_grid_size']})"
+                )
         else:
             raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
     else:
         if accelerator.is_main_process:
             print("Feature mode: precomputed")
 
-    model = PatchICL(patch_icl_cfg, context_size=cfg.get("context_size", 0), feature_extractor=feature_extractor)
+    model = PatchICL(
+        patch_icl_cfg,
+        context_size=cfg.get("context_size", 0),
+        feature_extractor=feature_extractor,
+    )
 
     # Loss functions
     loss_cfg = patch_icl_cfg.get("loss", {})
     patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
     aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
     patch_criterion = build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args"))
-    aggreg_criterion = build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args"))
+    aggreg_criterion = build_loss_fn(
+        aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args")
+    )
     model.set_loss_functions(patch_criterion, aggreg_criterion)
 
-    # Optionally load model weights from checkpoint (like eval.py)
+    # Optionally load model weights from checkpoint
     ckpt_path = cfg.get("checkpoint", None)
+    start_epoch = 0
     if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        start_epoch = checkpoint.get("epoch", 0) + 1
         if accelerator.is_main_process:
-            print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
+            print(
+                f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})"
+            )
     else:
         if accelerator.is_main_process:
             print("No checkpoint loaded, training from scratch")
     if accelerator.is_main_process:
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model parameters: {num_params:,}")
-        print(f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}")
+        print(
+            f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}"
+        )
 
     # Optimizer
     opt_args = cfg.optimizer.optimizer_args
-    optimizer = torch.optim.AdamW(model.parameters(), lr=opt_args.lr, weight_decay=opt_args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=opt_args.lr, weight_decay=opt_args.weight_decay
+    )
+
+    # Load optimizer state from checkpoint (after optimizer is created)
+    if ckpt_path:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if accelerator.is_main_process:
+                print("Loaded optimizer state from checkpoint")
 
     # Scheduler
     warmup_cfg = cfg.get("warmup_scheduler", {})
@@ -308,13 +383,40 @@ def main(cfg: DictConfig) -> None:
     )
 
     if warmup_enabled:
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_epochs],
+        )
     else:
         scheduler = main_scheduler
 
     # Prepare for distributed training
-    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, scheduler)
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
+    # torch.compile encoder/attention/decoder after DDP wrapping
+    backbone_cfg = patch_icl_cfg.get("backbone", {})
+    if backbone_cfg.get("compile", False):
+        if accelerator.is_main_process:
+            print("Compiling backbone submodules with torch.compile...")
+        bb = accelerator.unwrap_model(model).backbone
+        bb.encoder = torch.compile(bb.encoder)
+        bb.attention = torch.compile(bb.attention)
+        bb.decoder = torch.compile(bb.decoder)
+
+
+    # Load scheduler state after preparing for distributed training
+    if ckpt_path:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if accelerator.is_main_process:
+                print(f"Loaded scheduler state from checkpoint")
 
     # Training loop
     best_dice = 0.0
@@ -324,21 +426,42 @@ def main(cfg: DictConfig) -> None:
     val_save_dir = save_dir / "val_images" if save_imgs else None
 
     if save_imgs and accelerator.is_main_process:
-        print(f"Saving images: train every {save_every_n_epochs} epochs to {train_save_dir}")
+        print(
+            f"Saving images: train every {save_every_n_epochs} epochs to {train_save_dir}"
+        )
         print(f"Saving images: val every epoch to {val_save_dir}")
 
-    for epoch in tqdm(range(cfg.training.num_epochs), desc="Training", disable=not accelerator.is_main_process):
+    for epoch in tqdm(
+        range(start_epoch, cfg.training.num_epochs),
+        desc="Training",
+        disable=not accelerator.is_main_process,
+    ):
         train_losses = train_epoch(
-            model, train_loader, optimizer, device, epoch, cfg.training.print_every,
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            cfg.training.print_every,
             cfg.training.get("grad_accumulate_steps", 1),
-            accelerator=accelerator, use_wandb=cfg.logging.use_wandb, log_every=cfg.training.get("log_every", 10),
-            save_dir=train_save_dir, save_every_n_epochs=save_every_n_epochs
+            accelerator=accelerator,
+            use_wandb=cfg.logging.use_wandb,
+            log_every=cfg.training.get("log_every", 10),
+            save_dir=train_save_dir,
+            save_every_n_epochs=save_every_n_epochs,
+            compute_metrics_every=cfg.training.get("compute_metrics_every", 10),
         )
 
-        val_loss, val_local_dice, val_final_dice, val_context_dice, val_detailed = validate(
-            model, val_loader, device, accelerator=accelerator,
-            use_wandb=cfg.logging.use_wandb, epoch=epoch,
-            save_dir=val_save_dir
+        val_loss, val_local_dice, val_final_dice, val_context_dice, val_detailed = (
+            validate(
+                model,
+                val_loader,
+                device,
+                accelerator=accelerator,
+                use_wandb=cfg.logging.use_wandb,
+                epoch=epoch,
+                save_dir=val_save_dir,
+            )
         )
 
         scheduler.step()
@@ -377,7 +500,13 @@ def main(cfg: DictConfig) -> None:
                     log_dict[f"val_dice/{label_id}"] = dice_score
             # Log per-level val metrics (level_N_dice, level_N_softdice, level_N_avg_probs_*)
             if val_detailed:
-                skip_keys = {"per_case", "per_label", "local_softdice", "final_softdice", "context_softdice"}
+                skip_keys = {
+                    "per_case",
+                    "per_label",
+                    "local_softdice",
+                    "final_softdice",
+                    "context_softdice",
+                }
                 for key, value in val_detailed.items():
                     if key not in skip_keys:
                         log_dict[f"val/{key}"] = value
@@ -390,13 +519,17 @@ def main(cfg: DictConfig) -> None:
             if accelerator.is_main_process:
                 print(f"  -> New best dice: {best_dice:.5f}")
                 unwrapped_model = accelerator.unwrap_model(model)
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": unwrapped_model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_dice": best_dice,
-                    "config": OmegaConf.to_container(cfg, resolve=True),
-                }, save_dir / "best_model.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": unwrapped_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "best_dice": best_dice,
+                        "config": OmegaConf.to_container(cfg, resolve=True),
+                    },
+                    save_dir / "best_model.pt",
+                )
 
     if accelerator.is_main_process:
         print(f"\nTraining complete! Best Dice: {best_dice:.5f}")

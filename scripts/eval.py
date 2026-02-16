@@ -139,7 +139,7 @@ def main(cfg: DictConfig) -> None:
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalseg2d,
+            root_dir=cfg.paths.totalseg2d_h5,
             stats_path=cfg.paths.totalseg_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
@@ -153,12 +153,13 @@ def main(cfg: DictConfig) -> None:
             random_context=False,
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
+            max_labels=cfg.get("max_labels", None),
         )
     elif cfg.dataset == "totalsegmri2d":
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalsegmri2d,
+            root_dir=cfg.paths.totalsegmri2d_h5,
             stats_path=cfg.paths.totalsegmri_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
@@ -172,6 +173,7 @@ def main(cfg: DictConfig) -> None:
             random_context=False,
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
+            max_labels=cfg.get("max_labels", None),
         )
     elif cfg.dataset == "medsegbench":
         msb_cfg = cfg.get("medsegbench", {})
@@ -311,6 +313,17 @@ def main(cfg: DictConfig) -> None:
         model.set_loss_functions(patch_criterion, aggreg_criterion)
         if accelerator.is_main_process:
             print(f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}")
+
+                # Load checkpoint weights
+        ckpt_path = cfg.get("checkpoint", None)
+        if ckpt_path:
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            if accelerator.is_main_process:
+                print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
+        else:
+            if accelerator.is_main_process:
+                print("No checkpoint loaded, using default weights")
     elif cfg.method == "universeg":
         from src.models.universeg_baseline import UniverSegBaseline
 
@@ -329,16 +342,7 @@ def main(cfg: DictConfig) -> None:
     if accelerator.is_main_process:
         print(f"Model parameters: {num_params:,}")
 
-    # Load checkpoint weights
-    ckpt_path = cfg.get("checkpoint", None)
-    if ckpt_path:
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        if accelerator.is_main_process:
-            print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
-    else:
-        if accelerator.is_main_process:
-            print("No checkpoint loaded, using default weights")
+
 
     # Optimizer
     opt_type = cfg.optimizer.get("optimizer_type", "adamw").lower()
@@ -428,24 +432,39 @@ def main(cfg: DictConfig) -> None:
         accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0
     )
     if accelerator.is_main_process:
+        val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
+        val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
         print(
             f"Val Loss: {val_loss:.5f} | "
-            f"Val LocalDice: {val_local_dice:.5f} | "
             f"Val FinalDice: {val_final_dice:.5f} | "
+            f"Val SoftDice: {val_soft_dice:.5f} | "
+            f"Val PixelMAE: {val_pixel_mae:.5f} | "
             f"Val CtxDice: {val_context_dice:.5f}"
         )
+        # Print per-level metrics
+        for key, value in sorted(detailed_results.items()):
+            if key.startswith("level_"):
+                print(f"  {key}: {value:.4f}")
         # Print per-label dice
         print("\nPer-label Dice:")
         for label_id, dice in sorted(detailed_results["per_label"].items(), key=lambda x: x[1], reverse=True):
             print(f"  {label_id}: {dice:.4f}")
 
     if cfg.logging.use_wandb and accelerator.is_main_process:
+        val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
+        val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
         log_dict = {
             "val_loss": val_loss,
             "val_local_dice": val_local_dice,
             "val_final_dice": val_final_dice,
+            "val_final_soft_dice": val_soft_dice,
+            "val_final_pixel_mae": val_pixel_mae,
             "val_context_dice": val_context_dice,
         }
+        # Log all per-level metrics (dice, soft_dice, pixel_mae)
+        for key, value in detailed_results.items():
+            if key.startswith("level_"):
+                log_dict[f"val/{key}"] = value
         if flop_info:
             log_dict["gflops_per_sample"] = flop_info["gflops_per_sample"]
             log_dict["flops_per_sample"] = flop_info["flops_per_sample"]

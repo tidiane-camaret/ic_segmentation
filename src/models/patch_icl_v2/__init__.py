@@ -15,6 +15,7 @@ from src.models.patch_icl_v2.metrics import (
     PRED_THRESHOLD,
     GT_AREA_THRESHOLD,
     compute_dice,
+    compute_pixel_mae,
     compute_all_metrics,
     compute_per_sample_dice,
 )

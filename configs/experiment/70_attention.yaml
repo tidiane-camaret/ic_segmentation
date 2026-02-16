@@ -50,16 +50,17 @@ advanced_augmentation:
 
 training:
   seed: 42
-  num_epochs: 10
+  num_epochs: 100
   print_every: 50
   grad_accumulate_steps: 1
   num_workers: 12
   log_every: 10
+  compute_metrics_every: 10
 
 
 warmup_scheduler:
   enabled: true
-  warmup_epochs: 2
+  warmup_epochs: 3
 
 model:
   patch_icl:
@@ -91,7 +92,8 @@ model:
       min_coverage: 1e-6
 
     backbone:
-      decoder_use_skip_connections: true
+      compile: false
+      decoder_use_skip_connections: false
       image_size: 128
       embed_dim: 256  # Must match feature_extractor output dim (64 * num_layers)
       embed_proj_dim: 256
@@ -99,6 +101,7 @@ model:
       patch_feature_grid_size: 8  # Backbone encoder input spatial size
       num_heads: 4
       num_layers: 2
+      num_context_layers: 1  # Context-first self-attention before joint stage
       num_registers: 4
       target_self_attention: true
       dropout: 0.1
@@ -106,11 +109,15 @@ model:
 
     loss:
       patch_loss:
-        type: "softdiceBCE"
-        args: null
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5       # equal FG/BG weight (default 0.25 under-weights FG)
+          gamma: 2.0
       aggreg_loss:
-        type: "softdiceBCE"
-        args: null
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
       weights:
         default:
           target_patch: 1.0

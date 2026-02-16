@@ -84,8 +84,6 @@ def process_case(args):
     h5_path = output_dir / f"{case_name}.h5"
     case_stats = {}
 
-    if h5_path.exists():
-        return case_name, {}, None  # Already processed, skip
 
     labels_dir = case_dir / "segmentations"
     if not labels_dir.exists():

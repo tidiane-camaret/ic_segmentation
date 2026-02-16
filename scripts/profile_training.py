@@ -1,7 +1,17 @@
-"""Profile training batch to identify bottlenecks.
+"""Profile PatchICL training with Accelerate's built-in profiler.
 
-Usage:
-    python scripts/profile_training.py +experiment=60_2_levels
+Runs a few training batches with full profiling: CPU/CUDA time, memory,
+FLOPs, and chrome trace export. Produces a detailed summary and trace file.
+
+Usage (multi-GPU with accelerate):
+    uv run accelerate launch \
+        --multi_gpu --num_processes=2 --mixed_precision=fp16 \
+        scripts/profile_training.py \
+        +max_labels=10 experiment=70_attention cluster=dlclarge
+
+Usage (single GPU):
+    uv run python scripts/profile_training.py \
+        +max_labels=10 experiment=70_attention cluster=dlclarge
 """
 
 import sys
@@ -13,16 +23,20 @@ from pathlib import Path
 import hydra
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator, DistributedDataParallelKwargs, ProfileKwargs
 from omegaconf import DictConfig, OmegaConf
-from torch.profiler import ProfilerActivity, profile, record_function
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.losses import build_loss_fn
 from src.train_utils import seed_everything
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 class Timer:
-    """Simple timer for measuring execution time."""
+    """Wall-clock + CUDA-event timer for manual annotations."""
 
     def __init__(self):
         self.times = defaultdict(list)
@@ -32,546 +46,157 @@ class Timer:
     def track(self, name: str):
         torch.cuda.synchronize()
         start = time.perf_counter()
-        start_cuda = torch.cuda.Event(enable_timing=True)
-        end_cuda = torch.cuda.Event(enable_timing=True)
-        start_cuda.record()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
         try:
             yield
         finally:
-            end_cuda.record()
+            end_evt.record()
             torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start
-            cuda_elapsed = start_cuda.elapsed_time(end_cuda)
-            self.times[name].append(elapsed * 1000)  # ms
-            self.cuda_times[name].append(cuda_elapsed)
+            self.times[name].append((time.perf_counter() - start) * 1000)
+            self.cuda_times[name].append(start_evt.elapsed_time(end_evt))
 
-    def report(self):
-        print("\n" + "=" * 80)
-        print("TIMING REPORT (CPU wall time / CUDA kernel time)")
-        print("=" * 80)
-
+    def report(self, title="TIMING REPORT"):
         total_cpu = sum(sum(v) for v in self.times.values())
         total_cuda = sum(sum(v) for v in self.cuda_times.values())
-
-        # Sort by total time
         sorted_names = sorted(
             self.times.keys(), key=lambda n: sum(self.times[n]), reverse=True
         )
-
+        print(f"\n{'=' * 90}")
+        print(f"  {title} (CPU wall / CUDA kernel)")
+        print(f"{'=' * 90}")
         for name in sorted_names:
-            cpu_times = self.times[name]
-            cuda_times = self.cuda_times[name]
-            avg_cpu = sum(cpu_times) / len(cpu_times)
-            avg_cuda = sum(cuda_times) / len(cuda_times)
-            total_cpu_name = sum(cpu_times)
-            pct = total_cpu_name / total_cpu * 100 if total_cpu > 0 else 0
-            print(
-                f"{name:40s}: {avg_cpu:8.2f}ms CPU / {avg_cuda:8.2f}ms CUDA ({pct:5.1f}%)"
-            )
+            avg_cpu = sum(self.times[name]) / len(self.times[name])
+            avg_cuda = sum(self.cuda_times[name]) / len(self.cuda_times[name])
+            pct = sum(self.times[name]) / total_cpu * 100 if total_cpu > 0 else 0
+            print(f"{name:50s} {avg_cpu:8.1f}ms CPU  {avg_cuda:8.1f}ms CUDA  ({pct:5.1f}%)")
+        print(f"{'-' * 90}")
+        print(f"{'TOTAL':50s} {total_cpu:8.1f}ms CPU  {total_cuda:8.1f}ms CUDA")
 
-        print("-" * 80)
-        print(f"{'TOTAL':40s}: {total_cpu:8.2f}ms CPU / {total_cuda:8.2f}ms CUDA")
 
+def _sep(title, char="=", width=100):
+    print(f"\n{char * width}\n  {title}\n{char * width}")
 
-def profile_dataloader(train_loader, device, num_batches=5):
-    """Profile data loading time."""
-    print("\n" + "=" * 80)
-    print("DATALOADER PROFILING")
-    print("=" * 80)
 
-    timer = Timer()
+def _print_gpu_info():
+    if not torch.cuda.is_available():
+        return
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        print(f"  GPU {i}: {p.name}  |  VRAM {p.total_memory / 1024**3:.1f} GB  |  "
+              f"SMs {p.multi_processor_count}  |  CC {p.major}.{p.minor}")
 
-    for idx, batch in enumerate(train_loader):
-        if idx >= num_batches:
-            break
 
-        with timer.track("total_batch_load"):
-            with timer.track("get_batch_from_iterator"):
-                pass  # Already got batch
+def _print_vram(label=""):
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    peak = torch.cuda.max_memory_allocated() / 1024**3
+    print(f"  VRAM {label}: alloc={alloc:.2f} GB  reserved={reserved:.2f} GB  peak={peak:.2f} GB")
 
-            with timer.track("to_device_images"):
-                images = batch["image"].to(device)
 
-            with timer.track("to_device_labels"):
-                labels = batch["label"].to(device)
+# ---------------------------------------------------------------------------
+# Build data + model (mirrors train.py)
+# ---------------------------------------------------------------------------
 
-            with timer.track("to_device_context"):
-                context_in = batch.get("context_in")
-                context_out = batch.get("context_out")
-                if context_in is not None:
-                    context_in = context_in.to(device)
-                if context_out is not None:
-                    context_out = context_out.to(device)
-
-    timer.report()
-    return timer
-
-
-def profile_model_forward(model, batch, device, timer, unwrapped_model):
-    """Profile model forward pass in detail."""
-    images = batch["image"].to(device)
-    labels = batch["label"].to(device)
-    context_in = batch.get("context_in")
-    context_out = batch.get("context_out")
-    if context_in is not None:
-        context_in = context_in.to(device)
-    if context_out is not None:
-        context_out = context_out.to(device)
-
-    if labels.dim() == 3:
-        labels = labels.unsqueeze(1)
-
-    # Manual profiling of forward pass components
-    B, _, H, W = images.shape
-
-    # Feature extraction
-    with timer.track("feature_extraction"):
-        if unwrapped_model.feature_extractor is not None:
-            target_features, context_features = unwrapped_model._extract_features(
-                images, context_in, context_out
-            )
-        else:
-            target_features, context_features = None, None
-
-    # Full forward with tracking
-    with timer.track("full_forward"):
-        outputs = model(
-            images,
-            labels=labels,
-            context_in=context_in,
-            context_out=context_out,
-            target_features=target_features,
-            context_features=context_features,
-            mode="train",
-        )
-
-    with timer.track("compute_loss"):
-        losses = unwrapped_model.compute_loss(outputs, labels)
-        loss = losses["total_loss"]
-
-    return outputs, loss
-
-
-def profile_forward_detailed(model, batch, device, unwrapped_model):
-    """Detailed profiling of forward pass internals."""
-    print("\n" + "=" * 80)
-    print("DETAILED FORWARD PASS PROFILING")
-    print("=" * 80)
-
-    timer = Timer()
-
-    images = batch["image"].to(device)
-    labels = batch["label"].to(device)
-    context_in = batch.get("context_in")
-    context_out = batch.get("context_out")
-    if context_in is not None:
-        context_in = context_in.to(device)
-    if context_out is not None:
-        context_out = context_out.to(device)
-
-    if labels.dim() == 3:
-        labels = labels.unsqueeze(1)
-
-    B, _, H, W = images.shape
-
-    # 1. Feature extraction breakdown
-    with timer.track("1.feature_extraction_total"):
-        if unwrapped_model.feature_extractor is not None:
-            fe = unwrapped_model.feature_extractor
-
-            # Prepare inputs
-            with timer.track("1a.prepare_inputs"):
-                k = context_in.shape[1] if context_in is not None else 0
-                if context_in is not None:
-                    ctx_flat = context_in.view(B * k, *context_in.shape[2:])
-                    mask_flat = (
-                        context_out.view(B * k, *context_out.shape[2:])
-                        if context_out is not None
-                        else None
-                    )
-                    all_images = torch.cat([images, ctx_flat], dim=0)
-                else:
-                    all_images = images
-                    mask_flat = None
-
-            with timer.track("1b.resize_inputs"):
-                if all_images.shape[-2:] != (128, 128):
-                    all_images = F.interpolate(
-                        all_images,
-                        size=(128, 128),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                if mask_flat is not None and mask_flat.shape[-2:] != (128, 128):
-                    mask_flat = F.interpolate(
-                        mask_flat.float(), size=(128, 128), mode="nearest"
-                    )
-
-            with timer.track("1c.encoder_forward"):
-                # Run through conv blocks
-                img_x = all_images
-                msk_x = mask_flat
-                for i in range(4):
-                    with timer.track(f"1c_{i}_img_block"):
-                        img_x = fe.img_blocks[i](img_x)
-                    if msk_x is not None:
-                        with timer.track(f"1c_{i}_msk_block"):
-                            msk_x = fe.msk_blocks[i](msk_x)
-                    if i < 3:
-                        img_x = fe.pool(img_x)
-                        if msk_x is not None:
-                            msk_x = fe.pool(msk_x)
-
-            # Get proper features
-            target_features, context_features = fe.extract_batch(
-                images, context_in, context_out
-            )
-        else:
-            target_features, context_features = None, None
-
-    # 2. Per-level forward
-    for level_idx in range(unwrapped_model.num_levels):
-        level_cfg = unwrapped_model.levels[level_idx]
-        resolution = level_cfg["resolution"]
-        sampler = unwrapped_model.samplers[level_idx]
-        aggregator = unwrapped_model.aggregators[level_idx]
-
-        with timer.track(f"2.level_{level_idx}_total"):
-            # Downsample
-            with timer.track(f"2a.level_{level_idx}_downsample"):
-                image_ds = unwrapped_model._downsample(images, resolution)
-                labels_ds = unwrapped_model._downsample_mask(labels, resolution)
-                weights = unwrapped_model._mask_to_weights(labels_ds)
-
-            # Target sampling
-            with timer.track(f"2b.level_{level_idx}_target_sampling"):
-                patches, patch_labels, coords, _, aug_params, validity = sampler(
-                    image_ds, labels_ds, weights, None
-                )
-
-            # Extract target patch features
-            with timer.track(f"2c.level_{level_idx}_extract_target_features"):
-                if target_features is not None:
-                    from src.models.patch_icl_v2.patch_icl import extract_patch_features
-
-                    target_patch_features = extract_patch_features(
-                        features=target_features,
-                        coords=coords,
-                        patch_size=level_cfg["patch_size"],
-                        level_resolution=resolution,
-                        feature_grid_size=unwrapped_model.feature_grid_size,
-                        target_patch_grid_size=unwrapped_model.patch_feature_grid_size,
-                    )
-
-            # Context sampling
-            if context_in is not None:
-                k = context_in.shape[1]
-                context_in_flat = context_in.view(B * k, *context_in.shape[2:])
-                context_out_flat = context_out.view(B * k, *context_out.shape[2:])
-
-                with timer.track(f"2d.level_{level_idx}_context_downsample"):
-                    context_in_ds = unwrapped_model._downsample(
-                        context_in_flat, resolution
-                    ).view(B, k, -1, resolution, resolution)
-                    context_out_ds = unwrapped_model._downsample_mask(
-                        context_out_flat, resolution
-                    ).view(B, k, context_out.shape[2], resolution, resolution)
-                    context_weights = unwrapped_model._mask_to_weights(
-                        context_out_ds.view(B * k, *context_out_ds.shape[2:])
-                    ).view(B, k, 1, resolution, resolution)
-
-                with timer.track(f"2e.level_{level_idx}_context_sampling"):
-                    ctx_patches, ctx_labels, ctx_coords, _, ctx_validity = (
-                        unwrapped_model._select_context_patches(
-                            context_in_ds, context_out_ds, context_weights, sampler
-                        )
-                    )
-
-                with timer.track(f"2f.level_{level_idx}_extract_context_features"):
-                    if context_features is not None:
-                        K_ctx = ctx_patches.shape[1]
-                        K_per_ctx = K_ctx // k
-                        ctx_features_list = []
-                        for ctx_idx in range(k):
-                            ctx_feats = context_features[:, ctx_idx]
-                            ctx_coords_slice = ctx_coords[
-                                :, ctx_idx * K_per_ctx : (ctx_idx + 1) * K_per_ctx
-                            ]
-                            extracted = extract_patch_features(
-                                features=ctx_feats,
-                                coords=ctx_coords_slice,
-                                patch_size=level_cfg["patch_size"],
-                                level_resolution=resolution,
-                                feature_grid_size=unwrapped_model.feature_grid_size,
-                                target_patch_grid_size=unwrapped_model.patch_feature_grid_size,
-                            )
-                            ctx_features_list.append(extracted)
-                        context_patch_features = torch.cat(ctx_features_list, dim=1)
-
-                # Backbone (encoder + attention + decoder)
-                with timer.track(f"2g.level_{level_idx}_backbone_total"):
-                    K = target_patch_features.shape[1]
-                    K_ctx = context_patch_features.shape[1]
-                    coord_scale = H / resolution
-
-                    img_patches = torch.cat(
-                        [target_patch_features, context_patch_features], dim=1
-                    )
-                    all_coords = torch.cat(
-                        [
-                            coords.float() * coord_scale,
-                            ctx_coords.float() * coord_scale,
-                        ],
-                        dim=1,
-                    )
-                    ctx_id_labels = torch.zeros(
-                        B, K + K_ctx, dtype=torch.long, device=device
-                    )
-                    K_per_ctx = K_ctx // k
-                    for ctx_idx in range(k):
-                        start = K + ctx_idx * K_per_ctx
-                        end = K + (ctx_idx + 1) * K_per_ctx
-                        ctx_id_labels[:, start:end] = ctx_idx + 1
-
-                    with timer.track(f"2g1.level_{level_idx}_cnn_encoder"):
-                        encoded, skips = unwrapped_model.backbone.encoder(img_patches)
-                        encoded = encoded + unwrapped_model.backbone.level_embed[
-                            level_idx
-                        ].view(1, 1, -1)
-
-                    with timer.track(f"2g2.level_{level_idx}_attention"):
-                        is_context = ctx_id_labels > 0
-                        attended, _ = unwrapped_model.backbone.attention(
-                            encoded, all_coords, is_context, return_attn_weights=False
-                        )
-
-                    with timer.track(f"2g3.level_{level_idx}_cnn_decoder"):
-                        mask_pred = unwrapped_model.backbone.decoder(attended, skips)
-
-                # Aggregation
-                with timer.track(f"2h.level_{level_idx}_aggregation"):
-                    patch_logits = mask_pred[:, :K]
-                    pred = aggregator(patch_logits, coords, (resolution, resolution))
-
-    timer.report()
-    return timer
-
-
-def profile_backward(model, batch, device, unwrapped_model):
-    """Profile backward pass."""
-    print("\n" + "=" * 80)
-    print("BACKWARD PASS PROFILING")
-    print("=" * 80)
-
-    timer = Timer()
-
-    images = batch["image"].to(device)
-    labels = batch["label"].to(device)
-    context_in = batch.get("context_in")
-    context_out = batch.get("context_out")
-    if context_in is not None:
-        context_in = context_in.to(device)
-    if context_out is not None:
-        context_out = context_out.to(device)
-
-    if labels.dim() == 3:
-        labels = labels.unsqueeze(1)
-
-    # Forward
-    with timer.track("forward"):
-        outputs = model(
-            images,
-            labels=labels,
-            context_in=context_in,
-            context_out=context_out,
-            mode="train",
-        )
-        losses = unwrapped_model.compute_loss(outputs, labels)
-        loss = losses["total_loss"]
-
-    # Backward
-    with timer.track("backward"):
-        loss.backward()
-
-    timer.report()
-    return timer
-
-
-def run_pytorch_profiler(model, train_loader, device, num_batches=3):
-    """Run PyTorch profiler for detailed CUDA analysis."""
-    print("\n" + "=" * 80)
-    print("PYTORCH PROFILER (CUDA kernels)")
-    print("=" * 80)
-
-    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-
-    with profile(
-        activities=activities,
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    ) as prof:
-        for idx, batch in enumerate(train_loader):
-            if idx >= num_batches:
-                break
-
-            images = batch["image"].to(device)
-            labels = batch["label"].to(device)
-            context_in = batch.get("context_in")
-            context_out = batch.get("context_out")
-            if context_in is not None:
-                context_in = context_in.to(device)
-            if context_out is not None:
-                context_out = context_out.to(device)
-
-            if labels.dim() == 3:
-                labels = labels.unsqueeze(1)
-
-            with record_function("forward"):
-                outputs = model(
-                    images,
-                    labels=labels,
-                    context_in=context_in,
-                    context_out=context_out,
-                    mode="train",
-                )
-
-            with record_function("compute_loss"):
-                from accelerate import Accelerator
-
-                accelerator = Accelerator()
-                unwrapped = accelerator.unwrap_model(model)
-                losses = unwrapped.compute_loss(outputs, labels)
-                loss = losses["total_loss"]
-
-            with record_function("backward"):
-                loss.backward()
-
-            model.zero_grad()
-
-    # Print summary
-    print("\n--- Top 30 CUDA operations by total time ---")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
-
-    print("\n--- Top 30 operations by CPU time ---")
-    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
-
-    # Export chrome trace
-    trace_path = "/tmp/profile_trace.json"
-    prof.export_chrome_trace(trace_path)
-    print(f"\nChrome trace exported to {trace_path}")
-    print("Open chrome://tracing and load this file for visualization")
-
-    return prof
-
-
-@hydra.main(version_base=None, config_path="../configs", config_name="train")
-def main(cfg: DictConfig) -> None:
-    """Main profiling function."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    seed_everything(cfg.training.seed)
-
-    # Image augmentation config
+def build_dataloader(cfg):
+    """Build train dataloader from config."""
     img_aug_cfg = cfg.get("image_augmentation", {})
     use_image_augmentation = img_aug_cfg.get("enabled", False)
     augment_config = (
         OmegaConf.to_container(img_aug_cfg, resolve=True)
-        if use_image_augmentation
-        else None
+        if use_image_augmentation else None
     )
 
-    # Create dataloader
-    dataset_type = cfg.get("dataset", "totalseg2d")
-    feature_mode = cfg.get("feature_mode", "precomputed")
+    from src.dataloaders.totalseg2d_dataloader_fast import (
+        get_dataloader as get_totalseg2d_dataloader,
+    )
 
-    if dataset_type == "totalseg2d":
-        from src.dataloaders.totalseg2d_dataloader import (
-            get_dataloader as get_totalseg2d_dataloader,
-        )
+    train_labels = (
+        cfg.train_label_ids
+        if isinstance(cfg.train_label_ids, str)
+        else list(cfg.train_label_ids)
+    )
+    train_split_cfg = cfg.get("train_split", "train")
+    train_split = list(train_split_cfg) if OmegaConf.is_list(train_split_cfg) else train_split_cfg
 
-        train_labels = (
-            cfg.train_label_ids
-            if isinstance(cfg.train_label_ids, str)
-            else list(cfg.train_label_ids)
-        )
-
-        max_ds_len_cfg = cfg.get("max_ds_len")
-        if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
-            max_ds_len_train = max_ds_len_cfg.get("train")
-        else:
-            max_ds_len_train = max_ds_len_cfg
-
-        carve_mix_cfg = cfg.get("carve_mix", {})
-        use_carve_mix = carve_mix_cfg.get("enabled", False)
-        carve_mix_config = (
-            OmegaConf.to_container(carve_mix_cfg, resolve=True)
-            if use_carve_mix
-            else None
-        )
-
-        adv_aug_cfg = cfg.get("advanced_augmentation", {})
-        use_adv_aug = adv_aug_cfg.get("enabled", False)
-        adv_aug_config = (
-            OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
-        )
-
-        # Limit dataset for profiling
-        max_ds_len_train = min(max_ds_len_train or 1000, 100)
-
-        train_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalseg2d,
-            stats_path=cfg.paths.totalseg_stats,
-            label_id_list=train_labels,
-            context_size=cfg.context_size,
-            batch_size=cfg.train_batch_size,
-            image_size=tuple(cfg.preprocessing.image_size[:2]),
-            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-            bbox_padding=cfg.preprocessing.bbox_padding,
-            num_workers=cfg.training.get("num_workers", 4),
-            split="train",
-            shuffle=True,
-            max_ds_len=max_ds_len_train,
-            random_coloring_nb=cfg.get("random_coloring_nb", 0),
-            augment=use_image_augmentation,
-            augment_config=augment_config,
-            carve_mix=use_carve_mix,
-            carve_mix_config=carve_mix_config,
-            advanced_augmentation=use_adv_aug,
-            advanced_augmentation_config=adv_aug_config,
-            max_labels=cfg.get("max_labels", None),
-        )
+    max_ds_len_cfg = cfg.get("max_ds_len")
+    if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
+        max_ds_len_train = max_ds_len_cfg.get("train")
     else:
-        raise ValueError(
-            f"Profiling only supports totalseg2d dataset, got {dataset_type}"
-        )
+        max_ds_len_train = max_ds_len_cfg
 
-    print(
-        f"Dataset size: {len(train_loader.dataset)}, batch size: {cfg.train_batch_size}"
+    carve_mix_cfg = cfg.get("carve_mix", {})
+    use_carve_mix = carve_mix_cfg.get("enabled", False)
+    carve_mix_config = (
+        OmegaConf.to_container(carve_mix_cfg, resolve=True) if use_carve_mix else None
+    )
+    adv_aug_cfg = cfg.get("advanced_augmentation", {})
+    use_adv_aug = adv_aug_cfg.get("enabled", False)
+    adv_aug_config = (
+        OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
     )
 
-    # Create model
+    return get_totalseg2d_dataloader(
+        root_dir=cfg.paths.totalseg2d_h5,
+        stats_path=cfg.paths.totalseg_stats,
+        label_id_list=train_labels,
+        context_size=cfg.context_size,
+        batch_size=cfg.train_batch_size,
+        image_size=tuple(cfg.preprocessing.image_size[:2]),
+        crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+        bbox_padding=cfg.preprocessing.bbox_padding,
+        num_workers=cfg.training.get("num_workers", 4),
+        split=train_split,
+        shuffle=True,
+        max_ds_len=max_ds_len_train,
+        random_coloring_nb=cfg.get("random_coloring_nb", 0),
+        augment=use_image_augmentation,
+        augment_config=augment_config,
+        carve_mix=use_carve_mix,
+        carve_mix_config=carve_mix_config,
+        advanced_augmentation=use_adv_aug,
+        advanced_augmentation_config=adv_aug_config,
+        max_labels=cfg.get("max_labels", None),
+    )
+
+
+def build_model(cfg, device):
+    """Build PatchICL model from config."""
     from src.models.patch_icl_v2 import PatchICL
 
     patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
     random_coloring_nb = cfg.get("random_coloring_nb", 0)
     patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
 
-    # Feature extractor
+    feature_mode = cfg.get("feature_mode", "precomputed")
     feature_extractor = None
     if feature_mode == "on_the_fly":
         fe_cfg = patch_icl_cfg.get("feature_extractor", None)
-        extractor_type = fe_cfg.get("type", "meddino").lower() if fe_cfg else "meddino"
-
+        extractor_type = (
+            fe_cfg.get("type", "meddino").lower() if fe_cfg
+            else cfg.get("feature_extractor_type", "meddino").lower()
+        )
         if extractor_type == "icl_encoder":
             from src.models.icl_encoder import ICLEncoder
-
             feature_extractor = ICLEncoder(
                 layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
                 output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
                 freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
             )
+        elif extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
+            from src.models.meddino_extractor import create_meddino_extractor
+            feature_extractor = create_meddino_extractor(
+                model_path=fe_cfg.get("model_path", cfg.paths.ckpts.meddino_vit),
+                target_size=fe_cfg.get("target_size", 256),
+                device=device,
+                layer_idx=fe_cfg.get("layer_idx", 11),
+                freeze=fe_cfg.get("freeze", True),
+            )
+        else:
+            raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
 
     model = PatchICL(
         patch_icl_cfg,
@@ -579,37 +204,303 @@ def main(cfg: DictConfig) -> None:
         feature_extractor=feature_extractor,
     )
 
-    # Loss functions
     loss_cfg = patch_icl_cfg.get("loss", {})
     patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
     aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
-    patch_criterion = build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args"))
-    aggreg_criterion = build_loss_fn(
-        aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args")
+    model.set_loss_functions(
+        build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args")),
+        build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args")),
     )
-    model.set_loss_functions(patch_criterion, aggreg_criterion)
+    return model, patch_icl_cfg
 
-    model = model.to(device)
+
+# ---------------------------------------------------------------------------
+# Profiling phases
+# ---------------------------------------------------------------------------
+
+def phase1_manual_timing(model, train_loader, optimizer, device, accelerator,
+                         grad_accumulate_steps, n_batches=10):
+    """Phase 1: Wall-clock timing of each training stage."""
+    unwrapped = accelerator.unwrap_model(model)
+    timer = Timer()
     model.train()
 
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {num_params:,}")
+    for idx, batch in enumerate(train_loader):
+        if idx >= n_batches:
+            break
 
-    # Get a batch for profiling
+        with timer.track("TOTAL_ITERATION"):
+            with timer.track("01_data_to_device"):
+                images = batch["image"].to(device)
+                labels = batch["label"].to(device)
+                context_in = batch.get("context_in")
+                context_out = batch.get("context_out")
+                if context_in is not None:
+                    context_in = context_in.to(device)
+                if context_out is not None:
+                    context_out = context_out.to(device)
+                target_features = batch.get("target_features")
+                context_features = batch.get("context_features")
+                if target_features is not None:
+                    target_features = target_features.to(device)
+                if context_features is not None:
+                    context_features = context_features.to(device)
+                if labels.dim() == 3:
+                    labels = labels.unsqueeze(1)
+
+            with timer.track("02_zero_grad"):
+                if idx % grad_accumulate_steps == 0:
+                    optimizer.zero_grad()
+
+            with timer.track("03_forward"):
+                outputs = model(
+                    images, labels=labels,
+                    context_in=context_in, context_out=context_out,
+                    target_features=target_features,
+                    context_features=context_features,
+                    mode="train",
+                )
+
+            with timer.track("04_compute_loss"):
+                losses = unwrapped.compute_loss(outputs, labels)
+                loss = losses["total_loss"]
+
+            with timer.track("05_backward"):
+                scaled_loss = loss / grad_accumulate_steps
+                accelerator.backward(scaled_loss)
+
+            if (idx + 1) % grad_accumulate_steps == 0:
+                with timer.track("06_clip_grad"):
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                with timer.track("07_optimizer_step"):
+                    optimizer.step()
+
+        del outputs, losses
+
+    timer.report("Phase 1 — Per-Stage Wall-Clock Timing")
+    return timer
+
+
+def phase2_pytorch_profiler(model, train_loader, optimizer, device,
+                            accelerator, grad_accumulate_steps, trace_dir,
+                            n_batches=3):
+    """Phase 2: Raw PyTorch profiler on unwrapped model with reduced batch.
+
+    Uses a smaller sub-batch to leave headroom for profiler's CUDA allocations.
+    Only runs on main process to avoid DDP sync issues.
+    """
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    unwrapped = accelerator.unwrap_model(model)
+    is_main = accelerator.is_main_process
+
+    if not is_main:
+        # Non-main ranks just idle; no DDP sync needed since we use unwrapped
+        accelerator.wait_for_everyone()
+        return None
+
+    # Free DDP memory — profile unwrapped model directly
+    torch.cuda.empty_cache()
+    unwrapped.train()
+
+    # Grab a batch and slice to half size to leave room for profiler
     batch = next(iter(train_loader))
+    half_bs = max(1, batch["image"].shape[0] // 4)  # Use 1/4 batch
 
-    print("\n" + "=" * 80)
-    print("BATCH INFO")
-    print("=" * 80)
-    print(f"Images shape: {batch['image'].shape}")
-    print(f"Labels shape: {batch['label'].shape}")
-    if batch.get("context_in") is not None:
-        print(f"Context in shape: {batch['context_in'].shape}")
-        print(f"Context out shape: {batch['context_out'].shape}")
+    images = batch["image"][:half_bs].to(device)
+    labels = batch["label"][:half_bs].to(device)
+    context_in = batch.get("context_in")
+    context_out = batch.get("context_out")
+    if context_in is not None:
+        context_in = context_in[:half_bs].to(device)
+    if context_out is not None:
+        context_out = context_out[:half_bs].to(device)
+    if labels.dim() == 3:
+        labels = labels.unsqueeze(1)
 
-    # Warmup
-    print("\nWarming up...")
-    for _ in range(3):
+    print(f"  Profiling with sub-batch size {half_bs} (from {batch['image'].shape[0]})")
+
+    # Warmup run (no profiling)
+    with torch.no_grad():
+        out = unwrapped(images, labels=labels, context_in=context_in,
+                        context_out=context_out, mode="train")
+        del out
+    torch.cuda.empty_cache()
+
+    trace_path = str(Path(trace_dir) / "trace.json")
+    Path(trace_dir).mkdir(parents=True, exist_ok=True)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_flops=True,
+        with_stack=False,
+    ) as prof:
+        for i in range(n_batches):
+            optimizer.zero_grad()
+
+            with record_function("FORWARD_PASS"):
+                outputs = unwrapped(
+                    images, labels=labels,
+                    context_in=context_in, context_out=context_out,
+                    mode="train",
+                )
+
+            with record_function("COMPUTE_LOSS"):
+                losses = unwrapped.compute_loss(outputs, labels)
+                loss = losses["total_loss"]
+
+            with record_function("BACKWARD_PASS"):
+                loss.backward()
+
+            with record_function("OPTIMIZER_STEP"):
+                torch.nn.utils.clip_grad_norm_(unwrapped.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            del outputs, losses
+            torch.cuda.empty_cache()
+
+    prof.export_chrome_trace(trace_path)
+    print(f"  Chrome trace exported to: {trace_path}")
+
+    accelerator.wait_for_everyone()
+    return prof
+
+
+def print_profiler_results(prof):
+    """Print comprehensive tables from PyTorch profiler."""
+
+    _sep("CUDA TIME — Top 30 Operations")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+
+    _sep("CPU TIME — Top 30 Operations")
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=30))
+
+    # Memory table (only if profile_memory was enabled)
+    try:
+        _sep("CUDA MEMORY — Top 30 Operations (by self_cuda_memory_usage)")
+        print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=30))
+    except Exception:
+        pass  # profile_memory was disabled
+
+    _sep("FLOPs — Top 30 Operations")
+    print(prof.key_averages().table(sort_by="flops", row_limit=30))
+
+    _sep("CUDA TIME grouped by Input Shape — Top 30")
+    print(prof.key_averages(group_by_input_shape=True).table(
+        sort_by="self_cuda_time_total", row_limit=30))
+
+    # Custom annotated regions
+    _sep("Custom Annotated Regions Summary")
+    region_names = {"FORWARD_PASS", "COMPUTE_LOSS", "BACKWARD_PASS", "OPTIMIZER_STEP"}
+    for evt in prof.key_averages():
+        if evt.key in region_names:
+            print(
+                f"  {evt.key:20s}  "
+                f"CPU: {evt.cpu_time_total / 1e3:>10.1f} ms  "
+                f"CUDA: {evt.cuda_time_total / 1e3:>10.1f} ms  "
+                f"Calls: {evt.count:>3d}  "
+                f"CPU Mem: {evt.cpu_memory_usage / 1024**2:>8.1f} MB  "
+                f"CUDA Mem: {evt.cuda_memory_usage / 1024**2:>8.1f} MB"
+            )
+
+    # Total FLOPs
+    total_flops = sum(evt.flops for evt in prof.key_averages() if evt.flops)
+    if total_flops > 0:
+        print(f"\n  Total FLOPs (profiled batches): {total_flops:,.0f}")
+        print(f"  Total GFLOPs: {total_flops / 1e9:.2f}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+@hydra.main(version_base=None, config_path="../configs", config_name="train")
+def main(cfg: DictConfig) -> None:
+    """Profile training with Accelerate profiler."""
+
+    # --- Accelerator setup ---
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    mixed_precision = cfg.training.get("mixed_precision", None)
+
+    trace_dir = Path(cfg.paths.RESULTS_DIR) / "profiling"
+    profile_kwargs = ProfileKwargs(
+        activities=["cpu", "cuda"],
+        record_shapes=True,
+        profile_memory=False,  # Disable to avoid OOM on small VRAM GPUs
+        with_flops=True,
+        with_stack=False,
+        schedule_option={
+            "skip_first": 0,
+            "wait": 1,       # 1 warmup (no recording)
+            "warmup": 1,     # 1 profiler warmup
+            "active": 3,     # 3 active profiling batches (reduced for memory)
+            "repeat": 1,
+        },
+        output_trace_dir=str(trace_dir),
+    )
+
+    accelerator = Accelerator(
+        kwargs_handlers=[ddp_kwargs, profile_kwargs],
+        mixed_precision=mixed_precision,
+    )
+    device = accelerator.device
+    is_main = accelerator.is_main_process
+    seed_everything(cfg.training.seed)
+
+    if is_main:
+        _sep("PatchICL Training Profiler")
+        print(f"  Device: {device}  |  Processes: {accelerator.num_processes}  |  "
+              f"Mixed precision: {mixed_precision}")
+        _print_gpu_info()
+
+    # --- Data + model ---
+    train_loader = build_dataloader(cfg)
+    model, patch_icl_cfg = build_model(cfg, device)
+
+    if is_main:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        param_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**2
+        buf_mb = sum(b.numel() * b.element_size() for b in model.buffers()) / 1024**2
+        print(f"\n  Trainable params: {trainable:,}  |  Total: {total:,}")
+        print(f"  Param memory: {param_mb:.1f} MB  |  Buffer memory: {buf_mb:.1f} MB")
+
+    # Optimizer
+    opt_args = cfg.optimizer.optimizer_args
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=opt_args.lr, weight_decay=opt_args.weight_decay
+    )
+
+    # Prepare for distributed
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    grad_accumulate_steps = cfg.training.get("grad_accumulate_steps", 1)
+
+    if is_main and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        _print_vram("after model load + prepare")
+
+    # --- Warmup (also prints batch shape info from first batch) ---
+    if is_main:
+        _sep("Warmup (2 batches)", "-")
+    model.train()
+    unwrapped = accelerator.unwrap_model(model)
+    printed_shapes = False
+    for idx, batch in enumerate(train_loader):
+        if idx >= 2:
+            break
+
+        # Print batch shapes from first batch (all ranks participate in iteration)
+        if not printed_shapes and is_main:
+            _sep("Batch Shape Info")
+            for k, v in batch.items():
+                if hasattr(v, "shape"):
+                    print(f"  {k:25s} {list(v.shape)}  dtype={v.dtype}")
+                elif isinstance(v, (list, tuple)) and len(v) > 0:
+                    print(f"  {k:25s} len={len(v)}  type={type(v[0]).__name__}")
+            printed_shapes = True
+
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
         context_in = batch.get("context_in")
@@ -618,112 +509,79 @@ def main(cfg: DictConfig) -> None:
             context_in = context_in.to(device)
         if context_out is not None:
             context_out = context_out.to(device)
+        target_features = batch.get("target_features")
+        context_features = batch.get("context_features")
+        if target_features is not None:
+            target_features = target_features.to(device)
+        if context_features is not None:
+            context_features = context_features.to(device)
         if labels.dim() == 3:
             labels = labels.unsqueeze(1)
         outputs = model(
-            images,
-            labels=labels,
-            context_in=context_in,
-            context_out=context_out,
+            images, labels=labels,
+            context_in=context_in, context_out=context_out,
+            target_features=target_features,
+            context_features=context_features,
             mode="train",
         )
-        loss = model.compute_loss(outputs, labels)["total_loss"]
-        loss.backward()
-        model.zero_grad()
+        loss = unwrapped.compute_loss(outputs, labels)["total_loss"]
+        accelerator.backward(loss)
+        optimizer.step()
+        optimizer.zero_grad()
     torch.cuda.synchronize()
 
-    # 1. Profile data loading
-    print("\n\n" + "#" * 80)
-    print("# PROFILING DATA LOADING")
-    print("#" * 80)
-    profile_dataloader(train_loader, device, num_batches=10)
+    if is_main:
+        _print_vram("after warmup (peak includes forward+backward)")
 
-    # 2. Detailed forward profiling
-    print("\n\n" + "#" * 80)
-    print("# PROFILING FORWARD PASS (DETAILED)")
-    print("#" * 80)
-    profile_forward_detailed(model, batch, device, model)
-
-    # 3. Profile backward
-    print("\n\n" + "#" * 80)
-    print("# PROFILING BACKWARD PASS")
-    print("#" * 80)
-    profile_backward(model, batch, device, model)
-
-    # 4. Full training iteration timing
-    print("\n\n" + "#" * 80)
-    print("# FULL TRAINING ITERATION TIMING")
-    print("#" * 80)
-    timer = Timer()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-    for idx, batch in enumerate(train_loader):
-        if idx >= 10:
-            break
-
-        with timer.track("total_iteration"):
-            with timer.track("data_to_device"):
-                images = batch["image"].to(device)
-                labels = batch["label"].to(device)
-                context_in = batch.get("context_in")
-                context_out = batch.get("context_out")
-                if context_in is not None:
-                    context_in = context_in.to(device)
-                if context_out is not None:
-                    context_out = context_out.to(device)
-                if labels.dim() == 3:
-                    labels = labels.unsqueeze(1)
-
-            with timer.track("zero_grad"):
-                optimizer.zero_grad()
-
-            with timer.track("forward"):
-                outputs = model(
-                    images,
-                    labels=labels,
-                    context_in=context_in,
-                    context_out=context_out,
-                    mode="train",
-                )
-
-            with timer.track("loss"):
-                losses = model.compute_loss(outputs, labels)
-                loss = losses["total_loss"]
-
-            with timer.track("backward"):
-                loss.backward()
-
-            with timer.track("optimizer_step"):
-                optimizer.step()
-
-    timer.report()
-
-    # 5. PyTorch profiler for CUDA kernel analysis
-    print("\n\n" + "#" * 80)
-    print("# PYTORCH CUDA PROFILER")
-    print("#" * 80)
-    model.zero_grad()
-    run_pytorch_profiler(model, train_loader, device, num_batches=3)
-
-    print("\n\n" + "=" * 80)
-    print("PROFILING COMPLETE")
-    print("=" * 80)
-    print(
-        """
-ANALYSIS TIPS:
-1. If data_to_device time is high → CPU-GPU transfer bottleneck, consider pinned memory
-2. If dataloader time is high → Data augmentation or disk I/O bottleneck
-3. If feature_extraction time is high → Consider freezing encoder or using precomputed features
-4. If attention time is high → Reduce num_patches or use more efficient attention
-5. If backward time >> forward time → Memory pressure, consider gradient checkpointing
-6. Check chrome trace for detailed kernel-level analysis
-"""
+    # ===================================================================
+    # Phase 1: Manual wall-clock timing
+    # ===================================================================
+    if is_main:
+        _sep("PHASE 1 — Wall-Clock Timing (10 batches)", "#")
+    phase1_manual_timing(
+        model, train_loader, optimizer, device, accelerator,
+        grad_accumulate_steps, n_batches=10,
     )
+
+    # ===================================================================
+    # Phase 2: Accelerate profiler (CPU/CUDA time, memory, FLOPs)
+    # ===================================================================
+    if is_main:
+        _sep("PHASE 2 — PyTorch Profiler (3 iterations, reduced batch, main rank only)", "#")
+        torch.cuda.reset_peak_memory_stats()
+
+    prof = phase2_pytorch_profiler(
+        model, train_loader, optimizer, device, accelerator,
+        grad_accumulate_steps, trace_dir=str(trace_dir), n_batches=3,
+    )
+
+    if is_main and prof is not None:
+        torch.cuda.synchronize()
+        print_profiler_results(prof)
+
+        # Peak VRAM summary
+        _sep("Peak VRAM Summary")
+        _print_vram("final")
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"  Peak allocated (during profiled run): {peak:.2f} GB")
+
+        # Trace location
+        if prof is not None:
+            _sep("Chrome Trace Export")
+            print(f"  Traces saved to: {trace_dir}")
+            print(f"  Open at: chrome://tracing  or  https://ui.perfetto.dev")
+
+        _sep("Profiling Complete")
+        print("""
+OPTIMIZATION CHECKLIST:
+  1. Data loading slow?    → Increase num_workers, use pinned memory, or prefetch
+  2. Feature extraction?   → Freeze encoder, reduce resolution, precompute features
+  3. Attention bottleneck? → Reduce num_patches/num_layers, use Flash Attention
+  4. Backward >> Forward?  → Gradient checkpointing, reduce batch size
+  5. Memory pressure?      → Mixed precision (fp16/bf16), gradient accumulation
+  6. Optimizer step slow?  → Fused AdamW (torch.optim.AdamW(fused=True))
+""")
 
 
 if __name__ == "__main__":
-    from contextlib import redirect_stdout
-
-    output_path = "profiler_output.txt"
-    with open(output_path, "w") as f, redirect_stdout(f):
-        main()
+    main()

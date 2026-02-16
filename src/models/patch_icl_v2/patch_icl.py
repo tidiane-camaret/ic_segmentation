@@ -233,6 +233,7 @@ class PatchICL(nn.Module):
             append_zero_attn=backbone_cfg.get('append_zero_attn', False),
             max_levels=self.num_levels,
             gradient_checkpointing=backbone_cfg.get('gradient_checkpointing', False),
+            num_context_layers=backbone_cfg.get('num_context_layers', 0),
         )
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
@@ -473,6 +474,7 @@ class PatchICL(nn.Module):
             backbone_out = self.backbone(
                 img_patches=img_patches, coords=all_coords, ctx_id_labels=ctx_id_labels,
                 return_attn_weights=return_attn_weights, level_idx=level_idx,
+                num_target_patches=K,
             )
 
             all_logits = backbone_out['mask_patch_logit_preds']

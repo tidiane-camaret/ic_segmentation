@@ -14,6 +14,30 @@ PRED_THRESHOLD = 0.5      # sigmoid probability -> binary prediction
 GT_AREA_THRESHOLD = 0.25  # soft avg-pooled GT -> binary (>=25% coverage = foreground)
 
 
+def compute_pixel_mae(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    apply_sigmoid: bool = True,
+) -> torch.Tensor:
+    """Mean absolute error between soft pred and soft GT, per sample.
+
+    Works at any resolution without binarization. At coarse resolutions (8x8),
+    this is more informative than dice which requires binarization.
+
+    Args:
+        pred: Prediction logits [B, C, H, W]
+        target: Soft ground truth [B, C, H, W] (e.g. from avg_pool2d)
+        apply_sigmoid: Whether to apply sigmoid to pred
+
+    Returns:
+        Per-sample MAE tensor [B] (lower is better)
+    """
+    pred_probs = torch.sigmoid(pred).float() if apply_sigmoid else pred.float()
+    target_f = target.float()
+    spatial_dims = tuple(range(1, pred.dim()))
+    return (pred_probs - target_f).abs().mean(dim=spatial_dims)
+
+
 def compute_dice(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -49,22 +73,26 @@ def compute_dice(
     if spatial_dims is None:
         spatial_dims = tuple(range(2, pred.dim()))
 
+    # Detect empty GT from continuous values (threshold-free)
+    gt_has_fg = target_float.sum(dim=spatial_dims) > 0
+
     # Hard dice
     intersection = (pred_binary * target_binary).sum(dim=spatial_dims)
     union = pred_binary.sum(dim=spatial_dims) + target_binary.sum(dim=spatial_dims)
     dice = (2 * intersection + 1e-6) / (union + 1e-6)
+    dice = torch.where(gt_has_fg, dice, torch.zeros_like(dice))
 
-    result = {'dice': dice}
+    result = {'dice': dice, 'gt_has_foreground': gt_has_fg}
 
-    # Soft dice
+    # Soft dice (no binarization — uses continuous pred and GT directly)
     if return_soft:
-        # Cast to float32 for stable calculation, especially with fp16
         pred_probs_f32 = pred_probs.float()
         target_float_f32 = target_float.float()
 
         soft_intersection = (pred_probs_f32 * target_float_f32).sum(dim=spatial_dims)
         soft_denom = pred_probs_f32.sum(dim=spatial_dims) + target_float_f32.sum(dim=spatial_dims)
         soft_dice = (2 * soft_intersection + 1e-6) / (soft_denom + 1e-6)
+        soft_dice = torch.where(gt_has_fg, soft_dice, torch.zeros_like(soft_dice))
         result['soft_dice'] = soft_dice
 
     return result
@@ -94,6 +122,7 @@ def compute_level_metrics(
         dice_result = compute_dice(level_pred, labels_ds)
         metrics[f'level_{li}_dice'] = dice_result['dice'].mean()
         metrics[f'level_{li}_soft_dice'] = dice_result['soft_dice'].mean()
+        metrics[f'level_{li}_pixel_mae'] = compute_pixel_mae(level_pred, labels_ds).mean()
 
         # Refined probs dice (sampling guidance quality from progressive refinement)
         refined_probs = level_out.get('refined_probs')
@@ -185,14 +214,21 @@ def compute_all_metrics(
     if level_outputs:
         metrics.update(compute_level_metrics(level_outputs, labels))
 
-        # Final dice at last level's resolution (matches training loss resolution)
+        # Final metrics: upsample pred to full resolution for accurate dice
         last_pred = level_outputs[-1]['pred']
         last_res = last_pred.shape[-1]
-        sf = labels.shape[-1] // last_res
-        labels_ds = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
-        dice_result = compute_dice(last_pred, labels_ds)
+        full_res = labels.shape[-1]
+        if last_res < full_res:
+            pred_upsampled = F.interpolate(
+                last_pred, size=(full_res, full_res),
+                mode='bilinear', align_corners=False,
+            )
+        else:
+            pred_upsampled = last_pred
+        dice_result = compute_dice(pred_upsampled, labels)
         metrics['final_dice'] = dice_result['dice'].mean()
         metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
+        metrics['final_pixel_mae'] = compute_pixel_mae(pred_upsampled, labels).mean()
 
         # Context metrics from last level
         last_level = level_outputs[-1]
@@ -231,9 +267,15 @@ def compute_per_sample_dice(
     if level_outputs:
         last_pred = level_outputs[-1]['pred']
         last_res = last_pred.shape[-1]
-        sf = labels.shape[-1] // last_res
-        labels_ds = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
-        dice_result = compute_dice(last_pred, labels_ds)
+        full_res = labels.shape[-1]
+        if last_res < full_res:
+            pred_upsampled = F.interpolate(
+                last_pred, size=(full_res, full_res),
+                mode='bilinear', align_corners=False,
+            )
+        else:
+            pred_upsampled = last_pred
+        dice_result = compute_dice(pred_upsampled, labels)
     else:
         final_logit = outputs.get('final_logit')
         if final_logit is not None:

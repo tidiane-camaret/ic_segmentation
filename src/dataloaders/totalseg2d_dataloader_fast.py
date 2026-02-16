@@ -85,6 +85,7 @@ class TotalSeg2DDataset(Dataset):
         advanced_augmentation: bool = False,
         advanced_augmentation_config: Optional[Dict] = None,
         max_labels: Optional[int] = None,
+        class_balanced: bool = False,
     ):
         self.root_dir = Path(root_dir)
 
@@ -201,8 +202,21 @@ class TotalSeg2DDataset(Dataset):
         # This is a simplified valid_contexts. Original checked coverage, which we now do above.
         self.valid_contexts = {(label, axis): cases for label, cases in self.label_to_cases.items() for axis in self.axes}
 
+        # Class-balanced sampling: group samples by label for uniform label selection
+        self.class_balanced = class_balanced
+        self.label_to_samples: Dict[str, List[Tuple[str, str]]] = {}
+        for case_id, label_id, axis in self.samples:
+            self.label_to_samples.setdefault(label_id, []).append((case_id, axis))
+        self.active_labels = list(self.label_to_samples.keys())
+
         print(f"Built mapping for {len(self.label_to_cases)} labels.")
         print(f"Created {len(self.samples)} samples")
+        if self.class_balanced:
+            label_counts = {l: len(s) for l, s in self.label_to_samples.items()}
+            min_l = min(label_counts, key=label_counts.get)
+            max_l = max(label_counts, key=label_counts.get)
+            print(f"Class-balanced sampling: {len(self.active_labels)} labels, "
+                  f"min={min_l}({label_counts[min_l]}), max={max_l}({label_counts[max_l]})")
 
         if self.max_ds_len is not None and len(self.samples) > self.max_ds_len:
             random.shuffle(self.samples)
@@ -343,7 +357,12 @@ class TotalSeg2DDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a sample with context examples (on-the-fly from HDF5)."""
-        target_case_id, label_id, axis = self.samples[idx]
+        if self.class_balanced:
+            # Two-stage sampling: pick label uniformly, then pick a random sample
+            label_id = random.choice(self.active_labels)
+            target_case_id, axis = random.choice(self.label_to_samples[label_id])
+        else:
+            target_case_id, label_id, axis = self.samples[idx]
 
         # Load target slice
         img, mask = self._load_slice(target_case_id, label_id, axis)

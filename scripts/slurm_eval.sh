@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -p ml_gpu-rtx2080
 #SBATCH -c 20
-#SBATCH --mem 48000 
-#SBATCH --gres=gpu:2
-#SBATCH --time=2:00:00
+#SBATCH --mem 24000 
+#SBATCH --gres=gpu:1
+#SBATCH --time=30:00
 
 
 # interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 48000 --gres=gpu:2 --time=2:00:00 --pty bash 
@@ -24,10 +24,8 @@ nvidia-smi
 
 #uv run accelerate launch --multi_gpu scripts/eval.py experiment=60_2_levels cluster=dlclarge dataset=medsegbench checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/deep-feather-217/best_model.pt
 uv run accelerate launch \
-    --multi_gpu \
-    --num_processes=2 \
     scripts/eval.py \
+    +max_labels=100 \
     experiment=70_attention \
-    dataset=totalseg2d \
     cluster=dlclarge \
-    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-14_magnetic-balloon-244/best_model.pt
+    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_wooing-balloon-274/best_model.pt
