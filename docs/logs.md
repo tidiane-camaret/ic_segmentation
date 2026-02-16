@@ -4,6 +4,94 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-02-16: Augmentation Literature Review for In-Context Segmentation
+
+**Goal:** Survey SOTA augmentation strategies for in-context learning (ICL) segmentation, with focus on medical imaging (2024–2026).
+
+### Key Methods Reviewed
+
+**UniverSeg (ICCV 2023)** — Two-tier augmentation:
+- *In-Task Augmentation*: Standard transforms (affine, elastic, noise) applied **independently** to query and each support image with different random params.
+- *Task Augmentation*: Same transform applied **uniformly** to all query+support images (e.g., flip all, edge-detect all masks). Helps generalize to unseen tasks.
+- Support set size: 64 in most experiments.
+
+**SegGPT / Painter (ICCV 2023)** — Random coloring as core strategy:
+- Random color mapping per sample prevents class-color memorization.
+- Standard augmentations: random resize crop, color jitter, horizontal flip.
+- 50% probability of using augmented view as in-context example (semantic seg); 100% for instance seg.
+- No asymmetric support/query augmentation — the random coloring itself is the key trick.
+
+**SegICL (2024)** — Minimal augmentation details published. Relies on SA-Med2D-20M preprocessing. No explicit support/query augmentation distinction.
+
+**SAM2 + Augmentative Prompting (March 2025)** — Training-free, augmentation at inference:
+- Geometric: affine (scale, rotation, shear, translation) applied to support image + mask jointly.
+- Photometric: color jitter (brightness, contrast, saturation, hue) on image only.
+- NT=2 augmented versions per support image.
+- Dynamic matching via LPIPS: for each query slice, select augmented support with lowest perceptual distance.
+
+**Visual Prompt Selection (ECCV 2024)** — Support diversity > similarity:
+- Combining nearest AND farthest examples improves IoU by ~2.4 over nearest-only.
+- Random selection shows >5.6 IoU gap between best/worst.
+- Dissimilar contexts outperform in ~40% of cases.
+
+### Mix-Based Augmentation (MICCAI 2024)
+
+"Cut to the Mix" compared CutMix, CarveMix, ObjectAug, AnatoMix on organ segmentation:
+- **CutMix (+4.9 Dice) > CarveMix (+2.0) > AnatoMix (+1.9)**
+- Counterintuitive: simple CutMix outperforms anatomy-aware methods.
+- Anatomical plausibility doesn't help — raw diversity matters more.
+
+### nnUNet Augmentation (Gold Standard Reference)
+
+Fixed pipeline, universally robust:
+- Spatial: rotation ±30°, elastic deformation (alpha=1000, sigma=10), scaling
+- Intensity: gamma, brightness, contrast, Gaussian noise, Gaussian blur, low-res simulation
+- Mirroring on all axes
+
+### Emerging Trends (2025–2026)
+
+| Trend | Description |
+|-------|-------------|
+| Adaptive augmentation | Per-sample intensity (MICCAI 2025 ADA framework) |
+| Diffusion-based augmentation | Generative models for realistic training samples (ICCV 2025) |
+| Test-time augmentation as prompting | Augment support images at inference for prompt diversity |
+| Support set optimization | Learn which supports to select rather than augment blindly |
+| Simple > complex mixing | CutMix outperforms CarveMix — diminishing returns on anatomical realism |
+
+### Assessment of Our Current Pipeline (exp 81)
+
+| Our approach | SOTA consensus | Assessment |
+|---|---|---|
+| CarveMix (p=0.5) | CutMix may be simpler and equally/more effective | Consider ablating CarveMix vs CutMix |
+| Independent spatial aug per image | UniverSeg does same — standard | Good |
+| Asymmetric intensity (per image) | Aligned with UniverSeg in-task aug | Good and novel |
+| Mask perturbation on context only | Not found in any SOTA method | Worth ablating |
+| Double intensity augmentation | No SOTA method stacks two intensity pipelines | Likely redundant, risk of saturation |
+| Foreground crop + resolution degradation | nnUNet does low-res sim; fg crop unusual for ICL | Risky with CarveMix (scale mismatch) |
+| Random coloring | SegGPT core strategy | Well-motivated |
+| No task augmentation (uniform to all) | UniverSeg uses both in-task AND task aug | **Gap** — consider adding |
+
+### Recommendations
+
+1. **Add task-level augmentation** (UniverSeg-style): occasionally apply same transform to all images to teach task-invariance.
+2. **Remove or reduce double intensity augmentation** — no SOTA method stacks two independent intensity pipelines.
+3. **Consider replacing CarveMix with simpler CutMix** based on MICCAI 2024 findings.
+4. **Support set diversity** matters as much as augmentation quality.
+5. **Mask perturbation** on context is unique — worth keeping but needs ablation.
+
+### References
+
+- UniverSeg (ICCV 2023): https://arxiv.org/abs/2304.06131
+- SegGPT (ICCV 2023): https://arxiv.org/abs/2304.03284
+- SegICL (2024): https://arxiv.org/abs/2403.16578
+- SAM2 Augmentative Prompting (2025): https://arxiv.org/abs/2503.04826
+- Visual Prompt Selection (ECCV 2024): https://arxiv.org/abs/2407.10233
+- Cut to the Mix (MICCAI 2024): https://papers.miccai.org/miccai-2024/185-Paper0674.html
+- MICCAI 2025 ADA Framework: https://papers.miccai.org/miccai-2025/0039-Paper0315.html
+- DINOv2 Few-Shot Med Seg (ISBI 2024): https://arxiv.org/abs/2403.03273
+
+---
+
 ## 2026-02-16: Mask Prior Fusion Before Attention
 
 **Goal:** Use `combined_pred` from level i-1 to guide attention at level i, not just for sampling. Extract mask patches and fuse them with encoded image features before attention.
