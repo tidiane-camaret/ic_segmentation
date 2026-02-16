@@ -87,7 +87,7 @@ model:
       - resolution: 32
         patch_size: 16
         num_patches: 16
-        sampling_temperature: 0.3
+        sampling_temperature: 0.1
 
     oracle_levels_train: [true]
     oracle_levels_valid: [true]

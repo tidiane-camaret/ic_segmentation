@@ -68,7 +68,7 @@ model:
       type: "icl_encoder"
       layer_idx: "all"  # "all", single int (0-3), or list [1,2,3]. "all" -> D=256 (64*4 layers)
       freeze: false
-      output_grid_size: 8
+      output_grid_size: 64
 
     levels:
       - resolution: 8
@@ -81,6 +81,15 @@ model:
       - resolution: 32
         patch_size: 8
         sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 4
+        num_patches: 9
+        pad_before: 2
+        pad_after: 2
+      - resolution: 64
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
         stride: 4
         num_patches: 9
         pad_before: 2
@@ -103,7 +112,7 @@ model:
       image_size: 128
       embed_dim: 256  # Must match feature_extractor output dim (64 * num_layers)
       embed_proj_dim: 256
-      feature_grid_size: 8  # Must match feature_extractor output_grid_size
+      feature_grid_size: 64  # Must match feature_extractor output_grid_size
       patch_feature_grid_size: 8  # Backbone encoder input spatial size
       num_heads: 4
       num_layers: 2
