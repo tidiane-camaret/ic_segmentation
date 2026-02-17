@@ -70,7 +70,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Dataloader
-    dataset_type = cfg.get("dataset", "totalseg2d")
+    dataset_type = cfg.get("dataset", "totalseg")
     feature_mode = cfg.get("feature_mode", "precomputed")
 
     if dataset_type == "medsegbench":
@@ -202,8 +202,8 @@ def main(cfg: DictConfig) -> None:
                 print("Augmentation disabled")
 
         train_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalseg2d_h5,
-            stats_path=cfg.paths.totalseg_stats,
+            root_dir=cfg.paths.dataset2d_h5,
+            stats_path=cfg.paths.dataset_stats,
             label_id_list=train_labels,
             context_size=cfg.context_size,
             batch_size=cfg.train_batch_size,
@@ -229,8 +229,8 @@ def main(cfg: DictConfig) -> None:
             class_balanced=cfg.get("class_balanced", False),
         )
         val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalseg2d_h5,
-            stats_path=cfg.paths.totalseg_stats,
+            root_dir=cfg.paths.dataset2d_h5,
+            stats_path=cfg.paths.dataset_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,
