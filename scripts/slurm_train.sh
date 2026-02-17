@@ -28,6 +28,6 @@ uv run accelerate launch \
     --mixed_precision=fp16 \
     scripts/train.py \
     +max_labels=100 \
-    experiment=70_attention \
+    experiment=84_1lvl_16 \
     cluster=dlclarge \
     checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt

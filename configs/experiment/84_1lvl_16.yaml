@@ -1,0 +1,156 @@
+# @package _global_
+# Example config using the unified augmentation pipeline
+# This eliminates double intensity augmentation and adds task-level transforms
+
+dataset: totalseg
+feature_mode: "on_the_fly"
+feature_extractor_type: "icl_encoder"
+
+preprocessing:
+  image_size: [128, 128, 128]
+
+context_size: 3
+
+# Unified augmentation config (replaces image_augmentation + carve_mix + advanced_augmentation)
+augmentation:
+  enabled: true
+
+  # Mix augmentation: CutMix (simple) or CarveMix (foreground-aware)
+  mix:
+    type: "cutmix"  # Options: "cutmix", "carve_mix", "none"
+    probability: 0.5
+    cutmix:
+      min_ratio: 0.3
+      max_ratio: 0.7
+    carve_mix:
+      margin_range: [0.1, 0.5]
+      harmonize: true
+      harmonize_sigma: 5.0
+
+  # Spatial augmentation (rotation, scale, elastic)
+  spatial:
+    enabled: true
+    rotation_limit: 15.0
+    scale_limit: 0.1
+    elastic_alpha: 50.0
+    elastic_sigma: 5.0
+    # Foreground crop: random crop that keeps foreground visible
+    foreground_crop:
+      enabled: true
+      probability: 0.3
+      min_crop_frac: 0.5
+      disable_with_mix: true  # Skip FG crop if mix was applied (avoids scale mismatch)
+
+  # Intensity augmentation (SINGLE pipeline - no more double augmentation)
+  intensity:
+    enabled: true
+    brightness_limit: 0.1
+    contrast_limit: 0.1
+    gamma_limit: [80, 120]
+    noise_std_range: [0.02, 0.05]
+    asymmetric: true            # Different intensity per image (target vs context)
+    asymmetric_probability: 0.5  # Probability of applying intensity aug to each image
+
+  # Resolution degradation (simulates low-resolution inputs)
+  resolution_degradation:
+    enabled: true
+    probability: 0.2
+    min_scale: 0.25
+
+  # Context-specific augmentations
+  context:
+    mask_perturbation:
+      enabled: true
+      probability: 0.3
+      max_kernel: 5
+
+  # Task-level augmentation: same transform to ALL images (UniverSeg-style)
+  task_level:
+    enabled: true
+    probability: 0.3
+    transforms:
+      flip_horizontal: true
+      flip_vertical: true
+      rotate_90: true
+
+  # CT windowing jitter (HU range variation)
+  windowing_jitter: 100
+
+training:
+  seed: 42
+  num_epochs: 100
+  print_every: 50
+  grad_accumulate_steps: 1
+  num_workers: 12
+  log_every: 20
+  compute_metrics_every: 20
+
+warmup_scheduler:
+  enabled: true
+  warmup_epochs: 3
+
+model:
+  patch_icl:
+    feature_extractor:
+      type: "icl_encoder"
+      layer_idx: "all"
+      freeze: false
+      output_grid_size: 64
+
+    levels:
+      - resolution: 16
+        patch_size: 8
+        sampling_method: "sliding_window"
+        stride: 6
+        num_patches: 9
+        pad_before: 2
+        pad_after: 2
+
+    oracle_levels_train: [false, true]
+    oracle_levels_valid: [false, false]
+
+    cascade:
+      detach_between_levels: true
+
+    aggregator:
+      type: "average"
+      combine_mode: "average"
+      min_coverage: 1e-6
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: 128
+      embed_dim: 256
+      embed_proj_dim: 256
+      feature_grid_size: 64
+      patch_feature_grid_size: 8
+      num_heads: 4
+      num_layers: 2
+      num_context_layers: 1
+      num_registers: 4
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: true
+      use_context_mask: true
+      mask_fusion_type: "additive"
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      aggreg_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 0.5
+          context_aggreg: 0.5
+      level_weights: [1.0, 1.0]
