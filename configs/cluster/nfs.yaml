@@ -5,10 +5,10 @@ paths:
   root: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122
   DATA_DIR: ${.root}/data
   RESULTS_DIR: ${.root}/results
-  medsegbench: ${.DATA_DIR}/MedSegBench
+  medsegbench: ${.DATA_DIR}/medsegbench
   dataset: ${.DATA_DIR}/${dataset}
-  dataset2d: ${.DATA_DIR}/${dataset}2D
-  dataset2d_h5: ${.DATA_DIR}/${dataset}2D_H5
+  dataset2d: ${.DATA_DIR}/${dataset}2d
+  dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
   dataset_stats: ${.DATA_DIR}/${dataset}/${dataset}_stats.pkl
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints

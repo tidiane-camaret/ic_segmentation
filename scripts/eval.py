@@ -108,7 +108,7 @@ def main(cfg: DictConfig) -> None:
     val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
 
     # Get dataset class and dataloader
-    if cfg.dataset in ["totalseg2d", "totalsegmri2d"]:
+    if cfg.dataset in ["totalseg", "totalsegmri"]:
         from src.dataloaders.totalseg2d_dataloader_fast import (
             get_dataloader as get_totalseg2d_dataloader,
         )
@@ -137,12 +137,12 @@ def main(cfg: DictConfig) -> None:
     else:
         max_ds_len_val = max_ds_len_cfg
 
-    if cfg.dataset == "totalseg2d":
+    if cfg.dataset == "totalseg":
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalseg2d_h5,
-            stats_path=cfg.paths.totalseg_stats,
+            root_dir=cfg.paths.dataset2d_h5,
+            stats_path=cfg.paths.dataset_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,
@@ -157,12 +157,12 @@ def main(cfg: DictConfig) -> None:
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             max_labels=cfg.get("max_labels", None),
         )
-    elif cfg.dataset == "totalsegmri2d":
+    elif cfg.dataset == "totalsegmri":
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.totalsegmri2d_h5,
-            stats_path=cfg.paths.totalsegmri_stats,
+            root_dir=cfg.paths.dataset2d_h5,
+            stats_path=cfg.paths.dataset_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,

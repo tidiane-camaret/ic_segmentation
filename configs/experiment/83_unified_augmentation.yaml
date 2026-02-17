@@ -2,7 +2,7 @@
 # Example config using the unified augmentation pipeline
 # This eliminates double intensity augmentation and adds task-level transforms
 
-dataset: totalseg2d
+dataset: totalseg
 feature_mode: "on_the_fly"
 feature_extractor_type: "icl_encoder"
 
