@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 # Thresholds for hard-dice metric binarization
 PRED_THRESHOLD = 0.5      # sigmoid probability -> binary prediction
-GT_AREA_THRESHOLD = 0.25  # soft avg-pooled GT -> binary (>=25% coverage = foreground)
+GT_AREA_THRESHOLD = 0.5  # soft avg-pooled GT -> binary (>=25% coverage = foreground)
 
 
 def compute_pixel_mae(

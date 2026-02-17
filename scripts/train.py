@@ -51,9 +51,18 @@ def main(cfg: DictConfig) -> None:
         save_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # Image augmentation config (only for training)
+    # Unified augmentation config (takes precedence if present)
+    unified_aug_cfg = cfg.get("augmentation", {})
+    use_unified_augmentation = unified_aug_cfg.get("enabled", False)
+    augmentation_config = (
+        OmegaConf.to_container(unified_aug_cfg, resolve=True)
+        if use_unified_augmentation
+        else None
+    )
+
+    # Legacy image augmentation config (only used if unified is not enabled)
     img_aug_cfg = cfg.get("image_augmentation", {})
-    use_image_augmentation = img_aug_cfg.get("enabled", False)
+    use_image_augmentation = img_aug_cfg.get("enabled", False) and not use_unified_augmentation
     augment_config = (
         OmegaConf.to_container(img_aug_cfg, resolve=True)
         if use_image_augmentation
@@ -157,6 +166,15 @@ def main(cfg: DictConfig) -> None:
             max_ds_len_train = max_ds_len_cfg
             max_ds_len_val = max_ds_len_cfg
 
+        # Support separate max_cases for train/val (limits unique cases, not samples)
+        max_cases_cfg = cfg.get("max_cases")
+        if isinstance(max_cases_cfg, dict) or OmegaConf.is_dict(max_cases_cfg):
+            max_cases_train = max_cases_cfg.get("train")
+            max_cases_val = max_cases_cfg.get("val")
+        else:
+            max_cases_train = max_cases_cfg
+            max_cases_val = max_cases_cfg
+
         # CarveMix config (only for training)
         carve_mix_cfg = cfg.get("carve_mix", {})
         use_carve_mix = carve_mix_cfg.get("enabled", False)
@@ -166,12 +184,22 @@ def main(cfg: DictConfig) -> None:
             else None
         )
 
-        # Advanced augmentation config (only for training)
+        # Legacy advanced augmentation config (only for training, if unified not used)
         adv_aug_cfg = cfg.get("advanced_augmentation", {})
-        use_adv_aug = adv_aug_cfg.get("enabled", False)
+        use_adv_aug = adv_aug_cfg.get("enabled", False) and not use_unified_augmentation
         adv_aug_config = (
             OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
         )
+
+        # Log augmentation mode
+        if accelerator.is_main_process:
+            if use_unified_augmentation:
+                print(f"Using unified augmentation config")
+            elif use_image_augmentation or use_carve_mix or use_adv_aug:
+                print(f"Using legacy augmentation config (image_aug={use_image_augmentation}, "
+                      f"carve_mix={use_carve_mix}, advanced={use_adv_aug})")
+            else:
+                print("Augmentation disabled")
 
         train_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.totalseg2d_h5,
@@ -187,13 +215,17 @@ def main(cfg: DictConfig) -> None:
             shuffle=True,
             max_ds_len=max_ds_len_train,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
+            # Legacy augmentation params
             augment=use_image_augmentation,
             augment_config=augment_config,
             carve_mix=use_carve_mix,
             carve_mix_config=carve_mix_config,
             advanced_augmentation=use_adv_aug,
             advanced_augmentation_config=adv_aug_config,
+            # Unified augmentation config (takes precedence)
+            augmentation_config=augmentation_config,
             max_labels=cfg.get("max_labels", None),
+            max_cases=max_cases_train,
             class_balanced=cfg.get("class_balanced", False),
         )
         val_loader = get_totalseg2d_dataloader(
@@ -212,6 +244,7 @@ def main(cfg: DictConfig) -> None:
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             augment=False,  # No augmentation for validation
             max_labels=cfg.get("max_labels", None),
+            max_cases=max_cases_val,
         )
 
     # Model (PatchICL v2)

@@ -4,6 +4,53 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-02-17: Unified Augmentation Pipeline Implementation
+
+**Goal:** Refactor augmentation to fix issues identified in the literature review.
+
+### Issues Fixed
+
+1. **Double intensity augmentation** — Old pipeline had `random_intensity_shift()` in advanced_augmentation AND `intensity_transform` in standard augmentation. Now uses single unified intensity pipeline.
+
+2. **No task-level augmentation** — Added UniverSeg-style `apply_task_level_augmentation()` that applies the same transform (flip/rotate90) to all images in a batch.
+
+3. **CarveMix only** — Added simpler `cut_mix_2d()` as alternative (literature shows CutMix > CarveMix).
+
+4. **Foreground crop timing** — Now disabled when mix is applied to avoid scale mismatch.
+
+### New Config Structure
+
+```yaml
+augmentation:
+  enabled: true
+  mix:
+    type: "cutmix"  # "cutmix", "carve_mix", "none"
+    probability: 0.5
+  spatial:
+    enabled: true
+    foreground_crop:
+      disable_with_mix: true  # Key fix
+  intensity:
+    enabled: true
+    asymmetric: true  # Different per image
+  task_level:
+    enabled: true
+    probability: 0.3
+```
+
+### Files Changed
+
+- `src/dataloaders/augmentations.py` — Added `cut_mix_2d()`, `apply_task_level_augmentation()`, deprecated `random_intensity_shift()`
+- `src/dataloaders/totalseg2d_dataloader_fast.py` — Added unified config support, refactored `__getitem__` with new flow
+- `scripts/train.py` — Parse unified `augmentation` config key
+- `configs/experiment/83_unified_augmentation.yaml` — Example config
+
+### Backwards Compatibility
+
+Legacy configs (`image_augmentation`, `carve_mix`, `advanced_augmentation`) still work. Unified config takes precedence when `augmentation.enabled: true`.
+
+---
+
 ## 2026-02-16: Augmentation Literature Review for In-Context Segmentation
 
 **Goal:** Survey SOTA augmentation strategies for in-context learning (ICL) segmentation, with focus on medical imaging (2024–2026).

@@ -81,10 +81,14 @@ def main(cfg: DictConfig) -> None:
     # Print config
     # print(OmegaConf.to_yaml(cfg))
 
-    # Initialize accelerator for multi-GPU support
+    # Initialize accelerator with optional mixed precision
     from accelerate import DistributedDataParallelKwargs
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    mixed_precision = cfg.training.get("mixed_precision", None)
+    accelerator = Accelerator(
+        kwargs_handlers=[ddp_kwargs],
+        mixed_precision=mixed_precision,
+    )
     device = accelerator.device
 
     # Set seed
@@ -99,14 +103,12 @@ def main(cfg: DictConfig) -> None:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
 
+    # Parse val_split once (used by totalseg2d and totalsegmri2d)
+    val_split_cfg = cfg.get("val_split", ["val", "test"])
+    val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
+
     # Get dataset class and dataloader
-    if cfg.dataset == "totalseg2d":
-        from src.dataloaders.totalseg2d_dataloader_fast import (
-            get_dataloader as get_totalseg2d_dataloader,
-        )
-        val_split_cfg = cfg.get("val_split", ["val", "test"])
-        val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
-    elif cfg.dataset == "totalsegmri2d":
+    if cfg.dataset in ["totalseg2d", "totalsegmri2d"]:
         from src.dataloaders.totalseg2d_dataloader_fast import (
             get_dataloader as get_totalseg2d_dataloader,
         )

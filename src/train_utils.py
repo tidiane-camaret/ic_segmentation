@@ -24,8 +24,8 @@ def _get_image_save_executor() -> ThreadPoolExecutor:
     return _IMAGE_SAVE_EXECUTOR
 
 from src.models.patch_icl_v2.metrics import (
-    PRED_THRESHOLD,
     GT_AREA_THRESHOLD,
+    PRED_THRESHOLD,
     compute_all_metrics,
     compute_per_sample_dice,
     compute_pixel_mae,
@@ -207,8 +207,7 @@ def _save_sample_images(
             # Pred probs
             if l_pred_probs is not None:
                 pp = l_pred_probs.squeeze().numpy()
-                pred_probs = (pp - pp.min()) / (pp.max() - pp.min() + 1e-8)
-                im = axes[bot_row][1].imshow(pred_probs, cmap="hot", vmin=0, vmax=1)
+                im = axes[bot_row][1].imshow(pp, cmap="hot", vmin=pp.min(), vmax=pp.max())
                 axes[bot_row][1].set_title(f"Pred. Probs ({pp.shape[0]}x{pp.shape[1]})")
                 plt.colorbar(im, ax=axes[bot_row][1], fraction=0.046, pad=0.04)
             else:

@@ -56,7 +56,7 @@ def extract_label_slices(label_file: Path, case_path: Path):
                        "x": label_data[:, :, xc]}
 
         # Load image data
-        img_nii = nib.load(str(case_path / "ct.nii.gz"))
+        img_nii = nib.load(str(case_path / "mri.nii.gz"))
         img_data = img_nii.get_fdata()
         img_slices = {"z": img_data[zc, :, :],
                       "y": img_data[:, yc, :],
@@ -132,26 +132,26 @@ def main(cfg: DictConfig) -> None:
 
     # Get max_files from config (can override via CLI: max_files=10)
     max_files = getattr(cfg, 'max_files_3d_to_2d', None)
+    dataset_dir = Path(cfg.paths.dataset)
+    dataset_2d_dir_h5 = Path(cfg.paths.dataset2d_h5)
+    stats_path = Path(cfg.paths.dataset_stats)
 
-    totalseg_dir = Path(cfg.paths.totalseg)
-    # New output dir for HDF5 files
-    totalseg_2d_dir_h5 = Path(cfg.paths.totalseg2d_h5) 
-    stats_path = Path(cfg.paths.totalseg_stats)
+    print(f"Current Stats Path: {stats_path}")
 
-    print(f"Input dir: {totalseg_dir}")
-    print(f"HDF5 Output dir: {totalseg_2d_dir_h5}")
+    print(f"Input dir: {dataset_dir}")
+    print(f"HDF5 Output dir: {dataset_2d_dir_h5}")
     print(f"Stats path: {stats_path}")
 
-    if not totalseg_dir.exists():
-        print(f"ERROR: TotalSeg directory not found: {totalseg_dir}")
+    if not dataset_dir.exists():
+        print(f"ERROR: dataset directory not found: {dataset_dir}")
         return
 
-    totalseg_2d_dir_h5.mkdir(parents=True, exist_ok=True)
+    dataset_2d_dir_h5.mkdir(parents=True, exist_ok=True)
 
     # Build list of all cases
     tasks = [
-        (str(case_dir), str(totalseg_2d_dir_h5))
-        for case_dir in totalseg_dir.iterdir() if case_dir.is_dir()
+        (str(case_dir), str(dataset_2d_dir_h5))
+        for case_dir in dataset_dir.iterdir() if case_dir.is_dir()
     ]
 
     # Randomize order with a fixed seed before limiting to max_files
@@ -170,7 +170,7 @@ def main(cfg: DictConfig) -> None:
     n_workers = min(mp.cpu_count(), 20)
     print(f"Using {n_workers} workers...")
 
-    totalseg_stats = {}
+    dataset_stats = {}
     errors = []
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -181,14 +181,14 @@ def main(cfg: DictConfig) -> None:
             case_name, case_stats, error = future.result()
             
             if case_stats:
-                totalseg_stats[case_name] = case_stats
+                dataset_stats[case_name] = case_stats
             
             if error:
                 errors.append((case_name, error))
 
-    print(f"\nCompleted processing for {len(totalseg_stats)} cases.")
+    print(f"\nCompleted processing for {len(dataset_stats)} cases.")
     unique_labels = set()
-    for case_data in totalseg_stats.values():
+    for case_data in dataset_stats.values():
         unique_labels.update(case_data.keys())
     print(f"Unique labels found: {len(unique_labels)}")
     
@@ -198,12 +198,12 @@ def main(cfg: DictConfig) -> None:
             print(f"  {name}: {err}")
 
     # Save stats to pickle
-    if totalseg_stats:
+    if dataset_stats:
         print(f"\nSaving stats to {stats_path}...")
         stats_path.parent.mkdir(parents=True, exist_ok=True)
         with open(stats_path, "wb") as f:
-            pickle.dump(totalseg_stats, f)
-        print(f"Saved stats for {len(totalseg_stats)} cases.")
+            pickle.dump(dataset_stats, f)
+        print(f"Saved stats for {len(dataset_stats)} cases.")
     else:
         print("\nNo stats generated. Skipping stat file saving.")
 

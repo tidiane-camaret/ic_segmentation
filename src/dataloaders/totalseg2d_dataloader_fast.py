@@ -20,11 +20,14 @@ from tqdm import tqdm
 from data.label_ids_totalseg import get_label_ids
 from src.dataloaders.augmentations import (
     create_augmentation_transforms,
+    create_spatial_only_transform,
+    create_intensity_only_transform,
     carve_mix_2d,
+    cut_mix_2d,
     foreground_random_crop,
     perturb_mask,
     degrade_resolution,
-    random_intensity_shift,
+    apply_task_level_augmentation,
 )
 
 
@@ -78,13 +81,17 @@ class TotalSeg2DDataset(Dataset):
         random_context: bool = True,
         max_ds_len: Optional[int] = None,
         random_coloring_nb: int = 0,
+        # Legacy augmentation parameters (backwards compatible)
         augment: bool = False,
         augment_config: Optional[Dict] = None,
         carve_mix: bool = False,
         carve_mix_config: Optional[Dict] = None,
         advanced_augmentation: bool = False,
         advanced_augmentation_config: Optional[Dict] = None,
+        # New unified augmentation config
+        augmentation_config: Optional[Dict] = None,
         max_labels: Optional[int] = None,
+        max_cases: Optional[int] = None,
         class_balanced: bool = False,
     ):
         self.root_dir = Path(root_dir)
@@ -105,59 +112,14 @@ class TotalSeg2DDataset(Dataset):
         self.max_ds_len = max_ds_len
         self.random_coloring_nb = random_coloring_nb
 
-        # Augmentation setup (remains the same)
-        self.augment = augment
-        if augment:
-            aug_cfg = augment_config or {}
-            self.spatial_transform, self.intensity_transform = create_augmentation_transforms(
-                rotation_limit=aug_cfg.get('rotation_limit', 15.0),
-                scale_limit=aug_cfg.get('scale_limit', 0.1),
-                elastic_alpha=aug_cfg.get('elastic_alpha', 50.0),
-                elastic_sigma=aug_cfg.get('elastic_sigma', 5.0),
-                brightness_limit=aug_cfg.get('brightness_limit', 0.1),
-                contrast_limit=aug_cfg.get('contrast_limit', 0.1),
-                gamma_limit=aug_cfg.get('gamma_limit', (80, 120)),
-                noise_std_range=aug_cfg.get('noise_std_range', (0.02, 0.05)),
-            )
-            print(f"Augmentation enabled: rotation=±{aug_cfg.get('rotation_limit', 15)}°, "
-                  f"scale=±{aug_cfg.get('scale_limit', 0.1)*100:.0f}%, elastic, intensity")
+        # Setup augmentation: unified config takes precedence, else build from legacy
+        if augmentation_config is not None and augmentation_config.get("enabled", False):
+            self._setup_unified_augmentation(augmentation_config)
         else:
-            self.spatial_transform = None
-            self.intensity_transform = None
-
-        # Setup CarveMix (only for single-label binary masks)
-        self.carve_mix = carve_mix and self.random_coloring_nb == 0
-        cm_cfg = carve_mix_config or {}
-        self.carve_mix_p = cm_cfg.get("probability", 0.5)
-        self.carve_mix_margin_range = tuple(cm_cfg.get("margin_range", [0.1, 0.5]))
-        self.carve_mix_harmonize = cm_cfg.get("harmonize", True)
-        self.carve_mix_harmonize_sigma = cm_cfg.get("harmonize_sigma", 5.0)
-        if self.carve_mix:
-            print(f"CarveMix enabled: p={self.carve_mix_p}, margin={self.carve_mix_margin_range}, "
-                  f"harmonize={self.carve_mix_harmonize}, sigma={self.carve_mix_harmonize_sigma}")
-
-        # Setup advanced augmentation (only for single-label binary masks)
-        self.advanced_augmentation = advanced_augmentation and self.random_coloring_nb == 0
-        adv = advanced_augmentation_config or {}
-        self.adv_windowing_jitter = adv.get("windowing_jitter", 0)
-        fg = adv.get("foreground_crop", {})
-        self.adv_fg_crop_p = fg.get("probability", 0.3)
-        self.adv_fg_crop_min = fg.get("min_crop_frac", 0.5)
-        mp = adv.get("mask_perturbation", {})
-        self.adv_mask_perturb_p = mp.get("probability", 0.3)
-        self.adv_mask_perturb_kernel = mp.get("max_kernel", 5)
-        rd = adv.get("resolution_degradation", {})
-        self.adv_degrade_p = rd.get("probability", 0.2)
-        self.adv_degrade_min_scale = rd.get("min_scale", 0.25)
-        ai = adv.get("asymmetric_intensity", {})
-        self.adv_asym_p = ai.get("probability", 0.5)
-        self.adv_asym_brightness = ai.get("brightness_shift", 0.15)
-        self.adv_asym_contrast = ai.get("contrast_scale", 0.15)
-        self.adv_asym_gamma = tuple(ai.get("gamma_range", [0.7, 1.5]))
-        if self.advanced_augmentation:
-            print(f"Advanced augmentation enabled: windowing_jitter={self.adv_windowing_jitter}, "
-                  f"fg_crop_p={self.adv_fg_crop_p}, mask_perturb_p={self.adv_mask_perturb_p}, "
-                  f"degrade_p={self.adv_degrade_p}, asym_intensity_p={self.adv_asym_p}")
+            self._setup_legacy_augmentation(
+                augment, augment_config, carve_mix, carve_mix_config,
+                advanced_augmentation, advanced_augmentation_config
+            )
 
         # Load stats dict
         with open(stats_path, "rb") as f:
@@ -169,6 +131,15 @@ class TotalSeg2DDataset(Dataset):
         # Filter by split if provided
         if split is not None:
             self._filter_by_split(split)
+
+        # Limit number of cases (after split filtering)
+        if max_cases is not None and len(self.h5_files) > max_cases:
+            random.shuffle(self.h5_files)
+            self.h5_files = sorted(self.h5_files[:max_cases])
+            # Also filter stats to match
+            valid_case_ids = {f.stem for f in self.h5_files}
+            self.stats = {k: v for k, v in self.stats.items() if k in valid_case_ids}
+            print(f"Limited to {max_cases} cases (after split filter)")
 
         # Build samples and context maps from HDF5 files
         self.samples = []
@@ -227,7 +198,170 @@ class TotalSeg2DDataset(Dataset):
 
         # Per-worker H5 file cache (populated lazily)
         self._h5_cache: Dict[str, h5py.File] = {}
-    
+
+    def _setup_unified_augmentation(self, cfg: Dict):
+        """Setup augmentation from unified config format."""
+        self.augment = True
+        self.use_unified_augmentation = True
+
+        # Mix augmentation (CutMix or CarveMix)
+        mix_cfg = cfg.get("mix", {})
+        self.mix_type = mix_cfg.get("type", "none")  # "cutmix", "carve_mix", "none"
+        self.mix_probability = mix_cfg.get("probability", 0.5)
+        # CutMix params
+        cutmix_cfg = mix_cfg.get("cutmix", {})
+        self.cutmix_min_ratio = cutmix_cfg.get("min_ratio", 0.3)
+        self.cutmix_max_ratio = cutmix_cfg.get("max_ratio", 0.7)
+        # CarveMix params
+        carve_cfg = mix_cfg.get("carve_mix", {})
+        self.carve_mix_margin_range = tuple(carve_cfg.get("margin_range", [0.1, 0.5]))
+        self.carve_mix_harmonize = carve_cfg.get("harmonize", True)
+        self.carve_mix_harmonize_sigma = carve_cfg.get("harmonize_sigma", 5.0)
+
+        # Spatial augmentation
+        spatial_cfg = cfg.get("spatial", {})
+        self.spatial_enabled = spatial_cfg.get("enabled", True)
+        if self.spatial_enabled:
+            self.spatial_transform = create_spatial_only_transform(
+                rotation_limit=spatial_cfg.get("rotation_limit", 15.0),
+                scale_limit=spatial_cfg.get("scale_limit", 0.1),
+                elastic_alpha=spatial_cfg.get("elastic_alpha", 50.0),
+                elastic_sigma=spatial_cfg.get("elastic_sigma", 5.0),
+            )
+        else:
+            self.spatial_transform = None
+
+        # Foreground crop config (within spatial)
+        fg_crop_cfg = spatial_cfg.get("foreground_crop", {})
+        self.fg_crop_enabled = fg_crop_cfg.get("enabled", True)
+        self.fg_crop_probability = fg_crop_cfg.get("probability", 0.3)
+        self.fg_crop_min_frac = fg_crop_cfg.get("min_crop_frac", 0.5)
+        self.fg_crop_disable_with_mix = fg_crop_cfg.get("disable_with_mix", True)
+
+        # Intensity augmentation (single unified pipeline)
+        intensity_cfg = cfg.get("intensity", {})
+        self.intensity_enabled = intensity_cfg.get("enabled", True)
+        if self.intensity_enabled:
+            img_size = self.image_size[0] if self.image_size else 512
+            self.intensity_transform = create_intensity_only_transform(
+                brightness_limit=intensity_cfg.get("brightness_limit", 0.1),
+                contrast_limit=intensity_cfg.get("contrast_limit", 0.1),
+                gamma_limit=tuple(intensity_cfg.get("gamma_limit", [80, 120])),
+                noise_std_range=tuple(intensity_cfg.get("noise_std_range", [0.02, 0.05])),
+                img_size=img_size,
+            )
+            self.intensity_asymmetric = intensity_cfg.get("asymmetric", True)
+            self.intensity_asymmetric_p = intensity_cfg.get("asymmetric_probability", 0.5)
+        else:
+            self.intensity_transform = None
+            self.intensity_asymmetric = False
+            self.intensity_asymmetric_p = 0.0
+
+        # Resolution degradation
+        degrade_cfg = cfg.get("resolution_degradation", {})
+        self.degrade_enabled = degrade_cfg.get("enabled", True)
+        self.degrade_probability = degrade_cfg.get("probability", 0.2)
+        self.degrade_min_scale = degrade_cfg.get("min_scale", 0.25)
+
+        # Context mask perturbation
+        context_cfg = cfg.get("context", {})
+        mask_perturb_cfg = context_cfg.get("mask_perturbation", {})
+        self.mask_perturb_enabled = mask_perturb_cfg.get("enabled", True)
+        self.mask_perturb_probability = mask_perturb_cfg.get("probability", 0.3)
+        self.mask_perturb_max_kernel = mask_perturb_cfg.get("max_kernel", 5)
+
+        # Task-level augmentation (same transform to all images)
+        task_cfg = cfg.get("task_level", {})
+        self.task_level_enabled = task_cfg.get("enabled", True)
+        self.task_level_probability = task_cfg.get("probability", 0.3)
+        task_transforms = task_cfg.get("transforms", {})
+        self.task_flip_h = task_transforms.get("flip_horizontal", True)
+        self.task_flip_v = task_transforms.get("flip_vertical", True)
+        self.task_rotate_90 = task_transforms.get("rotate_90", True)
+
+        # Windowing jitter (CT-specific)
+        self.adv_windowing_jitter = cfg.get("windowing_jitter", 0)
+
+        # Disable mix for random_coloring mode
+        if self.random_coloring_nb > 0:
+            self.mix_type = "none"
+
+        # Print configuration summary
+        print(f"Unified augmentation enabled:")
+        print(f"  Mix: type={self.mix_type}, p={self.mix_probability}")
+        print(f"  Spatial: enabled={self.spatial_enabled}")
+        print(f"  Foreground crop: enabled={self.fg_crop_enabled}, p={self.fg_crop_probability}, disable_with_mix={self.fg_crop_disable_with_mix}")
+        print(f"  Intensity: enabled={self.intensity_enabled}, asymmetric={self.intensity_asymmetric}")
+        print(f"  Resolution degradation: enabled={self.degrade_enabled}, p={self.degrade_probability}")
+        print(f"  Context mask perturbation: enabled={self.mask_perturb_enabled}, p={self.mask_perturb_probability}")
+        print(f"  Task-level: enabled={self.task_level_enabled}, p={self.task_level_probability}")
+
+    def _setup_legacy_augmentation(
+        self,
+        augment: bool,
+        augment_config: Optional[Dict],
+        carve_mix: bool,
+        carve_mix_config: Optional[Dict],
+        advanced_augmentation: bool,
+        advanced_augmentation_config: Optional[Dict],
+    ):
+        """Setup augmentation from legacy config parameters."""
+        self.use_unified_augmentation = False
+
+        # Standard augmentation setup
+        self.augment = augment
+        if augment:
+            aug_cfg = augment_config or {}
+            self.spatial_transform, self.intensity_transform = create_augmentation_transforms(
+                rotation_limit=aug_cfg.get('rotation_limit', 15.0),
+                scale_limit=aug_cfg.get('scale_limit', 0.1),
+                elastic_alpha=aug_cfg.get('elastic_alpha', 50.0),
+                elastic_sigma=aug_cfg.get('elastic_sigma', 5.0),
+                brightness_limit=aug_cfg.get('brightness_limit', 0.1),
+                contrast_limit=aug_cfg.get('contrast_limit', 0.1),
+                gamma_limit=aug_cfg.get('gamma_limit', (80, 120)),
+                noise_std_range=aug_cfg.get('noise_std_range', (0.02, 0.05)),
+            )
+            print(f"Augmentation enabled: rotation=±{aug_cfg.get('rotation_limit', 15)}°, "
+                  f"scale=±{aug_cfg.get('scale_limit', 0.1)*100:.0f}%, elastic, intensity")
+        else:
+            self.spatial_transform = None
+            self.intensity_transform = None
+
+        # Setup CarveMix (only for single-label binary masks)
+        self.carve_mix = carve_mix and self.random_coloring_nb == 0
+        cm_cfg = carve_mix_config or {}
+        self.carve_mix_p = cm_cfg.get("probability", 0.5)
+        self.carve_mix_margin_range = tuple(cm_cfg.get("margin_range", [0.1, 0.5]))
+        self.carve_mix_harmonize = cm_cfg.get("harmonize", True)
+        self.carve_mix_harmonize_sigma = cm_cfg.get("harmonize_sigma", 5.0)
+        if self.carve_mix:
+            print(f"CarveMix enabled: p={self.carve_mix_p}, margin={self.carve_mix_margin_range}, "
+                  f"harmonize={self.carve_mix_harmonize}, sigma={self.carve_mix_harmonize_sigma}")
+
+        # Setup advanced augmentation (only for single-label binary masks)
+        self.advanced_augmentation = advanced_augmentation and self.random_coloring_nb == 0
+        adv = advanced_augmentation_config or {}
+        self.adv_windowing_jitter = adv.get("windowing_jitter", 0)
+        fg = adv.get("foreground_crop", {})
+        self.adv_fg_crop_p = fg.get("probability", 0.3)
+        self.adv_fg_crop_min = fg.get("min_crop_frac", 0.5)
+        mp = adv.get("mask_perturbation", {})
+        self.adv_mask_perturb_p = mp.get("probability", 0.3)
+        self.adv_mask_perturb_kernel = mp.get("max_kernel", 5)
+        rd = adv.get("resolution_degradation", {})
+        self.adv_degrade_p = rd.get("probability", 0.2)
+        self.adv_degrade_min_scale = rd.get("min_scale", 0.25)
+        ai = adv.get("asymmetric_intensity", {})
+        self.adv_asym_p = ai.get("probability", 0.5)
+        self.adv_asym_brightness = ai.get("brightness_shift", 0.15)
+        self.adv_asym_contrast = ai.get("contrast_scale", 0.15)
+        self.adv_asym_gamma = tuple(ai.get("gamma_range", [0.7, 1.5]))
+        if self.advanced_augmentation:
+            print(f"Advanced augmentation enabled: windowing_jitter={self.adv_windowing_jitter}, "
+                  f"fg_crop_p={self.adv_fg_crop_p}, mask_perturb_p={self.adv_mask_perturb_p}, "
+                  f"degrade_p={self.adv_degrade_p}, asym_intensity_p={self.adv_asym_p}")
+
     # --- Methods like _filter_by_split, _find_cases_with_labels, etc. remain largely the same ---
     def _filter_by_split(self, split: Union[str, List[str]]):
         """Filter cases by train/val/test split using meta.csv."""
@@ -245,9 +379,10 @@ class TotalSeg2DDataset(Dataset):
         else:
             split_case_ids = set(df["image_id"][df["split"].isin(split)].tolist())
         
-        # Filter stats, h5_files, and mappings
+        # Filter stats and h5_files
         self.stats = {k: v for k, v in self.stats.items() if k in split_case_ids}
-        # Rebuild mappings after filtering
+        self.h5_files = [f for f in self.h5_files if f.stem in split_case_ids]
+        print(f"Filtered to {len(self.h5_files)} cases for split '{split}'")
         # (This is a simplified version of the logic in __init__)
 
     def _get_h5_file(self, case_id: str) -> h5py.File:
@@ -364,6 +499,179 @@ class TotalSeg2DDataset(Dataset):
 
         return target_img, target_mask, context_imgs, context_masks
 
+    def _apply_mix_augmentation(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        label_id: str,
+        axis: str,
+        exclude_case_ids: List[str],
+    ) -> Tuple[np.ndarray, np.ndarray, bool]:
+        """Apply mix augmentation (CutMix or CarveMix) based on unified config.
+
+        Returns the mixed image/mask and a flag indicating if mix was applied.
+        """
+        if self.mix_type == "none" or random.random() > self.mix_probability:
+            return target_img, target_mask, False
+
+        donor = self._load_carve_mix_donor(label_id, axis, exclude_case_ids)
+        if donor is None:
+            return target_img, target_mask, False
+
+        donor_img, donor_mask = donor
+
+        if self.mix_type == "cutmix":
+            mixed_img, mixed_mask = cut_mix_2d(
+                target_img, target_mask, donor_img, donor_mask,
+                min_ratio=self.cutmix_min_ratio,
+                max_ratio=self.cutmix_max_ratio,
+            )
+        elif self.mix_type == "carve_mix":
+            mixed_img, mixed_mask = carve_mix_2d(
+                target_img, target_mask, donor_img, donor_mask,
+                margin_range=self.carve_mix_margin_range,
+                harmonize=self.carve_mix_harmonize,
+                harmonize_sigma=self.carve_mix_harmonize_sigma,
+            )
+        else:
+            return target_img, target_mask, False
+
+        return mixed_img, mixed_mask, True
+
+    def _apply_task_level_augmentation(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        context_imgs: List[np.ndarray],
+        context_masks: List[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
+        """Apply the same random transform to ALL images (UniverSeg-style)."""
+        if not self.task_level_enabled or random.random() > self.task_level_probability:
+            return target_img, target_mask, context_imgs, context_masks
+
+        all_imgs = [target_img] + context_imgs
+        all_masks = [target_mask] + context_masks
+
+        all_imgs, all_masks = apply_task_level_augmentation(
+            all_imgs, all_masks,
+            flip_horizontal=self.task_flip_h,
+            flip_vertical=self.task_flip_v,
+            rotate_90=self.task_rotate_90,
+        )
+
+        return all_imgs[0], all_masks[0], all_imgs[1:], all_masks[1:]
+
+    def _apply_spatial_augmentation(
+        self,
+        img: np.ndarray,
+        mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply spatial-only augmentation (no intensity changes)."""
+        if self.spatial_transform is None:
+            return img, mask
+
+        img_uint8 = (img * 255).astype(np.uint8)
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        result = self.spatial_transform(image=img_uint8, mask=mask_uint8)
+        return result['image'].astype(np.float32) / 255.0, (result['mask'] > 127).astype(np.float32)
+
+    def _apply_intensity_augmentation(
+        self,
+        img: np.ndarray,
+    ) -> np.ndarray:
+        """Apply intensity-only augmentation."""
+        if self.intensity_transform is None:
+            return img
+
+        img_uint8 = (img * 255).astype(np.uint8)
+        result = self.intensity_transform(image=img_uint8)
+        return result['image'].astype(np.float32) / 255.0
+
+    def _apply_unified_augmentation(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        context_imgs: List[np.ndarray],
+        context_masks: List[np.ndarray],
+        label_id: str,
+        axis: str,
+        exclude_case_ids: List[str],
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
+        """Apply the unified augmentation pipeline.
+
+        Flow:
+        1. Mix augmentation (CutMix OR CarveMix) on target
+        2. Foreground crop (only if mix not applied, based on config)
+        3. Re-resize if shapes changed
+        4. Task-level augmentation (same transform to ALL)
+        5. Spatial augmentation (different per image)
+        6. Intensity augmentation (different per image, or skip based on asymmetric setting)
+        7. Context mask perturbation
+        8. Resolution degradation
+        """
+        # 1. Mix augmentation on target
+        target_img, target_mask, mix_applied = self._apply_mix_augmentation(
+            target_img, target_mask, label_id, axis, exclude_case_ids
+        )
+
+        # 2. Foreground crop (skip if mix applied and disable_with_mix is True)
+        if self.fg_crop_enabled:
+            should_crop = not (mix_applied and self.fg_crop_disable_with_mix)
+            if should_crop and random.random() < self.fg_crop_probability:
+                target_img, target_mask = foreground_random_crop(target_img, target_mask, self.fg_crop_min_frac)
+                # Also apply to context (independent probability)
+                for i in range(len(context_imgs)):
+                    if random.random() < self.fg_crop_probability:
+                        context_imgs[i], context_masks[i] = foreground_random_crop(
+                            context_imgs[i], context_masks[i], self.fg_crop_min_frac
+                        )
+
+        # 3. Re-resize if shapes changed
+        if self.image_size is not None:
+            tgt_size = tuple(self.image_size)
+            if target_img.shape[:2] != tgt_size:
+                target_img = self._resize(target_img, self.image_size, mode="bilinear")
+                target_mask = self._resize(target_mask, self.image_size, mode="nearest")
+            context_imgs = [self._resize(c, self.image_size, "bilinear") if c.shape[:2] != tgt_size else c for c in context_imgs]
+            context_masks = [self._resize(c, self.image_size, "nearest") if c.shape[:2] != tgt_size else c for c in context_masks]
+
+        # 4. Task-level augmentation (same transform to ALL)
+        target_img, target_mask, context_imgs, context_masks = self._apply_task_level_augmentation(
+            target_img, target_mask, context_imgs, context_masks
+        )
+
+        # 5. Spatial augmentation (different per image)
+        if self.spatial_enabled:
+            target_img, target_mask = self._apply_spatial_augmentation(target_img, target_mask)
+            for i in range(len(context_imgs)):
+                context_imgs[i], context_masks[i] = self._apply_spatial_augmentation(context_imgs[i], context_masks[i])
+
+        # 6. Intensity augmentation (single unified pipeline)
+        if self.intensity_enabled:
+            # Apply to target
+            if not self.intensity_asymmetric or random.random() < self.intensity_asymmetric_p:
+                target_img = self._apply_intensity_augmentation(target_img)
+            # Apply to context (independent probability if asymmetric)
+            for i in range(len(context_imgs)):
+                if not self.intensity_asymmetric or random.random() < self.intensity_asymmetric_p:
+                    context_imgs[i] = self._apply_intensity_augmentation(context_imgs[i])
+
+        # 7. Context mask perturbation
+        if self.mask_perturb_enabled:
+            for i in range(len(context_masks)):
+                if random.random() < self.mask_perturb_probability:
+                    context_masks[i] = perturb_mask(context_masks[i], self.mask_perturb_max_kernel)
+
+        # 8. Resolution degradation
+        if self.degrade_enabled:
+            if random.random() < self.degrade_probability:
+                target_img = degrade_resolution(target_img, self.degrade_min_scale)
+            for i in range(len(context_imgs)):
+                if random.random() < self.degrade_probability:
+                    context_imgs[i] = degrade_resolution(context_imgs[i], self.degrade_min_scale)
+
+        return target_img, target_mask, context_imgs, context_masks
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a sample with context examples (on-the-fly from HDF5)."""
         if self.class_balanced:
@@ -373,6 +681,94 @@ class TotalSeg2DDataset(Dataset):
         else:
             target_case_id, label_id, axis = self.samples[idx]
 
+        # Use unified or legacy flow
+        if getattr(self, 'use_unified_augmentation', False):
+            return self._getitem_unified(target_case_id, label_id, axis)
+        else:
+            return self._getitem_legacy(target_case_id, label_id, axis)
+
+    def _getitem_unified(self, target_case_id: str, label_id: str, axis: str) -> Dict[str, torch.Tensor]:
+        """Get item using unified augmentation pipeline."""
+        # 1. Load target slice
+        img, mask = self._load_slice(target_case_id, label_id, axis)
+
+        # 2. Bbox crop and normalization
+        if self.crop_to_bbox:
+            bbox = self._get_2d_bbox(target_case_id, label_id, axis)
+            img, mask = self._crop_to_bbox(img, mask, bbox)
+
+        jitter = getattr(self, 'adv_windowing_jitter', 0)
+        img = self._normalize_image(img, jitter=jitter)
+
+        # 3. Initial resize
+        if self.image_size:
+            img = self._resize(img, self.image_size, "bilinear")
+            mask = self._resize(mask, self.image_size, "nearest")
+
+        # 4. Load context
+        context_imgs, context_labels, valid_context_ids = [], [], []
+        if self.context_size > 0:
+            context_key = (label_id, axis)
+            available_contexts = [c for c in self.valid_contexts.get(context_key, []) if c != target_case_id]
+            if self.random_context:
+                random.shuffle(available_contexts)
+
+            for ctx_case_id in available_contexts:
+                if len(context_imgs) >= self.context_size:
+                    break
+                try:
+                    ctx_img, ctx_label = self._load_slice(ctx_case_id, label_id, axis)
+                    if ctx_label.max() == 0:
+                        continue
+
+                    if self.crop_to_bbox:
+                        bbox = self._get_2d_bbox(ctx_case_id, label_id, axis)
+                        ctx_img, ctx_label = self._crop_to_bbox(ctx_img, ctx_label, bbox)
+
+                    ctx_img = self._normalize_image(ctx_img, jitter=jitter)
+
+                    if self.image_size:
+                        ctx_img = self._resize(ctx_img, self.image_size, "bilinear")
+                        ctx_label = self._resize(ctx_label, self.image_size, "nearest")
+
+                    context_imgs.append(ctx_img)
+                    context_labels.append(ctx_label)
+                    valid_context_ids.append(ctx_case_id)
+                except Exception as e:
+                    print(f"Warning: Failed to load context {ctx_case_id}/{label_id}/{axis}: {e}")
+                    continue
+
+            if len(context_imgs) == 0:
+                raise RuntimeError(f"Failed to load any context for label '{label_id}' axis '{axis}'")
+
+        # 5. Apply unified augmentation
+        exclude_ids = [target_case_id] + valid_context_ids
+        img, mask, context_imgs, context_labels = self._apply_unified_augmentation(
+            img, mask, context_imgs, context_labels, label_id, axis, exclude_ids
+        )
+
+        # 6. Convert to tensors
+        target_in = torch.from_numpy(img.copy()).unsqueeze(0).float()
+        target_out = torch.from_numpy(mask.copy()).unsqueeze(0).float()
+
+        if self.context_size == 0:
+            return {
+                "image": target_in, "label": target_out,
+                "target_case_id": target_case_id, "label_id": label_id, "axis": axis,
+            }
+
+        context_in = torch.stack([torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_imgs])
+        context_out = torch.stack([torch.from_numpy(c.copy()).unsqueeze(0).float() for c in context_labels])
+
+        return {
+            "image": target_in, "label": target_out,
+            "context_in": context_in, "context_out": context_out,
+            "target_case_id": target_case_id, "context_case_ids": valid_context_ids,
+            "label_id": label_id, "axis": axis,
+        }
+
+    def _getitem_legacy(self, target_case_id: str, label_id: str, axis: str) -> Dict[str, torch.Tensor]:
+        """Get item using legacy augmentation pipeline (backwards compatible)."""
         # Load target slice
         img, mask = self._load_slice(target_case_id, label_id, axis)
 
@@ -382,7 +778,7 @@ class TotalSeg2DDataset(Dataset):
             img, mask = self._crop_to_bbox(img, mask, bbox)
 
         # Normalize image
-        jitter = self.adv_windowing_jitter if self.advanced_augmentation else 0
+        jitter = self.adv_windowing_jitter if getattr(self, 'advanced_augmentation', False) else 0
         img = self._normalize_image(img, jitter=jitter)
 
         # Resize (if enabled)
@@ -391,7 +787,7 @@ class TotalSeg2DDataset(Dataset):
             mask = self._resize(mask, self.image_size, "nearest")
 
         # Foreground random crop
-        if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
+        if getattr(self, 'advanced_augmentation', False) and random.random() < self.adv_fg_crop_p:
             img, mask = foreground_random_crop(img, mask, self.adv_fg_crop_min)
 
         # Skip context loading if context_size is 0
@@ -402,10 +798,12 @@ class TotalSeg2DDataset(Dataset):
                 mask = self._resize(mask, self.image_size, mode="nearest")
 
             # CarveMix on target
-            img, mask = self._apply_carve_mix(img, mask, label_id, axis, [target_case_id])
+            if getattr(self, 'carve_mix', False):
+                img, mask = self._apply_carve_mix(img, mask, label_id, axis, [target_case_id])
 
             # Advanced augmentation
-            img, mask, _, _ = self._apply_advanced_augmentation(img, mask)
+            if getattr(self, 'advanced_augmentation', False):
+                img, mask, _, _ = self._apply_advanced_augmentation(img, mask)
 
             # Apply augmentation
             if self.augment:
@@ -424,6 +822,8 @@ class TotalSeg2DDataset(Dataset):
         available_contexts = [c for c in self.valid_contexts.get(context_key, []) if c != target_case_id]
         if self.random_context:
             random.shuffle(available_contexts)
+
+        jitter = self.adv_windowing_jitter if getattr(self, 'advanced_augmentation', False) else 0
 
         for ctx_case_id in available_contexts:
             if len(context_imgs) >= self.context_size:
@@ -444,7 +844,7 @@ class TotalSeg2DDataset(Dataset):
                     ctx_label = self._resize(ctx_label, self.image_size, "nearest")
 
                 # Foreground random crop (independent per context)
-                if self.advanced_augmentation and random.random() < self.adv_fg_crop_p:
+                if getattr(self, 'advanced_augmentation', False) and random.random() < self.adv_fg_crop_p:
                     ctx_img, ctx_label = foreground_random_crop(
                         ctx_img, ctx_label, self.adv_fg_crop_min
                     )
@@ -460,6 +860,7 @@ class TotalSeg2DDataset(Dataset):
             raise RuntimeError(f"Failed to load any context for label '{label_id}' axis '{axis}'")
 
         # Re-resize if foreground crop changed any shapes
+        # Note: img and mask are already loaded and processed from lines 762-780
         if self.image_size is not None:
             tgt_size = tuple(self.image_size)
             if img.shape[:2] != tgt_size:
@@ -470,12 +871,14 @@ class TotalSeg2DDataset(Dataset):
 
         # CarveMix on target only (after resize, before augmentation)
         exclude_ids = [target_case_id] + valid_context_ids
-        img, mask = self._apply_carve_mix(img, mask, label_id, axis, exclude_ids)
+        if getattr(self, 'carve_mix', False):
+            img, mask = self._apply_carve_mix(img, mask, label_id, axis, exclude_ids)
 
         # Advanced augmentation (asymmetric intensity, resolution degradation, mask perturbation)
-        img, mask, context_imgs, context_labels = self._apply_advanced_augmentation(
-            img, mask, context_imgs, context_labels
-        )
+        if getattr(self, 'advanced_augmentation', False):
+            img, mask, context_imgs, context_labels = self._apply_advanced_augmentation(
+                img, mask, context_imgs, context_labels
+            )
 
         # Apply augmentation (different random transform for target and each context)
         if self.augment:

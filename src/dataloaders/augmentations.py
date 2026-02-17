@@ -247,10 +247,196 @@ def random_intensity_shift(
     contrast_scale: float = 0.15,
     gamma_range: Tuple[float, float] = (0.7, 1.5),
 ) -> np.ndarray:
-    """Random intensity transform for cross-image appearance diversity."""
+    """Random intensity transform for cross-image appearance diversity.
+
+    DEPRECATED: Use the unified augmentation pipeline with intensity transforms
+    in albumentations instead. This function is kept for backwards compatibility.
+    """
+    import warnings
+    warnings.warn(
+        "random_intensity_shift is deprecated. Use the unified augmentation pipeline "
+        "with intensity.asymmetric=True instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     b = random.uniform(-brightness_shift, brightness_shift)
     c = random.uniform(1 - contrast_scale, 1 + contrast_scale)
     g = random.uniform(*gamma_range)
     img = np.clip(img * c + b, 0, 1)
     img = np.power(img, g)
     return img.astype(np.float32)
+
+
+def cut_mix_2d(
+    target_img: np.ndarray,
+    target_mask: np.ndarray,
+    donor_img: np.ndarray,
+    donor_mask: np.ndarray,
+    min_ratio: float = 0.3,
+    max_ratio: float = 0.7,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Simple CutMix: paste a random rectangular region from donor into target.
+
+    Args:
+        target_img: [H, W] float32 in [0, 1]
+        target_mask: [H, W] float32 binary
+        donor_img: [H, W] float32 in [0, 1]
+        donor_mask: [H, W] float32 binary
+        min_ratio: Minimum ratio of cut region (0-1)
+        max_ratio: Maximum ratio of cut region (0-1)
+
+    Returns:
+        mixed_img: [H, W] image with rectangular region from donor
+        mixed_mask: [H, W] mask with rectangular region from donor
+    """
+    H, W = target_img.shape
+
+    # Random cut size
+    cut_ratio_h = random.uniform(min_ratio, max_ratio)
+    cut_ratio_w = random.uniform(min_ratio, max_ratio)
+    cut_h = int(H * cut_ratio_h)
+    cut_w = int(W * cut_ratio_w)
+
+    # Random position in target
+    r0 = random.randint(0, H - cut_h)
+    c0 = random.randint(0, W - cut_w)
+
+    # Random position in donor (for source region)
+    donor_H, donor_W = donor_img.shape
+    dr0 = random.randint(0, max(0, donor_H - cut_h))
+    dc0 = random.randint(0, max(0, donor_W - cut_w))
+
+    # Handle size mismatch
+    actual_h = min(cut_h, donor_H - dr0, H - r0)
+    actual_w = min(cut_w, donor_W - dc0, W - c0)
+
+    # Paste donor region into target
+    mixed_img = target_img.copy()
+    mixed_mask = target_mask.copy()
+    mixed_img[r0:r0+actual_h, c0:c0+actual_w] = donor_img[dr0:dr0+actual_h, dc0:dc0+actual_w]
+    mixed_mask[r0:r0+actual_h, c0:c0+actual_w] = donor_mask[dr0:dr0+actual_h, dc0:dc0+actual_w]
+
+    return mixed_img, mixed_mask
+
+
+def apply_task_level_augmentation(
+    images: List[np.ndarray],
+    masks: List[np.ndarray],
+    flip_horizontal: bool = True,
+    flip_vertical: bool = True,
+    rotate_90: bool = True,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Apply the same random transform to ALL images/masks (UniverSeg-style).
+
+    This ensures spatial consistency across target and context images,
+    simulating different orientations of the same anatomical structure.
+
+    Args:
+        images: List of [H, W] images
+        masks: List of [H, W] masks
+        flip_horizontal: Allow horizontal flip
+        flip_vertical: Allow vertical flip
+        rotate_90: Allow 90/180/270 degree rotations
+
+    Returns:
+        Transformed images and masks (same transform applied to all)
+    """
+    if not images:
+        return images, masks
+
+    # Decide on transforms (same for all images)
+    do_hflip = flip_horizontal and random.random() < 0.5
+    do_vflip = flip_vertical and random.random() < 0.5
+    rot_k = random.choice([0, 1, 2, 3]) if rotate_90 else 0
+
+    transformed_images = []
+    transformed_masks = []
+
+    for img, mask in zip(images, masks):
+        # Apply horizontal flip
+        if do_hflip:
+            img = np.fliplr(img).copy()
+            mask = np.fliplr(mask).copy()
+
+        # Apply vertical flip
+        if do_vflip:
+            img = np.flipud(img).copy()
+            mask = np.flipud(mask).copy()
+
+        # Apply rotation (k * 90 degrees)
+        if rot_k > 0:
+            img = np.rot90(img, k=rot_k).copy()
+            mask = np.rot90(mask, k=rot_k).copy()
+
+        transformed_images.append(img)
+        transformed_masks.append(mask)
+
+    return transformed_images, transformed_masks
+
+
+def create_spatial_only_transform(
+    rotation_limit: float = 15.0,
+    scale_limit: float = 0.1,
+    elastic_alpha: float = 50.0,
+    elastic_sigma: float = 5.0,
+) -> A.Compose:
+    """Create spatial-only augmentation transform (no intensity changes)."""
+    return A.Compose([
+        A.OneOf([
+            A.Affine(
+                scale=(1.0 - scale_limit, 1.0 + scale_limit),
+                rotate=(-rotation_limit, rotation_limit),
+                shear=(-10, 10),
+                border_mode=0,
+                fill=0,
+                fill_mask=0,
+                p=0.8,
+            ),
+            A.GridDistortion(
+                num_steps=5,
+                distort_limit=0.3,
+                border_mode=0,
+                p=0.2
+            ),
+        ], p=0.8),
+        A.ElasticTransform(
+            alpha=elastic_alpha,
+            sigma=elastic_sigma,
+            border_mode=0,
+            fill=0,
+            fill_mask=0,
+            p=0.3,
+        ),
+    ])
+
+
+def create_intensity_only_transform(
+    brightness_limit: float = 0.1,
+    contrast_limit: float = 0.1,
+    gamma_limit: Tuple[float, float] = (80, 120),
+    noise_std_range: Tuple[float, float] = (0.02, 0.05),
+    img_size: int = 512,
+) -> A.Compose:
+    """Create intensity-only augmentation transform (no spatial changes)."""
+    return A.Compose([
+        A.OneOf([
+            A.RandomBrightnessContrast(
+                brightness_limit=brightness_limit,
+                contrast_limit=contrast_limit,
+                p=0.7,
+            ),
+            A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
+        ], p=0.8),
+        A.RandomGamma(gamma_limit=gamma_limit, p=0.3),
+        A.OneOf([
+            A.GaussNoise(std_range=noise_std_range, p=0.5),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.5),
+        ], p=0.4),
+        A.CoarseDropout(
+            num_holes_range=(1, 6),
+            hole_height_range=(img_size//20, img_size//10),
+            hole_width_range=(img_size//20, img_size//10),
+            fill_value=0,
+            p=0.2
+        ),
+    ])
