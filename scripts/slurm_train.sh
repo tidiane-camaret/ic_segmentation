@@ -7,6 +7,8 @@
 
 
 # interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 48000 --gres=gpu:2 --time=12:00:00 --pty bash 
+# interactive session : srun -p ml_gpu-rtx2080 -c 20 --mem 24000 --time=4:00:00 --pty bash 
+
 # NCCL debugging and timeout settings
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
@@ -21,13 +23,13 @@ export NCCL_TIMEOUT=1800
 nvidia-smi
 
 # run with sbatch scripts/slurm_train.sh
-
-uv run accelerate launch \
-    --multi_gpu \
-    --num_processes=2 \
-    --mixed_precision=fp16 \
-    scripts/train.py \
-    +max_labels=100 \
-    experiment=84_1lvl_16 \
-    cluster=dlclarge \
-    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt
+uv run scripts/totalseg_3d_to_2d_fast.py cluster=dlclarge
+#uv run accelerate launch \
+#    --multi_gpu \
+#    --num_processes=2 \
+#    --mixed_precision=fp16 \
+#    scripts/train.py \
+#    +max_labels=100 \
+#    experiment=84_1lvl_16 \
+#    cluster=dlclarge \
+#    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt

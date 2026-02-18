@@ -16,7 +16,7 @@ logging:
   save_every_n_epochs: 1  # Save train images every N epochs
   
 # Dataset: "totalseg2d" or "medsegbench"
-dataset: totalseg2d
+dataset: totalseg
 download: false
 context_size: 1
 random_coloring_nb: 0

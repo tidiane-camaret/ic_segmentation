@@ -56,7 +56,10 @@ def extract_label_slices(label_file: Path, case_path: Path):
                        "x": label_data[:, :, xc]}
 
         # Load image data
-        img_nii = nib.load(str(case_path / "mri.nii.gz"))
+        img_file = case_path / "ct.nii.gz"
+        if not img_file.exists():
+            img_file = case_path / "mri.nii.gz"
+        img_nii = nib.load(str(img_file))
         img_data = img_nii.get_fdata()
         img_slices = {"z": img_data[zc, :, :],
                       "y": img_data[:, yc, :],

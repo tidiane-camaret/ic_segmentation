@@ -5,11 +5,10 @@ paths:
   root: /work/dlclarge2/ndirt-SegFM3D
   DATA_DIR: ${.root}/data
   RESULTS_DIR: ${.root}/ic_segmentation/results
-  totalseg: ${.DATA_DIR}/TotalSeg
-  medsegbench: ${.DATA_DIR}/medsegbench
-  totalseg2d: ${.DATA_DIR}/TotalSeg2D
-  totalseg_stats: ${.totalseg}/totalseg_stats.pkl
-  totalseg2d_h5: ${.DATA_DIR}/TotalSeg2D_H5
+  dataset: ${.DATA_DIR}/${dataset}
+  dataset2d: ${.DATA_DIR}/${dataset}2d
+  dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
+  dataset_stats: ${.DATA_DIR}/${dataset}/${dataset}_stats.pkl
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints
     medverse: ${..root}/checkpoints/Medverse.ckpt
