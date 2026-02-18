@@ -140,8 +140,8 @@ def build_dataloader(cfg):
     )
 
     return get_totalseg2d_dataloader(
-        root_dir=cfg.paths.totalseg2d_h5,
-        stats_path=cfg.paths.totalseg_stats,
+        root_dir=cfg.paths.dataset2d_h5,
+        stats_path=cfg.paths.dataset_stats,
         label_id_list=train_labels,
         context_size=cfg.context_size,
         batch_size=cfg.train_batch_size,
@@ -194,6 +194,16 @@ def build_model(cfg, device):
                 device=device,
                 layer_idx=fe_cfg.get("layer_idx", 11),
                 freeze=fe_cfg.get("freeze", True),
+            )
+        elif extractor_type == "rad_dino":
+            from src.models.rad_dino_extractor import RADDINOExtractor
+
+            feature_extractor = RADDINOExtractor(
+                model_name=fe_cfg.get("model_name", "microsoft/rad-dino") if fe_cfg else "microsoft/rad-dino",
+                target_size=fe_cfg.get("target_size", 224) if fe_cfg else 224,
+                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                device=device,
+                freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
             )
         else:
             raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
@@ -396,13 +406,17 @@ def print_profiler_results(prof):
     region_names = {"FORWARD_PASS", "COMPUTE_LOSS", "BACKWARD_PASS", "OPTIMIZER_STEP"}
     for evt in prof.key_averages():
         if evt.key in region_names:
+            # Use getattr for CUDA attrs since they may not exist on all systems
+            cuda_time = getattr(evt, "cuda_time", 0) or 0
+            cuda_mem = getattr(evt, "cuda_memory_usage", 0) or 0
+            cpu_mem = getattr(evt, "cpu_memory_usage", 0) or 0
             print(
                 f"  {evt.key:20s}  "
                 f"CPU: {evt.cpu_time_total / 1e3:>10.1f} ms  "
-                f"CUDA: {evt.cuda_time_total / 1e3:>10.1f} ms  "
+                f"CUDA: {cuda_time / 1e3:>10.1f} ms  "
                 f"Calls: {evt.count:>3d}  "
-                f"CPU Mem: {evt.cpu_memory_usage / 1024**2:>8.1f} MB  "
-                f"CUDA Mem: {evt.cuda_memory_usage / 1024**2:>8.1f} MB"
+                f"CPU Mem: {cpu_mem / 1024**2:>8.1f} MB  "
+                f"CUDA Mem: {cuda_mem / 1024**2:>8.1f} MB"
             )
 
     # Total FLOPs

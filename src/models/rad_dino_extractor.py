@@ -63,28 +63,25 @@ class RADDINOProcessor:
 
         B = images.shape[0]
 
-        # Percentile clipping and rescaling (per image)
-        processed = []
-        for i in range(B):
-            img = images[i, 0]  # [H, W]
+        # Flatten spatial dims for batched quantile: [B, H*W]
+        flat = images[:, 0].reshape(B, -1)
 
-            # Percentile clipping (0.5% - 99.5%)
-            lower = torch.quantile(img, 0.005)
-            upper = torch.quantile(img, 0.995)
-            img = torch.clamp(img, lower, upper)
+        # Batched percentile clipping (0.5% - 99.5%) - only 2 quantile calls total
+        lower = torch.quantile(flat, 0.005, dim=1, keepdim=True)  # [B, 1]
+        upper = torch.quantile(flat, 0.995, dim=1, keepdim=True)  # [B, 1]
 
-            # Rescale to [0, 1]
-            img_min, img_max = img.min(), img.max()
-            if img_max > img_min:
-                img = (img - img_min) / (img_max - img_min)
-            else:
-                img = torch.zeros_like(img)
+        # Clamp with per-image bounds
+        processed = torch.clamp(flat, lower, upper)
 
-            processed.append(img)
+        # Rescale to [0, 1] per image (batched min/max)
+        img_min = processed.min(dim=1, keepdim=True)[0]
+        img_max = processed.max(dim=1, keepdim=True)[0]
+        denom = (img_max - img_min).clamp(min=1e-8)
+        processed = (processed - img_min) / denom
 
-        # Stack and expand to RGB
-        processed = torch.stack(processed, dim=0).unsqueeze(1)  # [B, 1, H, W]
-        processed = processed.expand(-1, 3, -1, -1)  # [B, 3, H, W]
+        # Reshape back to spatial and expand to RGB
+        H, W = images.shape[2], images.shape[3]
+        processed = processed.view(B, 1, H, W).expand(-1, 3, -1, -1)
 
         # Resize to target size
         processed = F.interpolate(

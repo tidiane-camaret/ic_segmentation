@@ -70,6 +70,7 @@ training:
   grad_accumulate_steps: 1
   num_workers: 8
   log_every: 10
+  mixed_precision: fp16
 
 method: "patch_icl"
 checkpoint: null  # Path to model checkpoint to load weights from
