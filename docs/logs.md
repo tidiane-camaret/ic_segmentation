@@ -4,6 +4,72 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-02-18: RAD-DINO Pretrained Multi-Modality Encoder
+
+**Goal:** Replace trainable ICLEncoder with pretrained multi-modality encoder for better CT→MRI generalization.
+
+### Background
+
+The current `ICLEncoder` (trainable CNN) achieves good results on CT datasets but accuracy drops on MRI due to domain shift. Pretrained encoders trained on diverse medical imaging data can provide better cross-modality generalization.
+
+### Implementation
+
+**RAD-DINO** (Microsoft, HuggingFace: `microsoft/rad-dino`):
+- DINOv2-based ViT-B/14 trained on RadImageNet (1.35M images)
+- Covers CT, MRI, ultrasound, X-ray (11 anatomical regions)
+- 768-dim features, 16x16 output grid for 224x224 input
+- Self-supervised (no text supervision) — robust features
+
+**Architecture change**: Context masks are NOT passed to the feature extractor. Pretrained encoders only process images. Mask information is instead handled at the backbone/transformer level via `use_context_mask`, which passes patch-level masks directly to attention.
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `src/models/rad_dino_extractor.py` | New RAD-DINO feature extractor (RADDINOExtractor class) |
+| `scripts/train.py` | Added `rad_dino` extractor type registration |
+| `configs/experiment/85_rad_dino.yaml` | Config using RAD-DINO with adapted backbone settings |
+
+### Key Config Changes
+
+```yaml
+feature_extractor_type: "rad_dino"
+
+model:
+  patch_icl:
+    feature_extractor:
+      type: "rad_dino"
+      model_name: "microsoft/rad-dino"
+      target_size: 224      # ViT native input
+      output_grid_size: 16  # ViT-B/14: 224/14=16
+      freeze: true          # Frozen for cross-modality
+
+    backbone:
+      embed_dim: 768        # Match RAD-DINO output
+      embed_proj_dim: 256   # Project down for efficiency
+      feature_grid_size: 16 # Match extractor grid
+      num_heads: 8          # More heads for 768-dim
+      use_context_mask: true  # Masks at attention level
+```
+
+### Usage
+
+```bash
+# Train with RAD-DINO
+python scripts/train.py --config configs/experiment/85_rad_dino.yaml
+
+# Test encoder loading
+python -c "from src.models.rad_dino_extractor import RADDINOExtractor; e = RADDINOExtractor(device='cpu'); print(e.get_feature_info())"
+```
+
+### Dependencies
+
+```bash
+pip install transformers  # For HuggingFace model loading
+```
+
+---
+
 ## 2026-02-17: Unified Augmentation Pipeline Implementation
 
 **Goal:** Refactor augmentation to fix issues identified in the literature review.

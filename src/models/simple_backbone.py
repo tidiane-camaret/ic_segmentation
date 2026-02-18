@@ -27,6 +27,11 @@ Config example:
         num_registers: 4
         target_self_attention: false
         dropout: 0.0
+
+Scale Encoding:
+    Uses ContinuousScaleEncoding with log-sinusoidal functions instead of fixed
+    level embeddings. Pass `resolution` (e.g., 8, 16, 32, 64) to forward() for
+    resolution-agnostic multi-scale processing. Frequencies are learnable (SPE-style).
 """
 from __future__ import annotations
 
@@ -35,6 +40,42 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class ContinuousScaleEncoding(nn.Module):
+    """Resolution-agnostic scale encoding using sinusoidal functions.
+
+    Encodes continuous resolution values (e.g., 8, 16, 32, 64) into embeddings
+    using log-spaced sinusoidal functions, similar to NeRF/Transformer PE.
+    Supports learnable frequencies (SPE-style) for task-specific adaptation.
+    """
+
+    def __init__(self, embed_dim: int, learnable_freqs: bool = True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        half_dim = embed_dim // 2
+        # Base frequencies (log-spaced like transformer PE)
+        freqs = torch.exp(torch.arange(half_dim).float() * -(math.log(10000.0) / half_dim))
+        if learnable_freqs:
+            self.freqs = nn.Parameter(freqs)
+        else:
+            self.register_buffer('freqs', freqs)
+
+    def forward(self, resolution: float, device: torch.device = None) -> torch.Tensor:
+        """Encode resolution to embedding vector.
+
+        Args:
+            resolution: Current level resolution (e.g., 8, 16, 32, 64)
+            device: Target device for the output tensor
+
+        Returns:
+            [embed_dim] scale embedding
+        """
+        # Log2 gives linear progression: 8→3, 16→4, 32→5, 64→6
+        scale = math.log2(resolution)
+        freqs = self.freqs if device is None else self.freqs.to(device)
+        args = scale * freqs
+        return torch.cat([torch.sin(args), torch.cos(args)])
 
 
 class LayerNorm2d(nn.Module):
@@ -797,7 +838,7 @@ class SimpleBackbone(nn.Module):
         max_seq_len: int = 1024,
         decoder_use_skip_connections: bool = True,
         append_zero_attn: bool = False,
-        max_levels: int = 4,
+        max_levels: int = 4,  # Deprecated, kept for backward compatibility
         gradient_checkpointing: bool = False,
         use_mask_prior: bool = False,
         mask_fusion_type: str = "additive",
@@ -819,7 +860,7 @@ class SimpleBackbone(nn.Module):
             max_seq_len: Maximum sequence length for RoPE cache
             decoder_use_skip_connections: If True, use U-Net skips in decoder
             append_zero_attn: Append zero token to K/V for attention sink
-            max_levels: Number of resolution levels for level embedding
+            max_levels: Deprecated, no longer used. Scale encoding is now resolution-agnostic.
             use_mask_prior: If True, fuse mask prior from previous level into encoded features
             mask_fusion_type: How to fuse mask prior ("additive", "gated", or "concat")
         """
@@ -831,8 +872,8 @@ class SimpleBackbone(nn.Module):
         self.use_context_mask = kwargs.get('use_context_mask', False)
         self.mask_fusion_type = mask_fusion_type
 
-        # Learnable level embedding (Deformable DETR style)
-        self.level_embed = nn.Parameter(torch.randn(max_levels, embed_dim) * 0.02)
+        # Continuous scale encoding (resolution-agnostic, replaces fixed level_embed)
+        self.scale_encoder = ContinuousScaleEncoding(embed_dim, learnable_freqs=True)
 
         self.encoder = SimpleCNNEncoder(
             input_dim=input_dim,
@@ -879,6 +920,7 @@ class SimpleBackbone(nn.Module):
         ctx_id_labels: torch.Tensor = None,
         return_attn_weights: bool = False,
         level_idx: int = 0,
+        resolution: float | None = None,
         num_target_patches: int | None = None,
         mask_prior_patches: torch.Tensor | None = None,
         context_mask_patches: torch.Tensor | None = None,
@@ -891,7 +933,9 @@ class SimpleBackbone(nn.Module):
             coords: [B, K, 2] - Patch coordinates (y, x)
             ctx_id_labels: [B, K] - 0 for target, >0 for context
             return_attn_weights: If True, return attention weights and register tokens
-            level_idx: Resolution level index for level embedding
+            level_idx: Deprecated, use resolution instead. Fallback level index.
+            resolution: Current level resolution (e.g., 8, 16, 32, 64).
+                If None, computed as patch_size * 2^level_idx.
             num_target_patches: Number of target patches (first N tokens).
                 Enables context-first attention when num_context_layers > 0.
             mask_prior_patches: [B, K_target, 1, h, h] - mask prior patches from previous level
@@ -920,8 +964,11 @@ class SimpleBackbone(nn.Module):
         # Encode
         encoded, skips = self.encoder(img_patches)
 
-        # Add level embedding (Deformable DETR style)
-        encoded = encoded + self.level_embed[level_idx].view(1, 1, -1)
+        # Add continuous scale embedding (resolution-agnostic)
+        if resolution is None:
+            resolution = float(self.patch_size * (2 ** level_idx))
+        scale_embed = self.scale_encoder(resolution, device=device).view(1, 1, -1)
+        encoded = encoded + scale_embed
 
         # Fuse mask prior into target patch embeddings (before attention)
         K_target = num_target_patches if num_target_patches is not None else K
