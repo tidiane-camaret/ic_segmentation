@@ -5,9 +5,13 @@ Labels are sorted by total volume (largest first).
 The split is created with a fixed random seed (42) for reproducibility.
 """
 
+from cProfile import label
 import random
+from pathlib import Path
+import pandas as pd
+from requests import get
 
-"""
+
 # Labels by total volume (occurrences * avg_volume) from totalseg_2d.ipynb
 
 _all_label_ids = ['liver',
@@ -261,73 +265,31 @@ category_map = {
 }
 
 """
-from pathlib import Path
-import pandas as pd
+
+"""
 
 totalseg_dir = Path("/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg/")
 labels_stats_df = pd.read_csv(totalseg_dir / "label_stats.csv", index_col="label_id")
+labels_stats_df.sort_values("occurrences", ascending=False)
 
 label_ids_train = labels_stats_df[labels_stats_df["split"] == "train"].index.tolist()
 label_ids_val = labels_stats_df[labels_stats_df["split"] == "val"].index.tolist()
 
-# for each split, keep max_labels by occurrences
 def get_label_ids(split="all", max_labels=None):
-    if split == "all":
-        label_ids = labels_stats_df.index.tolist()
-    elif split == "train":
-        label_ids = labels_stats_df[labels_stats_df["split"] == "train"].index.tolist()
-    elif split == "val":
-        label_ids = labels_stats_df[labels_stats_df["split"] == "val"].index.tolist()
-    else:
-        raise ValueError(f"split must be 'train', 'val', or 'all', got: {split}")
 
-    if max_labels is not None:
-        label_ids = label_ids[:max_labels]
-
-    return label_ids
-"""
-# For backwards compatibility
-label_ids = _all_label_ids
-
-
-def _split_labels(labels, seed=42):
-    rng = random.Random(seed)
-    shuffled = labels.copy()
-    rng.shuffle(shuffled)
-    split_idx = int(len(shuffled) * 0.5)
-    return shuffled[:split_idx], shuffled[split_idx:]
-
-
-# Default splits using all labels (for backwards compatibility)
-label_ids_train, label_ids_val = _split_labels(_all_label_ids)
-
-
-def get_label_ids(split="all", max_labels=None):
-    Get label IDs for specified split.
-
-    Args:
-        split: One of "train", "val", or "all"
-        max_labels: If provided, first take the top n labels by volume,
-            then apply the train/val split to those n labels.
-
-    Returns:
-        List of label IDs for the specified split
-    # First, select top n labels by volume (or all if max_labels is None)
-    if max_labels is not None:
-        base_labels = _all_label_ids[:max_labels]
-    else:
-        base_labels = _all_label_ids
 
     # Then apply split
     if split == "all":
-        return base_labels
+        label_ids = label_ids_train + label_ids_val
     elif split == "train":
-        train, _ = _split_labels(base_labels)
-        return train
+        label_ids = label_ids_train
     elif split == "val":
-        _, val = _split_labels(base_labels)
-        return val
+        label_ids = label_ids_val
     else:
         raise ValueError(f"split must be 'train', 'val', or 'all', got: {split}")
+    # Finally, apply max_labels limit
+    if max_labels is not None:
+        label_ids = label_ids[:max_labels]
+    return label_ids
 
-"""
+

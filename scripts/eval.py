@@ -293,6 +293,21 @@ def main(cfg: DictConfig) -> None:
                     info = feature_extractor.get_feature_info()
                     print(f"Feature mode: on_the_fly (ICLEncoder layers={info['layer_indices']}, "
                           f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
+            elif extractor_type == "rad_dino":
+                from src.models.rad_dino_extractor import RADDINOExtractor
+                if accelerator.is_main_process:
+                    print("Initializing RAD-DINO for on-the-fly feature extraction...")
+                feature_extractor = RADDINOExtractor(
+                    model_name=fe_cfg.get("model_name", "microsoft/rad-dino") if fe_cfg else "microsoft/rad-dino",
+                    target_size=fe_cfg.get("target_size", 224) if fe_cfg else 224,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    device=device,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                )
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(f"Feature mode: on_the_fly (RAD-DINO model={info['model_name']}, "
+                          f"dim={info['feature_dim']}, grid={info['output_grid_size']}, frozen={info['frozen']})")
             else:
                 raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
         else:

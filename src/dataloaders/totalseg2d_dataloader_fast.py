@@ -368,7 +368,7 @@ class TotalSeg2DDataset(Dataset):
         import pandas as pd
 
         # Assuming meta.csv is in a standard location relative to the HDF5 dir
-        meta_path = self.root_dir.parent / "TotalSeg" / "meta.csv"
+        meta_path = self.root_dir.parent / "totalseg" / "meta.csv"
         if not meta_path.exists():
             print(f"Warning: meta.csv not found at {meta_path}, skipping split filter")
             return
