@@ -682,7 +682,7 @@ class SimpleCNNDecoder(nn.Module):
     Takes encoded features and skip connections from encoder,
     progressively upsamples with skip fusion to output resolution.
     Uses bilinear interpolation for final upsampling to handle any patch_size.
-    
+
     Supports feature_grid_size of 8 or 16.
     """
 
@@ -693,6 +693,7 @@ class SimpleCNNDecoder(nn.Module):
         patch_size: int = 16,
         feature_grid_size: int = 16,
         use_skip_connections: bool = True,
+        predict_confidence: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -700,6 +701,7 @@ class SimpleCNNDecoder(nn.Module):
         self.patch_size = patch_size
         self.feature_grid_size = feature_grid_size
         self.use_skip_connections = use_skip_connections
+        self.predict_confidence = predict_confidence
 
         D = embed_dim
         fuse_ch_in = D * 2 if self.use_skip_connections else D
@@ -740,50 +742,57 @@ class SimpleCNNDecoder(nn.Module):
             self.up4 = None
             self.fuse4 = None
 
-        # Final conv and projection before upsampling
-        self.final_conv = nn.Sequential(
+        # Segmentation head
+        self.seg_head = nn.Sequential(
             nn.Conv2d(D, D // 2, 3, padding=1),
             nn.GELU(),
             nn.Conv2d(D // 2, num_classes, 1),
         )
 
-    def forward(
+        # Confidence head (predicts pixel-level confidence)
+        if predict_confidence:
+            self.conf_head = nn.Sequential(
+                nn.Conv2d(D, D // 2, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(D // 2, 1, 1),  # Single channel confidence
+            )
+
+    def _decode_trunk(
         self,
         encoded: torch.Tensor,
         skips: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """
+        """Shared decoder trunk that produces features at feature_grid_size resolution.
+
         Args:
-            encoded: [B, K, D] - attention output
+            encoded: [B*K, D, 1, 1] - attention output reshaped
             skips: dict with skip tensors from encoder
 
         Returns:
-            [B, K, num_classes, patch_size, patch_size]
+            [B*K, D, feature_grid_size, feature_grid_size] - decoded features
         """
-        B, K, D = encoded.shape
-        h = self.feature_grid_size
+        B_K, D = encoded.shape[0], encoded.shape[1]
 
-        # Reshape encoded to [B*K, D, 1, 1] (use contiguous for after attention)
-        x = encoded.contiguous().view(B * K, D, 1, 1)
+        x = encoded
 
         # 1x1 → 2x2 + skip
         x = self.up1(x)
         if self.use_skip_connections:
-            skip_2x2 = skips['skip_2x2'].contiguous().view(B * K, D, 2, 2)
+            skip_2x2 = skips['skip_2x2'].view(B_K, D, 2, 2)
             x = torch.cat([x, skip_2x2], dim=1)
         x = self.fuse1(x)
 
         # 2x2 → 4x4 + skip
         x = self.up2(x)
         if self.use_skip_connections:
-            skip_4x4 = skips['skip_4x4'].contiguous().view(B * K, D, 4, 4)
+            skip_4x4 = skips['skip_4x4'].view(B_K, D, 4, 4)
             x = torch.cat([x, skip_4x4], dim=1)
         x = self.fuse2(x)
 
         # 4x4 → 8x8 + skip
         x = self.up3(x)
         if self.use_skip_connections:
-            skip_8x8 = skips['skip_8x8'].contiguous().view(B * K, D, 8, 8)
+            skip_8x8 = skips['skip_8x8'].view(B_K, D, 8, 8)
             x = torch.cat([x, skip_8x8], dim=1)
         x = self.fuse3(x)
 
@@ -791,21 +800,66 @@ class SimpleCNNDecoder(nn.Module):
             # 8x8 → 16x16 + skip
             x = self.up4(x)
             if self.use_skip_connections:
-                skip_16x16 = skips['skip_16x16'].contiguous().view(B * K, D, 16, 16)
+                skip_16x16 = skips['skip_16x16'].view(B_K, D, 16, 16)
                 x = torch.cat([x, skip_16x16], dim=1)
             x = self.fuse4(x)
 
-        # Final conv to num_classes
-        x = self.final_conv(x)  # [B*K, num_classes, h, h]
+        return x  # [B*K, D, h, h]
 
-        # Upsample to patch_size if needed
+    def forward(
+        self,
+        encoded: torch.Tensor,
+        skips: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Args:
+            encoded: [B, K, D] - attention output
+            skips: dict with skip tensors from encoder
+
+        Returns:
+            seg_pred: [B, K, num_classes, patch_size, patch_size]
+            conf_pred: [B, K, 1, patch_size, patch_size] or None if predict_confidence=False
+        """
+        B, K, D = encoded.shape
+        h = self.feature_grid_size
+
+        # Reshape encoded to [B*K, D, 1, 1] (use contiguous for after attention)
+        x = encoded.contiguous().view(B * K, D, 1, 1)
+
+        # Make skips contiguous for the trunk
+        skips_contiguous = {k: v.contiguous() for k, v in skips.items()}
+
+        # Shared decoder trunk
+        features = self._decode_trunk(x, skips_contiguous)  # [B*K, D, h, h]
+
+        # Segmentation head
+        seg_pred = self.seg_head(features)  # [B*K, num_classes, h, h]
+
+        # Upsample segmentation to patch_size if needed
         if h != self.patch_size:
-            x = F.interpolate(
-                x, size=(self.patch_size, self.patch_size),
+            seg_pred = F.interpolate(
+                seg_pred, size=(self.patch_size, self.patch_size),
                 mode='bilinear', align_corners=False
             )
 
-        return x.view(B, K, self.num_classes, self.patch_size, self.patch_size)
+        seg_pred = seg_pred.view(B, K, self.num_classes, self.patch_size, self.patch_size)
+
+        # Confidence head
+        conf_pred = None
+        if self.predict_confidence:
+            conf_logits = self.conf_head(features)  # [B*K, 1, h, h]
+            conf_pred = torch.sigmoid(conf_logits)  # [0, 1] bounded
+
+            # Upsample confidence to patch_size if needed
+            if h != self.patch_size:
+                conf_pred = F.interpolate(
+                    conf_pred, size=(self.patch_size, self.patch_size),
+                    mode='bilinear', align_corners=False
+                )
+
+            conf_pred = conf_pred.view(B, K, 1, self.patch_size, self.patch_size)
+
+        return seg_pred, conf_pred
 
 
 class SimpleBackbone(nn.Module):
@@ -842,6 +896,7 @@ class SimpleBackbone(nn.Module):
         gradient_checkpointing: bool = False,
         use_mask_prior: bool = False,
         mask_fusion_type: str = "additive",
+        predict_confidence: bool = False,
         **kwargs,
     ):
         """
@@ -863,6 +918,7 @@ class SimpleBackbone(nn.Module):
             max_levels: Deprecated, no longer used. Scale encoding is now resolution-agnostic.
             use_mask_prior: If True, fuse mask prior from previous level into encoded features
             mask_fusion_type: How to fuse mask prior ("additive", "gated", or "concat")
+            predict_confidence: If True, predict pixel-level confidence alongside segmentation
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -871,6 +927,7 @@ class SimpleBackbone(nn.Module):
         self.use_mask_prior = use_mask_prior
         self.use_context_mask = kwargs.get('use_context_mask', False)
         self.mask_fusion_type = mask_fusion_type
+        self.predict_confidence = predict_confidence
 
         # Continuous scale encoding (resolution-agnostic, replaces fixed level_embed)
         self.scale_encoder = ContinuousScaleEncoding(embed_dim, learnable_freqs=True)
@@ -901,6 +958,7 @@ class SimpleBackbone(nn.Module):
             patch_size=patch_size,
             feature_grid_size=feature_grid_size,
             use_skip_connections=decoder_use_skip_connections,
+            predict_confidence=predict_confidence,
         )
 
         # Mask encoder and fusion (shared for target prior and context masks)
@@ -1009,11 +1067,14 @@ class SimpleBackbone(nn.Module):
         )
 
         # Decode
-        mask_pred = self.decoder(attended, skips)
+        seg_pred, conf_pred = self.decoder(attended, skips)
 
         result = {
-            'mask_patch_logit_preds': mask_pred,
+            'mask_patch_logit_preds': seg_pred,
         }
+
+        if conf_pred is not None:
+            result['confidence_preds'] = conf_pred
 
         if extras is not None:
             result['attn_weights'] = extras['attn_weights']

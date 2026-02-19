@@ -4,11 +4,12 @@
 # Masks are handled at backbone level (use_context_mask), not in feature extractor
 
 dataset: totalseg
+max_labels: 50 
 feature_mode: "on_the_fly"
 feature_extractor_type: "rad_dino"
 
 preprocessing:
-  image_size: [128, 128, 128]
+  image_size: [224, 224, 224]
 
 context_size: 3
 
@@ -99,22 +100,38 @@ model:
       freeze: true  # Keep frozen for cross-modality generalization
 
     levels:
-      - resolution: 16
+      - resolution: 18
         patch_size: 8
         sampling_method: "sliding_window"
         stride: 6
         num_patches: 9
-        pad_before: 2
-        pad_after: 2
+        pad_before: 1
+        pad_after: 1
+      - resolution: 36
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
+      - resolution: 66
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
 
-    oracle_levels_train: [false]
-    oracle_levels_valid: [false]
+    oracle_levels_train: [false, false]
+    oracle_levels_valid: [false, false]
 
     aggregator:
       type: "average"
       combine_mode: "average"
       min_coverage: 1e-6
-      use_confidence: false      # Modulate aggregation weights by confidence
+      use_confidence: true      # Modulate aggregation weights by confidence
       confidence_mode: "multiply" # "multiply" or "replace"
 
     backbone:
@@ -135,7 +152,7 @@ model:
       use_mask_prior: true
       use_context_mask: true  # Masks handled at backbone level
       mask_fusion_type: "additive"
-      predict_confidence: true  # Enable confidence head for uncertainty estimation
+      predict_confidence: true  # Enable confidence head (set true to use)
 
     loss:
       patch_loss:
@@ -158,10 +175,10 @@ model:
       # Confidence loss settings (requires predict_confidence: true in backbone)
       confidence:
         enabled: true           # Enable confidence supervision
-        supervision_weight: 1  # MSE(conf, 1-|pred-gt|) weight
+        supervision_weight: 0.5  # MSE(conf, 1-|pred-gt|) weight
         boundary_weight: 0     # Penalize high confidence at patch borders
-        boundary_width: none        # Pixels from edge to penalize
-        weighted_seg: true      # Use confidence-weighted segmentation loss
+        boundary_width: 2        # Pixels from edge to penalize
+        weighted_seg: false      # Use confidence-weighted segmentation loss
 
     cascade:
       detach_between_levels: true

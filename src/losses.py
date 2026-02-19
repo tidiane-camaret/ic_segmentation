@@ -315,6 +315,147 @@ class FocalLoss(nn.Module):
         return (focal_weight * ce_loss).mean()
 
 
+# =============================================================================
+# Confidence-related losses
+# =============================================================================
+
+
+class ConfidenceSupervisionLoss(nn.Module):
+    """Supervise confidence to match prediction accuracy.
+
+    Target confidence = 1 - |pred_prob - gt|, so confident where accurate.
+    Uses MSE between predicted confidence and computed target confidence.
+    """
+
+    def __init__(self, smooth: float = 1e-6) -> None:
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(
+        self,
+        confidence: torch.Tensor,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute confidence supervision loss.
+
+        Args:
+            confidence: [B, K, 1, ps, ps] - predicted confidence in [0, 1]
+            predictions: [B, K, C, ps, ps] - logits (detached inside)
+            targets: Same shape as predictions - ground truth labels
+
+        Returns:
+            Scalar MSE loss
+        """
+        # Stop gradient on predictions to avoid influencing segmentation
+        with torch.no_grad():
+            pred_prob = torch.sigmoid(predictions)
+            # For multi-channel, compute per-channel error and average
+            error = torch.abs(pred_prob - targets.float())
+            if error.dim() == 5:  # [B, K, C, ps, ps]
+                # Average over channel dimension (dim=2)
+                if error.shape[2] > 1:
+                    error = error.mean(dim=2, keepdim=True)
+            elif error.dim() == 4:  # [B, C, H, W]
+                if error.shape[1] > 1:
+                    error = error.mean(dim=1, keepdim=True)
+            target_conf = 1.0 - error  # High confidence where accurate
+
+        return nn.functional.mse_loss(confidence, target_conf)
+
+
+class BoundaryConfidenceLoss(nn.Module):
+    """Penalize high confidence at patch boundaries.
+
+    Boundaries tend to have artifacts from patch-based processing,
+    so we encourage lower confidence near edges.
+    """
+
+    def __init__(self, patch_size: int, border_width: int = 2) -> None:
+        """
+        Args:
+            patch_size: Size of patches (ps x ps)
+            border_width: Width of boundary region to penalize
+        """
+        super().__init__()
+        self.patch_size = patch_size
+        self.border_width = border_width
+
+        # Create boundary mask: 1 at borders, 0 inside
+        mask = torch.ones(1, 1, patch_size, patch_size)
+        if patch_size > 2 * border_width:
+            mask[:, :, border_width:-border_width, border_width:-border_width] = 0
+        self.register_buffer('boundary_mask', mask)
+
+    def forward(self, confidence: torch.Tensor) -> torch.Tensor:
+        """Compute boundary confidence penalty.
+
+        Args:
+            confidence: [B, K, 1, ps, ps] - predicted confidence in [0, 1]
+
+        Returns:
+            Scalar loss (mean confidence at boundaries)
+        """
+        # Reshape to [B*K, 1, ps, ps] for efficient masking
+        B, K = confidence.shape[:2]
+        conf_flat = confidence.reshape(B * K, 1, self.patch_size, self.patch_size)
+
+        # Penalize high confidence at boundaries
+        boundary_conf = conf_flat * self.boundary_mask
+        return boundary_conf.mean()
+
+
+class ConfidenceWeightedDiceLoss(nn.Module):
+    """Dice loss weighted by predicted confidence.
+
+    High-confidence regions contribute more to the loss.
+    """
+
+    def __init__(self, smooth: float = 1e-5) -> None:
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        confidence: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute confidence-weighted Dice loss.
+
+        Args:
+            predictions: [B, C, H, W] - logits
+            targets: [B, C, H, W] - ground truth
+            confidence: [B, 1, H, W] - confidence in [0, 1]
+
+        Returns:
+            Scalar Dice loss
+        """
+        probs = torch.sigmoid(predictions)
+        targets = targets.float()
+
+        # Expand confidence to match channel dimension
+        if confidence.shape[1] != probs.shape[1]:
+            confidence = confidence.expand_as(probs)
+
+        # Weight both prediction and target by confidence
+        weighted_probs = probs * confidence
+        weighted_targets = targets * confidence
+
+        # Flatten spatial dimensions
+        weighted_probs = weighted_probs.flatten(2)  # [B, C, N]
+        weighted_targets = weighted_targets.flatten(2)
+        confidence_flat = confidence.flatten(2)
+
+        # Weighted intersection and sums
+        intersection = (weighted_probs * weighted_targets).sum(dim=2)
+        pred_sum = (weighted_probs * confidence_flat[:, :1]).sum(dim=2)
+        target_sum = (weighted_targets * confidence_flat[:, :1]).sum(dim=2)
+
+        dice = (2.0 * intersection + self.smooth) / (pred_sum + target_sum + self.smooth)
+        return 1.0 - dice.mean()
+
+
 def build_loss_fn(loss_type: str, loss_args: Optional[Dict] = None) -> nn.Module:
     """Factory function to build loss functions.
 
@@ -330,12 +471,16 @@ def build_loss_fn(loss_type: str, loss_args: Optional[Dict] = None) -> nn.Module
             - 'mse': Mean Squared Error loss for regression
             - 'l1': L1 (Mean Absolute Error) loss for regression
             - 'focal': Focal loss for class imbalance
+            - 'confidence_supervision': MSE between confidence and prediction accuracy
+            - 'boundary_confidence': Penalize high confidence at patch boundaries
+            - 'confidence_weighted_dice': Dice loss weighted by confidence
         loss_args: Additional arguments for loss function. Examples:
             - dice: {'smooth': 1e-5, 'apply_sigmoid': True, 'squared': False}
             - diceBCE: {'dice_weight': 0.5, 'bce_weight': 0.5}
             - smoothl1: {'beta': 1.0, 'apply_sigmoid': True}
             - mse/l1: {'apply_sigmoid': True}
             - focal: {'alpha': 0.25, 'gamma': 2.0}
+            - boundary_confidence: {'patch_size': 16, 'border_width': 2}
 
     Returns:
         Instantiated loss module
@@ -356,6 +501,9 @@ def build_loss_fn(loss_type: str, loss_args: Optional[Dict] = None) -> nn.Module
         "mse": MSELoss,
         "l1": L1Loss,
         "focal": FocalLoss,
+        "confidence_supervision": ConfidenceSupervisionLoss,
+        "boundary_confidence": BoundaryConfidenceLoss,
+        "confidence_weighted_dice": ConfidenceWeightedDiceLoss,
     }
 
     if loss_type not in loss_registry:

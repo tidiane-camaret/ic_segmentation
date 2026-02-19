@@ -4,6 +4,77 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-02-18: Confidence Head Implementation
+
+**Goal:** Add patch-level confidence prediction to enable confidence-weighted loss, confidence-aware aggregation, and multi-level blending.
+
+### Architecture
+
+Added a confidence head to `SimpleCNNDecoder` that predicts pixel-level confidence alongside segmentation. The decoder now uses a shared trunk with separate output heads:
+
+```
+Decoder Trunk (U-Net style) → [B*K, D, h, h]
+    ├─ seg_head → [B, K, C, ps, ps]    # Segmentation logits
+    └─ conf_head → [B, K, 1, ps, ps]   # Confidence in [0, 1] (sigmoid)
+```
+
+### New Loss Functions (`src/losses.py`)
+
+| Loss | Description |
+|------|-------------|
+| `ConfidenceSupervisionLoss` | MSE between predicted confidence and `1 - |pred_prob - gt|`. Trains confidence to match prediction accuracy. |
+| `BoundaryConfidenceLoss` | Penalizes high confidence at patch borders (artifact-prone regions) |
+| `ConfidenceWeightedDiceLoss` | Dice loss weighted by confidence (high-confidence regions contribute more) |
+
+### Aggregation Enhancements (`src/models/patch_icl_v2/aggregate.py`)
+
+- Added `use_confidence` and `confidence_mode` parameters to aggregators
+- `confidence_mode="multiply"`: Multiplies base weights (uniform/Gaussian) by confidence
+- `confidence_mode="replace"`: Uses confidence as sole weighting
+- New `combine_mode="confidence"`: Uses aggregated confidence for blending with previous level
+
+### Multi-Level Confidence Blending
+
+When `cascade.confidence_blend=true`, levels are blended using confidence:
+```
+combined = conf × current + (1 - conf) × previous
+```
+Uncertain regions defer to coarser level predictions.
+
+### Config Options
+
+```yaml
+backbone:
+  predict_confidence: true    # Enable confidence head
+
+aggregator:
+  use_confidence: true        # Modulate weights by confidence
+  confidence_mode: "multiply" # or "replace"
+
+loss:
+  confidence:
+    enabled: true
+    supervision_weight: 0.5   # MSE(conf, 1-error) weight
+    boundary_weight: 0.1      # Penalty for border confidence
+    boundary_width: 2         # Border pixels to penalize
+    weighted_seg: false       # Use confidence-weighted Dice
+
+cascade:
+  confidence_blend: true      # Multi-level confidence blending
+```
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/models/simple_backbone.py` | Added `predict_confidence` param, refactored decoder to use shared trunk with separate heads |
+| `src/losses.py` | Added `ConfidenceSupervisionLoss`, `BoundaryConfidenceLoss`, `ConfidenceWeightedDiceLoss` |
+| `src/models/patch_icl_v2/aggregate.py` | Added confidence parameter, multiply/replace modes, confidence combine mode |
+| `src/models/patch_icl_v2/patch_icl.py` | Integrated confidence in loss computation, multi-level blending |
+| `configs/experiment/85_rad_dino.yaml` | Added confidence config options (disabled by default) |
+
+---
+
 ## 2026-02-18: RAD-DINO Pretrained Multi-Modality Encoder
 
 **Goal:** Replace trainable ICLEncoder with pretrained multi-modality encoder for better CT→MRI generalization.

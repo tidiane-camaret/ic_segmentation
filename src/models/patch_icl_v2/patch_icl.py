@@ -268,6 +268,32 @@ class PatchICL(nn.Module):
         while len(self.level_loss_weights) < self.num_levels:
             self.level_loss_weights.append(1.0)
 
+        # Confidence loss config
+        conf_cfg = loss_cfg.get('confidence', {})
+        self.confidence_enabled = conf_cfg.get('enabled', False)
+        self.confidence_supervision_weight = conf_cfg.get('supervision_weight', 0.5)
+        self.confidence_boundary_weight = conf_cfg.get('boundary_weight', 0.1)
+        self.confidence_boundary_width = conf_cfg.get('boundary_width', 2)
+        self.use_confidence_weighted_seg = conf_cfg.get('weighted_seg', False)
+
+        # Initialize confidence loss functions if enabled
+        if self.confidence_enabled:
+            from src.losses import ConfidenceSupervisionLoss, BoundaryConfidenceLoss
+            self.conf_supervision_loss = ConfidenceSupervisionLoss()
+            self.conf_boundary_loss = BoundaryConfidenceLoss(
+                patch_size=self.patch_size,
+                border_width=self.confidence_boundary_width,
+            )
+
+        # Initialize confidence-weighted segmentation loss if enabled
+        if self.use_confidence_weighted_seg:
+            from src.losses import ConfidenceWeightedDiceLoss
+            self.conf_weighted_seg_loss = ConfidenceWeightedDiceLoss()
+
+        # Cascade confidence blending config
+        cascade_cfg = config.get('cascade', {})
+        self.confidence_blend = cascade_cfg.get('confidence_blend', False)
+
         # Backbone (shared across levels, with level embedding)
         backbone_cfg = config.get('backbone', {})
         self.feature_grid_size = backbone_cfg.get('feature_grid_size', 16)
@@ -293,6 +319,7 @@ class PatchICL(nn.Module):
             use_mask_prior=backbone_cfg.get('use_mask_prior', False),
             mask_fusion_type=backbone_cfg.get('mask_fusion_type', 'additive'),
             use_context_mask=backbone_cfg.get('use_context_mask', False),
+            predict_confidence=backbone_cfg.get('predict_confidence', False),
         )
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
@@ -311,14 +338,12 @@ class PatchICL(nn.Module):
         return F.interpolate(x, size=(resolution, resolution), mode='bilinear', align_corners=False)
 
     def _downsample_mask(self, mask: torch.Tensor, resolution: int) -> torch.Tensor:
-        """Downsample mask using avg pooling (soft area-fraction targets)."""
+        """Downsample mask using area interpolation (soft area-fraction targets)."""
         if mask.shape[-1] == resolution and mask.shape[-2] == resolution:
             return mask
         if mask.shape[1] > 1:  # Multi-channel (RGB)
             return F.interpolate(mask.float(), size=(resolution, resolution), mode='bilinear', align_corners=False)
-        scale_factor = mask.shape[-1] // resolution
-        if scale_factor > 1:
-            return F.avg_pool2d(mask.float(), kernel_size=scale_factor, stride=scale_factor)
+        # Use area interpolation for exact output size (avg_pool2d doesn't guarantee exact resolution)
         return F.interpolate(mask.float(), size=(resolution, resolution), mode='area')
 
     def _mask_to_weights(self, mask: torch.Tensor) -> torch.Tensor:
@@ -441,7 +466,7 @@ class PatchICL(nn.Module):
         context_out: torch.Tensor | None,
         target_features: torch.Tensor | None,
         context_features: torch.Tensor | None,
-        weights: torch.Tensor,
+        sampling_weights: torch.Tensor,
         H: int,
         W: int,
         return_attn_weights: bool = False,
@@ -471,8 +496,8 @@ class PatchICL(nn.Module):
         labels_ds = self._downsample_mask(labels, resolution) if labels is not None else torch.zeros(
             B, self.num_mask_channels, resolution, resolution, device=device)
 
-        # Select target patches
-        patches, patch_labels, coords, _, aug_params, target_validity = sampler(image_ds, labels_ds, weights, None)
+        # Select target patches using sampling_weights
+        patches, patch_labels, coords, _, aug_params, target_validity = sampler(image_ds, labels_ds, sampling_weights, None)
         K = patches.shape[1]
         coord_scale = H / resolution
 
@@ -604,6 +629,14 @@ class PatchICL(nn.Module):
             patch_logits = all_logits[:, :K]
             context_patch_logits = all_logits[:, K:]
 
+            # Extract confidence predictions if available
+            all_confidence = backbone_out.get('confidence_preds')
+            patch_confidence = None
+            context_patch_confidence = None
+            if all_confidence is not None:
+                patch_confidence = all_confidence[:, :K]
+                context_patch_confidence = all_confidence[:, K:]
+
             # Aggregate context predictions
             context_preds = []
             for ctx_idx in range(k):
@@ -616,7 +649,9 @@ class PatchICL(nn.Module):
                         ctx_aug = context_aug_params[b][ctx_idx]
                         if ctx_aug and any(v is not None for v in ctx_aug.values()):
                             ctx_logits[b:b+1] = self.augmenter.inverse(ctx_logits[b:b+1], ctx_aug)
-                ctx_pred = aggregator(ctx_logits, ctx_coords_slice, (resolution, resolution))
+                agg_result = aggregator(ctx_logits, ctx_coords_slice, (resolution, resolution))
+                # Handle tuple return when confidence is used
+                ctx_pred = agg_result[0] if isinstance(agg_result, tuple) else agg_result
                 context_preds.append(ctx_pred)
             context_pred = torch.stack(context_preds, dim=1)
         else:
@@ -629,13 +664,23 @@ class PatchICL(nn.Module):
                 mask_prior_patches=mask_prior_patches,
             )
             patch_logits = backbone_out['mask_patch_logit_preds']
+            patch_confidence = backbone_out.get('confidence_preds')
 
         # Apply inverse augmentation and aggregate
         patch_logits_for_agg = patch_logits
         if self.augmenter is not None and aug_params:
             patch_logits_for_agg = self.augmenter.inverse(patch_logits, aug_params)
 
-        pred = aggregator(patch_logits_for_agg, coords, (resolution, resolution))
+        # Aggregate with confidence if available
+        aggregated_conf = None
+        if patch_confidence is not None:
+            agg_result = aggregator(
+                patch_logits_for_agg, coords, (resolution, resolution),
+                confidence=patch_confidence
+            )
+            pred, aggregated_conf = agg_result
+        else:
+            pred = aggregator(patch_logits_for_agg, coords, (resolution, resolution))
 
         level_out = {
             'pred': pred,
@@ -656,9 +701,11 @@ class PatchICL(nn.Module):
             'register_tokens': backbone_out.get('register_tokens'),
             'patch_size': patch_size,
             'level_res': resolution,
+            'confidence_preds': patch_confidence,
+            'aggregated_conf': aggregated_conf,
         }
 
-        return level_out, pred
+        return level_out, pred, aggregated_conf
 
     def forward(
         self,
@@ -685,6 +732,7 @@ class PatchICL(nn.Module):
 
         # Process each level with progressive refinement
         combined_pred = None  # Progressively refined prediction
+        combined_conf = None  # Progressively refined confidence
         level_outputs = []
 
         for i in range(self.num_levels):
@@ -692,24 +740,35 @@ class PatchICL(nn.Module):
             resolution = level_cfg['resolution']
             patch_size = level_cfg['patch_size']
 
-            # Determine sampling weights for this level
+            # Determine sampling weights for this level (guides where patches are sampled)
             use_oracle = self.oracle_train[i] if training else self.oracle_valid[i]
             if use_oracle and labels is not None:
                 labels_ds = self._downsample_mask(labels, resolution)
-                weights = self._mask_to_weights(labels_ds)
+                sampling_weights = self._mask_to_weights(labels_ds)
                 refined_probs = None
             elif combined_pred is not None:
-                # Use refined prediction from previous levels as sampling weights
-                combined_prob = torch.sigmoid(combined_pred)
-                if self.detach_between_levels:
-                    combined_prob = combined_prob.detach()
-                weights = F.interpolate(
-                    combined_prob, size=(resolution, resolution),
-                    mode='bilinear', align_corners=False
-                )
-                refined_probs = weights.clone()
+                # Use previous level outputs for sampling weights
+                if combined_conf is not None:
+                    # Sample from LOW confidence regions (where model is uncertain)
+                    conf_weights = 1.0 - combined_conf
+                    if self.detach_between_levels:
+                        conf_weights = conf_weights.detach()
+                    sampling_weights = F.interpolate(
+                        conf_weights, size=(resolution, resolution),
+                        mode='bilinear', align_corners=False
+                    )
+                else:
+                    # Fallback: use prediction probabilities
+                    combined_prob = torch.sigmoid(combined_pred)
+                    if self.detach_between_levels:
+                        combined_prob = combined_prob.detach()
+                    sampling_weights = F.interpolate(
+                        combined_prob, size=(resolution, resolution),
+                        mode='bilinear', align_corners=False
+                    )
+                refined_probs = sampling_weights.clone()
             else:
-                weights = torch.ones(B, 1, resolution, resolution, device=device)
+                sampling_weights = torch.ones(B, 1, resolution, resolution, device=device)
                 refined_probs = None
 
             # Pass previous prediction as mask prior (level 0 has None)
@@ -717,7 +776,7 @@ class PatchICL(nn.Module):
             if i > 0 and combined_pred is not None:
                 mask_prior = combined_pred.detach() if self.detach_between_levels else combined_pred
 
-            level_out, pred = self._forward_level(
+            level_out, pred, aggregated_conf = self._forward_level(
                 level_idx=i,
                 image=image,
                 labels=labels,
@@ -725,7 +784,7 @@ class PatchICL(nn.Module):
                 context_out=context_out,
                 target_features=target_features,
                 context_features=context_features,
-                weights=weights,
+                sampling_weights=sampling_weights,
                 H=H, W=W,
                 return_attn_weights=return_attn_weights,
                 mask_prior=mask_prior,
@@ -741,10 +800,34 @@ class PatchICL(nn.Module):
                     combined_pred, size=(resolution, resolution),
                     mode='bilinear', align_corners=False
                 )
-                # Blend: use current pred where covered, keep previous elsewhere
-                combined_pred = coverage * pred + (1 - coverage) * combined_upsampled
+
+                # Blend predictions
+                if self.confidence_blend and combined_conf is not None and aggregated_conf is not None:
+                    # Use confidence for blending: high conf regions use current, low conf use previous
+                    conf_upsampled = F.interpolate(
+                        combined_conf, size=(resolution, resolution),
+                        mode='bilinear', align_corners=False
+                    )
+                    # Blend using current level confidence where covered
+                    blend_weight = coverage * aggregated_conf + (1 - coverage) * conf_upsampled
+                    combined_pred = blend_weight * pred + (1 - blend_weight) * combined_upsampled
+                else:
+                    # Standard coverage-based blending
+                    combined_pred = coverage * pred + (1 - coverage) * combined_upsampled
+
+                # Update combined confidence
+                if aggregated_conf is not None:
+                    if combined_conf is not None:
+                        conf_upsampled = F.interpolate(
+                            combined_conf, size=(resolution, resolution),
+                            mode='bilinear', align_corners=False
+                        )
+                        combined_conf = coverage * aggregated_conf + (1 - coverage) * conf_upsampled
+                    else:
+                        combined_conf = aggregated_conf
             else:
                 combined_pred = pred
+                combined_conf = aggregated_conf
 
             level_out['refined_probs'] = refined_probs  # Probs used for sampling (after refinement)
             level_out['coverage_mask'] = self._create_coverage_mask(coords, patch_size, (resolution, resolution))
@@ -754,11 +837,17 @@ class PatchICL(nn.Module):
         final_pred = F.interpolate(combined_pred, size=(H, W), mode='bilinear', align_corners=False)
         coarse_pred = F.interpolate(level_outputs[0]['pred'], size=(H, W), mode='bilinear', align_corners=False)
 
+        # Final confidence map
+        final_conf = None
+        if combined_conf is not None:
+            final_conf = F.interpolate(combined_conf, size=(H, W), mode='bilinear', align_corners=False)
+
         # Backward compat aliases from last level
         last = level_outputs[-1]
         return {
             'final_pred': final_pred,
             'final_logit': final_pred,
+            'final_conf': final_conf,
             'coarse_pred': coarse_pred,
             'level_outputs': level_outputs,
             'patches': last['patches'],
@@ -819,20 +908,33 @@ class PatchICL(nn.Module):
             patch_logits = level_out['patch_logits']
             patch_labels = level_out['patch_labels']
             target_validity = level_out.get('target_validity')
+            conf_preds = level_out.get('confidence_preds')
             K = patch_logits.shape[1]
-            target_patch_loss = self._masked_patch_loss(
-                patch_logits.reshape(B * K, -1),
-                patch_labels.reshape(B * K, -1),
-                target_validity.reshape(B * K, -1) if target_validity is not None else None,
-            )
+
+            # Use confidence-weighted loss if enabled and confidence available
+            if self.use_confidence_weighted_seg and conf_preds is not None:
+                # Reshape for loss: [B*K, C, ps, ps]
+                logits_flat = patch_logits.reshape(B * K, *patch_logits.shape[2:])
+                labels_flat = patch_labels.reshape(B * K, *patch_labels.shape[2:])
+                conf_flat = conf_preds.reshape(B * K, *conf_preds.shape[2:])
+                target_patch_loss = self.conf_weighted_seg_loss(
+                    logits_flat, labels_flat, conf_flat
+                )
+            else:
+                target_patch_loss = self._masked_patch_loss(
+                    patch_logits.reshape(B * K, -1),
+                    patch_labels.reshape(B * K, -1),
+                    target_validity.reshape(B * K, -1) if target_validity is not None else None,
+                )
             losses[f'level_{i}_target_patch_loss'] = target_patch_loss
             total_loss = total_loss + lw * self.loss_weights['target_patch'] * target_patch_loss
             sum_target_patch = sum_target_patch + target_patch_loss
 
-            # Target aggreg loss (soft avg_pool targets)
+            # Target aggreg loss (area-interpolated targets for exact size match)
             pred = level_out['pred']
-            scale_factor = labels.shape[-1] // pred.shape[-1]
-            labels_ds = F.avg_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
+            labels_ds = F.interpolate(
+                labels.float(), size=pred.shape[-2:], mode='area'
+            )
             target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
             losses[f'level_{i}_target_aggreg_loss'] = target_aggreg_loss
             total_loss = total_loss + lw * self.loss_weights['target_aggreg'] * target_aggreg_loss
@@ -861,8 +963,9 @@ class PatchICL(nn.Module):
             if context_pred is not None and context_labels_fullres is not None:
                 B_ctx, k_ctx = context_pred.shape[:2]
                 ctx_flat = context_labels_fullres.view(B_ctx * k_ctx, *context_labels_fullres.shape[2:])
-                ctx_scale = ctx_flat.shape[-1] // context_pred.shape[-1]
-                context_labels_ds = F.avg_pool2d(ctx_flat.float(), kernel_size=ctx_scale, stride=ctx_scale)
+                context_labels_ds = F.interpolate(
+                    ctx_flat.float(), size=context_pred.shape[-2:], mode='area'
+                )
                 context_aggreg_loss = self.aggreg_criterion(
                     context_pred.reshape(B_ctx * k_ctx, -1),
                     context_labels_ds.reshape(B_ctx * k_ctx, -1),
@@ -886,6 +989,37 @@ class PatchICL(nn.Module):
                 )
                 losses[f'level_{i}_refined_probs_dice'] = dice_result['dice'].mean()
                 losses[f'level_{i}_refined_probs_soft_dice'] = dice_result['soft_dice'].mean()
+
+        # Confidence losses (if enabled)
+        sum_conf_supervision = 0.0
+        sum_conf_boundary = 0.0
+        if self.confidence_enabled:
+            for i, level_out in enumerate(outputs['level_outputs']):
+                lw = self.level_loss_weights[i]
+                conf_preds = level_out.get('confidence_preds')
+
+                if conf_preds is not None:
+                    patch_logits = level_out['patch_logits']
+                    patch_labels = level_out['patch_labels']
+
+                    # Confidence supervision loss: MSE(conf, 1 - |pred - gt|)
+                    conf_sup_loss = self.conf_supervision_loss(
+                        conf_preds, patch_logits, patch_labels
+                    )
+                    losses[f'level_{i}_conf_supervision_loss'] = conf_sup_loss
+                    total_loss = total_loss + lw * self.confidence_supervision_weight * conf_sup_loss
+                    sum_conf_supervision = sum_conf_supervision + conf_sup_loss
+
+                    # Boundary confidence penalty
+                    if self.confidence_boundary_weight > 0:
+                        conf_boundary_loss = self.conf_boundary_loss(conf_preds)
+                        losses[f'level_{i}_conf_boundary_loss'] = conf_boundary_loss
+                        total_loss = total_loss + lw * self.confidence_boundary_weight * conf_boundary_loss
+                        sum_conf_boundary = sum_conf_boundary + conf_boundary_loss
+
+            # Aggregated confidence losses
+            losses['conf_supervision_loss'] = sum_conf_supervision / self.num_levels
+            losses['conf_boundary_loss'] = sum_conf_boundary / self.num_levels
 
         losses['total_loss'] = total_loss
 

@@ -48,8 +48,13 @@ def _save_sample_images(
     epoch: int,
     prefix: str = "train",
     max_samples: int = 20,
+    max_context: int = 2,
 ) -> None:
-    """Save sample images with patches to disk."""
+    """Save sample images with patches to disk.
+
+    Layout: One row per level with columns:
+    [Ctx1, Ctx2, Target, Pred, Conf, Pred×Conf, Binary, Combined Conf]
+    """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
@@ -62,11 +67,10 @@ def _save_sample_images(
         """Draw patch bounding boxes on image."""
         if coords is None or level_res is None:
             return
-        # Handle edge cases with coords shape
         if coords.ndim == 0 or coords.numel() == 0:
             return
         if coords.ndim == 1:
-            coords = coords.unsqueeze(0)  # [2] -> [1, 2]
+            coords = coords.unsqueeze(0)
         if coords.shape[-1] != 2:
             return
 
@@ -95,7 +99,6 @@ def _save_sample_images(
     wandb_images = []
     try:
         import wandb
-
         wandb_available = True
     except ImportError:
         wandb_available = False
@@ -107,7 +110,6 @@ def _save_sample_images(
         ctx_in = sample.get("context_in")
         ctx_out = sample.get("context_out")
 
-        # Build per-level info (backward compat with single-level samples)
         levels_info = sample.get("levels", [])
         if not levels_info:
             levels_info = [
@@ -121,153 +123,142 @@ def _save_sample_images(
             ]
 
         n_levels = len(levels_info)
-        n_ctx = ctx_in.shape[0] if ctx_in is not None else 0
-        n_cols = max(1 + n_ctx, 4)
-        n_rows = 2 * n_levels
+        n_ctx = min(ctx_in.shape[0] if ctx_in is not None else 0, max_context)
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
-        if n_rows == 2:
-            axes = [axes[0], axes[1]]  # keep 2D indexing consistent
+        # Columns: [Ctx1, Ctx2, Target, Pred, Conf, Pred×Conf, Binary, Sampling Weights]
+        n_cols = max_context + 6  # 2 ctx + target + pred + conf + pred×conf + binary + sampling weights
+        n_rows = n_levels
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
+        if n_rows == 1:
+            axes = [axes]
 
         for li, level_info in enumerate(levels_info):
-            top_row = 2 * li
-            bot_row = 2 * li + 1
+            row = axes[li]
             l_target_coords = level_info.get("target_coords")
             l_context_coords = level_info.get("context_coords")
             l_patch_size = level_info.get("patch_size", 16)
             l_level_res = level_info.get("level_res", 32)
             l_pred_probs = level_info.get("pred_probs")
             l_refined_probs = level_info.get("refined_probs")
+            l_aggregated_conf = level_info.get("aggregated_conf")
 
-            # --- Top row: target + context images with patch boxes ---
-            axes[top_row][0].imshow(img, cmap="gray")
-            axes[top_row][0].imshow(gt, cmap="Reds", alpha=0.4)
-            axes[top_row][0].contour(gt, colors="yellow", linewidths=1)
-            if l_target_coords is not None and l_level_res is not None:
-                draw_patch_boxes(
-                    axes[top_row][0],
-                    img,
-                    l_target_coords,
-                    l_patch_size,
-                    l_level_res,
-                    color="lime",
-                )
-            axes[top_row][0].set_title(f"Level {li} (res {l_level_res}) - Target")
-            axes[top_row][0].axis("off")
+            col_idx = 0
 
-            for ci in range(n_ctx):
-                ctx_img = ctx_in[ci].squeeze().numpy()
-                ctx_mask = ctx_out[ci].squeeze().numpy()
-                axes[top_row][1 + ci].imshow(ctx_img, cmap="gray")
-                axes[top_row][1 + ci].imshow(ctx_mask, cmap="Reds", alpha=0.4)
-                axes[top_row][1 + ci].contour(ctx_mask, colors="cyan", linewidths=1)
-                if (
-                    l_context_coords is not None
-                    and l_level_res is not None
-                    and l_context_coords.ndim == 2
-                ):
-                    try:
-                        total_patches = l_context_coords.shape[0]
-                        K_per_ctx = total_patches // n_ctx
-                        ci_coords = l_context_coords[
-                            ci * K_per_ctx : (ci + 1) * K_per_ctx
-                        ]
-                        draw_patch_boxes(
-                            axes[top_row][1 + ci],
-                            ctx_img,
-                            ci_coords,
-                            l_patch_size,
-                            l_level_res,
-                            color="cyan",
-                        )
-                    except (IndexError, TypeError, ZeroDivisionError):
-                        pass
-                axes[top_row][1 + ci].set_title(f"Context {ci + 1}")
-                axes[top_row][1 + ci].axis("off")
+            # --- Context images (max 2) ---
+            for ci in range(max_context):
+                if ci < n_ctx and ctx_in is not None:
+                    ctx_img = ctx_in[ci].squeeze().numpy()
+                    ctx_mask = ctx_out[ci].squeeze().numpy()
+                    row[col_idx].imshow(ctx_img, cmap="gray")
+                    row[col_idx].imshow(ctx_mask, cmap="Reds", alpha=0.4)
+                    row[col_idx].contour(ctx_mask, colors="cyan", linewidths=1)
+                    if l_context_coords is not None and l_context_coords.ndim == 2:
+                        try:
+                            total_patches = l_context_coords.shape[0]
+                            n_ctx_total = ctx_in.shape[0] if ctx_in is not None else 1
+                            K_per_ctx = total_patches // n_ctx_total
+                            ci_coords = l_context_coords[ci * K_per_ctx : (ci + 1) * K_per_ctx]
+                            draw_patch_boxes(row[col_idx], ctx_img, ci_coords, l_patch_size, l_level_res, "cyan")
+                        except (IndexError, TypeError, ZeroDivisionError):
+                            pass
+                    row[col_idx].set_title(f"Ctx {ci + 1}")
+                else:
+                    row[col_idx].set_title("Ctx N/A")
+                row[col_idx].axis("off")
+                col_idx += 1
 
-            for j in range(1 + n_ctx, n_cols):
-                axes[top_row][j].axis("off")
+            # --- Target image with patches ---
+            row[col_idx].imshow(img, cmap="gray")
+            row[col_idx].imshow(gt, cmap="Reds", alpha=0.4)
+            row[col_idx].contour(gt, colors="yellow", linewidths=1)
+            if l_target_coords is not None:
+                draw_patch_boxes(row[col_idx], img, l_target_coords, l_patch_size, l_level_res, "lime")
+            row[col_idx].set_title(f"L{li} Target (r{l_level_res})")
+            row[col_idx].axis("off")
+            col_idx += 1
 
-            # --- Bottom row: Downsized GT | Pred probs | Pred mask ---
-            # Downsized GT
-            if l_level_res is not None and l_level_res < gt.shape[0]:
-                gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
-                scale = max(1, gt.shape[0] // l_level_res)
-                gt_ds = (
-                    F.avg_pool2d(gt_t, kernel_size=scale, stride=scale)
-                    .squeeze()
-                    .numpy()
-                )
-            else:
-                gt_ds = gt
-            axes[bot_row][0].imshow(gt_ds, cmap="gray")
-            axes[bot_row][0].set_title(f"GT ({gt_ds.shape[0]}x{gt_ds.shape[1]})")
-            axes[bot_row][0].axis("off")
-
-            # Pred probs
+            # --- Level prediction map ---
             if l_pred_probs is not None:
                 pp = l_pred_probs.squeeze().numpy()
-                im = axes[bot_row][1].imshow(pp, cmap="hot", vmin=pp.min(), vmax=pp.max())
-                axes[bot_row][1].set_title(f"Pred. Probs ({pp.shape[0]}x{pp.shape[1]})")
-                plt.colorbar(im, ax=axes[bot_row][1], fraction=0.046, pad=0.04)
+                im = row[col_idx].imshow(pp, cmap="hot", vmin=0, vmax=1)
+                row[col_idx].set_title(f"Pred ({pp.shape[0]})")
+                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
             else:
-                axes[bot_row][1].set_title("Pred. Probs (N/A)")
-            axes[bot_row][1].axis("off")
+                row[col_idx].set_title("Pred N/A")
+            row[col_idx].axis("off")
+            col_idx += 1
 
-            # Pred mask with per-level dice
+            # --- Level confidence map ---
+            if l_aggregated_conf is not None:
+                conf_img = l_aggregated_conf.squeeze().numpy()
+                im = row[col_idx].imshow(conf_img, cmap="viridis", vmin=0, vmax=1)
+                row[col_idx].set_title(f"Conf ({conf_img.shape[0]})")
+                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
+            else:
+                row[col_idx].set_title("Conf N/A")
+            row[col_idx].axis("off")
+            col_idx += 1
+
+            # --- Pred × Conf ---
+            if l_pred_probs is not None and l_aggregated_conf is not None:
+                pp = l_pred_probs.squeeze().numpy()
+                conf_img = l_aggregated_conf.squeeze().numpy()
+                if conf_img.shape != pp.shape:
+                    conf_t = torch.from_numpy(conf_img).unsqueeze(0).unsqueeze(0)
+                    conf_t = F.interpolate(conf_t, size=pp.shape, mode="bilinear", align_corners=False)
+                    conf_img = conf_t.squeeze().numpy()
+                weighted = pp * conf_img
+                im = row[col_idx].imshow(weighted, cmap="hot", vmin=0, vmax=1)
+                row[col_idx].set_title("Pred×Conf")
+                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
+            else:
+                row[col_idx].set_title("Pred×Conf N/A")
+            row[col_idx].axis("off")
+            col_idx += 1
+
+            # --- Binary prediction with dice ---
             if l_pred_probs is not None:
                 pp = l_pred_probs.squeeze()
-                # Resize pred to match gt_ds if needed (backward compat)
-                if pp.shape[0] != gt_ds.shape[0]:
-                    pp = F.interpolate(
-                        pp.unsqueeze(0).unsqueeze(0).float(),
-                        size=(gt_ds.shape[0], gt_ds.shape[1]),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).squeeze()
-                pp = pp.numpy() if hasattr(pp, "numpy") else pp
-                pred_mask = (pp > PRED_THRESHOLD).astype(float)
+                # Get GT at prediction resolution
+                gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
+                if pp.shape[0] != gt.shape[0]:
+                    gt_t = F.interpolate(gt_t, size=pp.shape[-2:], mode='area')
+                gt_ds = gt_t.squeeze().numpy()
+                pp_np = pp.numpy() if hasattr(pp, "numpy") else pp
+                pred_mask = (pp_np > PRED_THRESHOLD).astype(float)
                 gt_binary = (gt_ds > GT_AREA_THRESHOLD).astype(float)
                 inter = (pred_mask * gt_binary).sum()
                 union_val = pred_mask.sum() + gt_binary.sum()
                 level_dice = (2 * inter + 1e-6) / (union_val + 1e-6)
-                axes[bot_row][2].imshow(pred_mask, cmap="gray")
-                axes[bot_row][2].set_title(f"Pred (dice={level_dice:.3f})")
+                row[col_idx].imshow(pred_mask, cmap="gray")
+                row[col_idx].set_title(f"Bin (d={level_dice:.2f})")
             else:
-                axes[bot_row][2].set_title("Pred (N/A)")
-            axes[bot_row][2].axis("off")
+                row[col_idx].set_title("Bin N/A")
+            row[col_idx].axis("off")
+            col_idx += 1
 
-            # Refined probs (sampling weights for this level from progressive refinement)
-            if l_refined_probs is not None and n_cols > 3:
+            # --- Sampling weights (refined probs / 1-conf for next level) ---
+            if l_refined_probs is not None:
                 rp = l_refined_probs.squeeze().numpy()
-                im = axes[bot_row][3].imshow(rp, cmap="hot", vmin=0, vmax=1)
-                axes[bot_row][3].set_title(
-                    f"Refined Pred. Probs ({rp.shape[0]}x{rp.shape[1]})"
-                )
-                plt.colorbar(im, ax=axes[bot_row][3], fraction=0.046, pad=0.04)
-            elif n_cols > 3:
-                axes[bot_row][3].set_title("Refined Pred. Probs (N/A)")
-            if n_cols > 3:
-                axes[bot_row][3].axis("off")
+                im = row[col_idx].imshow(rp, cmap="hot", vmin=0, vmax=1)
+                row[col_idx].set_title(f"SampW ({rp.shape[0]})")
+                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
+            else:
+                row[col_idx].set_title("SampW N/A")
+            row[col_idx].axis("off")
 
-            for j in range(4, n_cols):
-                axes[bot_row][j].axis("off")
-
-        fig.suptitle(f"{label_id} (final dice={dice:.3f})", fontsize=12, y=1.01)
+        fig.suptitle(f"{label_id} (dice={dice:.3f})", fontsize=12, y=1.01)
         fig.tight_layout()
         safe_label = label_id.replace("/", "_")
         save_path = epoch_dir / f"{safe_label}.png"
         fig.savefig(save_path, dpi=100, bbox_inches="tight")
         plt.close(fig)
 
-        # Log the saved image to wandb
         if wandb_available:
-            wandb_img = wandb.Image(
-                str(save_path), caption=f"{label_id} (dice={dice:.3f})"
-            )
+            wandb_img = wandb.Image(str(save_path), caption=f"{label_id} (dice={dice:.3f})")
             wandb_images.append(wandb_img)
 
-    # Log all images at once to wandb
     if wandb_images and wandb_available and wandb.run is not None:
         wandb.log({f"{prefix}/saved_samples": wandb_images, "epoch": epoch})
 
@@ -311,6 +302,11 @@ def _collect_sample_for_viz(
         pred_probs = torch.sigmoid(outputs["final_logit"][i]).detach().cpu()
     pred_binary = (pred_probs > PRED_THRESHOLD).float()
 
+    # Get final confidence map if available
+    final_conf = outputs.get("final_conf")
+    if final_conf is not None:
+        final_conf = final_conf[i].detach().cpu()
+
     # Collect per-level info
     levels = []
     for level_out in level_outputs:
@@ -327,6 +323,10 @@ def _collect_sample_for_viz(
         l_refined = level_out.get("refined_probs")
         if l_refined is not None:
             l_refined = l_refined[i].detach().cpu()
+        # Collect confidence maps
+        l_aggregated_conf = level_out.get("aggregated_conf")
+        if l_aggregated_conf is not None:
+            l_aggregated_conf = l_aggregated_conf[i].detach().cpu()
         levels.append(
             {
                 "target_coords": l_coords,
@@ -335,6 +335,7 @@ def _collect_sample_for_viz(
                 "level_res": level_out.get("level_res", 32),
                 "pred_probs": l_pred_probs,
                 "refined_probs": l_refined,
+                "aggregated_conf": l_aggregated_conf,
             }
         )
 
@@ -349,6 +350,7 @@ def _collect_sample_for_viz(
             context_out[i].detach().cpu() if context_out is not None else None
         ),
         "levels": levels,
+        "final_conf": final_conf,
     }
 
 
@@ -750,8 +752,9 @@ def validate(
         level_outputs = outputs.get("level_outputs", [])
         if level_outputs:
             last_pred = level_outputs[-1]["pred"]
-            sf = labels.shape[-1] // last_pred.shape[-1]
-            labels_ds = F.avg_pool2d(labels.float(), kernel_size=sf, stride=sf)
+            labels_ds = F.interpolate(
+                labels.float(), size=last_pred.shape[-2:], mode='area'
+            )
             loss = unwrapped_model.aggreg_criterion(last_pred, labels_ds)
         else:
             loss = unwrapped_model.aggreg_criterion(

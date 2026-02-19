@@ -115,9 +115,9 @@ def compute_level_metrics(
 
     for li, level_out in enumerate(level_outputs):
         level_pred = level_out['pred']
-        level_res = level_pred.shape[-1]
-        scale_factor = labels.shape[-1] // level_res
-        labels_ds = F.avg_pool2d(labels.float(), kernel_size=scale_factor, stride=scale_factor)
+        labels_ds = F.interpolate(
+            labels.float(), size=level_pred.shape[-2:], mode='area'
+        )
 
         dice_result = compute_dice(level_pred, labels_ds)
         metrics[f'level_{li}_dice'] = dice_result['dice'].mean()
@@ -127,9 +127,9 @@ def compute_level_metrics(
         # Refined probs dice (sampling guidance quality from progressive refinement)
         refined_probs = level_out.get('refined_probs')
         if refined_probs is not None:
-            rp_res = refined_probs.shape[-1]
-            rp_sf = labels.shape[-1] // rp_res
-            rp_gt = F.avg_pool2d(labels.float(), kernel_size=rp_sf, stride=rp_sf)
+            rp_gt = F.interpolate(
+                labels.float(), size=refined_probs.shape[-2:], mode='area'
+            )
 
             # Soft dice (refined_probs is already probabilities)
             rp_dice = compute_dice(refined_probs, rp_gt, apply_sigmoid=False)
