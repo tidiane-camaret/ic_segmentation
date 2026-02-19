@@ -266,9 +266,9 @@ category_map = {
 
 """
 
-"""
 
-totalseg_dir = Path("/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg/")
+"""
+totalseg_dir = Path("/work/dlclarge2/ndirt-SegFM3D/data/totalseg")
 labels_stats_df = pd.read_csv(totalseg_dir / "label_stats.csv", index_col="label_id")
 labels_stats_df.sort_values("occurrences", ascending=False)
 

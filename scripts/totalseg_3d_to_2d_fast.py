@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import hydra
 import nibabel as nib
 import numpy as np
 from omegaconf import DictConfig
-import random
+
 
 def extract_label_slices(label_file: Path, case_path: Path):
     """

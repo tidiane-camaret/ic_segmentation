@@ -1,0 +1,186 @@
+# @package _global_
+# RAD-DINO pretrained encoder for multi-modality medical image segmentation
+# Uses Microsoft's radiology-specific DINOv2 trained on RadImageNet (CT, MRI, US, X-ray)
+# Masks are handled at backbone level (use_context_mask), not in feature extractor
+
+dataset: totalseg
+max_labels: 50 
+feature_mode: "on_the_fly"
+feature_extractor_type: "universeg"
+layer_idx: "all"
+
+preprocessing:
+  image_size: [224, 224, 224]
+
+context_size: 3
+
+# Unified augmentation config
+augmentation:
+  enabled: true
+
+  # Mix augmentation: CutMix (simple) or CarveMix (foreground-aware)
+  mix:
+    type: "cutmix"
+    probability: 0.5
+    cutmix:
+      min_ratio: 0.3
+      max_ratio: 0.7
+    carve_mix:
+      margin_range: [0.1, 0.5]
+      harmonize: true
+      harmonize_sigma: 5.0
+
+  # Spatial augmentation (rotation, scale, elastic)
+  spatial:
+    enabled: true
+    rotation_limit: 15.0
+    scale_limit: 0.1
+    elastic_alpha: 50.0
+    elastic_sigma: 5.0
+    foreground_crop:
+      enabled: true
+      probability: 0.3
+      min_crop_frac: 0.5
+      disable_with_mix: true
+
+  # Intensity augmentation
+  intensity:
+    enabled: true
+    brightness_limit: 0.1
+    contrast_limit: 0.1
+    gamma_limit: [80, 120]
+    noise_std_range: [0.02, 0.05]
+    asymmetric: true
+    asymmetric_probability: 0.5
+
+  # Resolution degradation
+  resolution_degradation:
+    enabled: true
+    probability: 0.2
+    min_scale: 0.25
+
+  # Context-specific augmentations
+  context:
+    mask_perturbation:
+      enabled: true
+      probability: 0.3
+      max_kernel: 5
+
+  # Task-level augmentation
+  task_level:
+    enabled: true
+    probability: 0.3
+    transforms:
+      flip_horizontal: true
+      flip_vertical: true
+      rotate_90: true
+
+  # CT windowing jitter
+  windowing_jitter: 100
+
+training:
+  seed: 42
+  num_epochs: 100
+  print_every: 50
+  grad_accumulate_steps: 1
+  num_workers: 12
+  log_every: 20
+  compute_metrics_every: 20
+
+warmup_scheduler:
+  enabled: true
+  warmup_epochs: 3
+
+model:
+  patch_icl:
+    feature_extractor:
+      type: "universeg"
+      model_name: "microsoft/rad-dino"
+      target_size: 224  # ViT-B/14 native input size
+      output_grid_size: 64  # Native ViT-B/14 output (224/14=16)
+      freeze: true  # Keep frozen for cross-modality generalization
+
+    levels:
+      - resolution: 18
+        patch_size: 8
+        sampling_method: "sliding_window"
+        stride: 6
+        num_patches: 9
+        pad_before: 1
+        pad_after: 1
+      - resolution: 36
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
+      - resolution: 66
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
+
+    oracle_levels_train: [false, false]
+    oracle_levels_valid: [false, false]
+
+    aggregator:
+      type: "average"
+      combine_mode: "average"
+      min_coverage: 1e-6
+      use_confidence: true      # Modulate aggregation weights by confidence
+      confidence_mode: "multiply" # "multiply" or "replace"
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: 128
+      embed_dim: 256  # Match RAD-DINO ViT-B feature dimension
+      embed_proj_dim: 256  # Project down for efficiency
+      feature_grid_size: 64  # Match RAD-DINO output grid
+      patch_feature_grid_size: 8
+      num_heads: 8  # More heads for 768-dim features
+      num_layers: 2
+      num_context_layers: 1
+      num_registers: 4
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: true
+      use_context_mask: true  # Masks handled at backbone level
+      mask_fusion_type: "additive"
+      predict_confidence: true  # Enable confidence head (set true to use)
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      aggreg_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 0.5
+          context_aggreg: 0.5
+      level_weights: [1.0, 1.0]
+      # Confidence loss settings (requires predict_confidence: true in backbone)
+      confidence:
+        enabled: true           # Enable confidence supervision
+        supervision_weight: 0.5  # MSE(conf, 1-|pred-gt|) weight
+        boundary_weight: 0     # Penalize high confidence at patch borders
+        boundary_width: 2        # Pixels from edge to penalize
+        weighted_seg: false      # Use confidence-weighted segmentation loss
+
+    cascade:
+      detach_between_levels: true
+      confidence_blend: true    # Use confidence for multi-level blending
