@@ -5,11 +5,9 @@ Labels are sorted by total volume (largest first).
 The split is created with a fixed random seed (42) for reproducibility.
 """
 
-from cProfile import label
-import random
 from pathlib import Path
 import pandas as pd
-from requests import get
+
 
 
 # Labels by total volume (occurrences * avg_volume) from totalseg_2d.ipynb
@@ -268,7 +266,8 @@ category_map = {
 
 
 """
-totalseg_dir = Path("/work/dlclarge2/ndirt-SegFM3D/data/totalseg")
+#totalseg_dir = Path("/work/dlclarge2/ndirt-SegFM3D/data/totalseg")
+totalseg_dir = Path("/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg")
 labels_stats_df = pd.read_csv(totalseg_dir / "label_stats.csv", index_col="label_id")
 labels_stats_df.sort_values("occurrences", ascending=False)
 

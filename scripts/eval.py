@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src import in meta cluster
 from src.losses import build_loss_fn
-from src.train_utils import seed_everything, train_epoch, validate
+from src.train_utils import seed_everything, train_epoch, validate, wait_for_image_saves
 
 
 def measure_flops(model, val_loader, device, accelerator=None):
@@ -518,6 +518,8 @@ def main(cfg: DictConfig) -> None:
         print(f"\nVal complete! Avg Dice: {val_final_dice:.5f}")
 
     if cfg.logging.use_wandb and accelerator.is_main_process:
+        # Wait for background image saving threads to complete before closing wandb
+        wait_for_image_saves()
         wandb.finish()
 
 

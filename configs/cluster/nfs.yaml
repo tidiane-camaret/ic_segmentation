@@ -5,6 +5,7 @@ paths:
   root: /nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122
   DATA_DIR: ${.root}/data
   RESULTS_DIR: ${.root}/results
+  medsegbench: ${.DATA_DIR}/medsegbench
   dataset: ${.DATA_DIR}/${dataset}
   dataset2d: ${.DATA_DIR}/${dataset}2d
   dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
@@ -19,7 +20,7 @@ paths:
     patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
     patch_icl_v2: null #${..RESULTS_DIR}/checkpoints/peach-plasma-179/best_model.pt
 # Cluster-specific training settings
-train_batch_size: 600
-val_batch_size: 600
+train_batch_size: 64
+val_batch_size: 64
 training:
-  num_workers: 16
+  num_workers: 8

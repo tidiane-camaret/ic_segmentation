@@ -23,6 +23,17 @@ def _get_image_save_executor() -> ThreadPoolExecutor:
         _IMAGE_SAVE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="img_save")
     return _IMAGE_SAVE_EXECUTOR
 
+
+def wait_for_image_saves(timeout: float = 60.0) -> None:
+    """Wait for all pending image save tasks to complete.
+
+    Call this before wandb.finish() to ensure all images are logged.
+    """
+    global _IMAGE_SAVE_EXECUTOR
+    if _IMAGE_SAVE_EXECUTOR is not None:
+        _IMAGE_SAVE_EXECUTOR.shutdown(wait=True)
+        _IMAGE_SAVE_EXECUTOR = None  # Reset so new executor can be created if needed
+
 from src.models.patch_icl_v2.metrics import (
     GT_AREA_THRESHOLD,
     PRED_THRESHOLD,
@@ -183,7 +194,7 @@ def _save_sample_images(
                 pp = l_pred_probs.squeeze().numpy()
                 im = row[col_idx].imshow(pp, cmap="hot", vmin=0, vmax=1)
                 row[col_idx].set_title(f"Pred ({pp.shape[0]})")
-                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
+                fig.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
             else:
                 row[col_idx].set_title("Pred N/A")
             row[col_idx].axis("off")
@@ -194,7 +205,7 @@ def _save_sample_images(
                 conf_img = l_aggregated_conf.squeeze().numpy()
                 im = row[col_idx].imshow(conf_img, cmap="viridis", vmin=0, vmax=1)
                 row[col_idx].set_title(f"Conf ({conf_img.shape[0]})")
-                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
+                fig.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
             else:
                 row[col_idx].set_title("Conf N/A")
             row[col_idx].axis("off")
@@ -211,7 +222,7 @@ def _save_sample_images(
                 weighted = pp * conf_img
                 im = row[col_idx].imshow(weighted, cmap="hot", vmin=0, vmax=1)
                 row[col_idx].set_title("Pred×Conf")
-                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
+                fig.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
             else:
                 row[col_idx].set_title("Pred×Conf N/A")
             row[col_idx].axis("off")
@@ -243,7 +254,7 @@ def _save_sample_images(
                 rp = l_refined_probs.squeeze().numpy()
                 im = row[col_idx].imshow(rp, cmap="hot", vmin=0, vmax=1)
                 row[col_idx].set_title(f"SampW ({rp.shape[0]})")
-                plt.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
+                fig.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
             else:
                 row[col_idx].set_title("SampW N/A")
             row[col_idx].axis("off")
@@ -260,7 +271,127 @@ def _save_sample_images(
             wandb_images.append(wandb_img)
 
     if wandb_images and wandb_available and wandb.run is not None:
-        wandb.log({f"{prefix}/saved_samples": wandb_images, "epoch": epoch})
+        wandb.log({f"{prefix}/by_level": wandb_images, "epoch": epoch})
+
+
+def _save_sample_images_final(
+    label_samples: dict,
+    save_dir: Path,
+    epoch: int,
+    prefix: str = "train",
+    max_samples: int = 20,
+    max_context: int = 2,
+) -> None:
+    """Save final prediction images upsampled to input resolution.
+
+    Layout: [Ctx1, Ctx2, Target+GT, Pred Probs, Binary Pred]
+    Simple view showing final output at full resolution.
+    """
+    import matplotlib.pyplot as plt
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    epoch_dir = save_dir / f"{prefix}_epoch_{epoch:04d}_final"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    wandb_images = []
+    try:
+        import wandb
+        wandb_available = True
+    except ImportError:
+        wandb_available = False
+
+    for label_id, sample in list(label_samples.items())[:max_samples]:
+        img = sample["image"].squeeze().numpy()
+        gt = sample["label"].squeeze().numpy()
+        dice = sample["dice"]
+        ctx_in = sample.get("context_in")
+        ctx_out = sample.get("context_out")
+        pred_probs = sample.get("pred_probs")  # Already at some resolution
+
+        n_ctx = min(ctx_in.shape[0] if ctx_in is not None else 0, max_context)
+        n_cols = max_context + 3  # ctx1, ctx2, target+gt, pred_probs, binary
+
+        fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
+
+        col_idx = 0
+
+        # Context images
+        for ci in range(max_context):
+            if ci < n_ctx and ctx_in is not None:
+                ctx_img = ctx_in[ci].squeeze().numpy()
+                ctx_mask = ctx_out[ci].squeeze().numpy()
+                axes[col_idx].imshow(ctx_img, cmap="gray")
+                axes[col_idx].imshow(ctx_mask, cmap="Reds", alpha=0.4)
+                axes[col_idx].contour(ctx_mask, colors="cyan", linewidths=1)
+                axes[col_idx].set_title(f"Context {ci + 1}")
+            else:
+                axes[col_idx].set_title("Ctx N/A")
+            axes[col_idx].axis("off")
+            col_idx += 1
+
+        # Target with GT overlay
+        axes[col_idx].imshow(img, cmap="gray")
+        axes[col_idx].imshow(gt, cmap="Reds", alpha=0.4)
+        axes[col_idx].contour(gt, colors="yellow", linewidths=1)
+        axes[col_idx].set_title("Target + GT")
+        axes[col_idx].axis("off")
+        col_idx += 1
+
+        # Prediction probs upsampled to input resolution
+        if pred_probs is not None:
+            pp = pred_probs.squeeze()
+            # Upsample to input resolution if needed
+            if pp.shape[0] != img.shape[0] or pp.shape[1] != img.shape[1]:
+                pp_t = torch.from_numpy(pp.numpy() if hasattr(pp, "numpy") else pp).unsqueeze(0).unsqueeze(0).float()
+                pp_t = F.interpolate(pp_t, size=img.shape[:2], mode="bilinear", align_corners=False)
+                pp_up = pp_t.squeeze().numpy()
+            else:
+                pp_up = pp.numpy() if hasattr(pp, "numpy") else pp
+
+            # Show prediction with image underlay
+            axes[col_idx].imshow(img, cmap="gray")
+            im = axes[col_idx].imshow(pp_up, cmap="hot", alpha=0.6, vmin=0, vmax=1)
+            axes[col_idx].set_title("Pred Probs")
+            fig.colorbar(im, ax=axes[col_idx], fraction=0.046, pad=0.04)
+        else:
+            axes[col_idx].set_title("Pred N/A")
+        axes[col_idx].axis("off")
+        col_idx += 1
+
+        # Binary prediction with GT contour
+        if pred_probs is not None:
+            pp = pred_probs.squeeze()
+            if pp.shape[0] != img.shape[0] or pp.shape[1] != img.shape[1]:
+                pp_t = torch.from_numpy(pp.numpy() if hasattr(pp, "numpy") else pp).unsqueeze(0).unsqueeze(0).float()
+                pp_t = F.interpolate(pp_t, size=img.shape[:2], mode="bilinear", align_corners=False)
+                pp_up = pp_t.squeeze().numpy()
+            else:
+                pp_up = pp.numpy() if hasattr(pp, "numpy") else pp
+
+            pred_binary = (pp_up > PRED_THRESHOLD).astype(float)
+            axes[col_idx].imshow(img, cmap="gray")
+            axes[col_idx].imshow(pred_binary, cmap="Greens", alpha=0.4)
+            axes[col_idx].contour(gt, colors="yellow", linewidths=1, linestyles="--")
+            axes[col_idx].contour(pred_binary, colors="lime", linewidths=1)
+            axes[col_idx].set_title(f"Binary (dice={dice:.3f})")
+        else:
+            axes[col_idx].set_title("Binary N/A")
+        axes[col_idx].axis("off")
+
+        fig.suptitle(f"{label_id} (dice={dice:.3f})", fontsize=12, y=1.02)
+        fig.tight_layout()
+        safe_label = label_id.replace("/", "_")
+        save_path = epoch_dir / f"{safe_label}.png"
+        fig.savefig(save_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
+        if wandb_available:
+            wandb_img = wandb.Image(str(save_path), caption=f"{label_id} (dice={dice:.3f})")
+            wandb_images.append(wandb_img)
+
+    if wandb_images and wandb_available and wandb.run is not None:
+        wandb.log({f"{prefix}/final": wandb_images, "epoch": epoch})
 
 
 def _save_sample_images_async(
@@ -272,6 +403,10 @@ def _save_sample_images_async(
 ) -> None:
     """Save sample images asynchronously in background thread.
 
+    Saves two versions:
+    - by_level: detailed per-level visualization with patches
+    - final: upsampled predictions at input resolution
+
     Copies data and submits to thread pool to avoid blocking training.
     """
     # Deep copy the samples dict to avoid race conditions
@@ -280,7 +415,9 @@ def _save_sample_images_async(
     samples_copy = copy.deepcopy(label_samples)
 
     executor = _get_image_save_executor()
+    # Submit both image saving tasks
     executor.submit(_save_sample_images, samples_copy, save_dir, epoch, prefix, max_samples)
+    executor.submit(_save_sample_images_final, samples_copy, save_dir, epoch, prefix, max_samples)
 
 
 def _collect_sample_for_viz(

@@ -5,12 +5,15 @@
 
 dataset: totalseg
 max_labels: 50 
+class_balanced: true  # Uniform label sampling (each label equally likely per step)
+train_label_ids: "train"
+val_label_ids: "val"
+
+method: "patch_icl"
 feature_mode: "on_the_fly"
-feature_extractor_type: "universeg"
-layer_idx: "all"
 
 preprocessing:
-  image_size: [224, 224, 224]
+  image_size: [512, 512, 512]
 
 context_size: 3
 
@@ -89,14 +92,14 @@ training:
 
 warmup_scheduler:
   enabled: true
-  warmup_epochs: 3
+  warmup_epochs: 10
 
 model:
   patch_icl:
     feature_extractor:
       type: "universeg"
-      model_name: "microsoft/rad-dino"
-      target_size: 224  # ViT-B/14 native input size
+      layer_idx: "all"
+      target_size: 512  # ViT-B/14 native input size
       output_grid_size: 64  # Native ViT-B/14 output (224/14=16)
       freeze: true  # Keep frozen for cross-modality generalization
 
@@ -125,8 +128,8 @@ model:
         pad_before: 1
         pad_after: 1
 
-    oracle_levels_train: [false, false]
-    oracle_levels_valid: [false, false]
+    oracle_levels_train: [false, false, false]
+    oracle_levels_valid: [false, false, false]
 
     aggregator:
       type: "average"
@@ -138,12 +141,12 @@ model:
     backbone:
       compile: false
       decoder_use_skip_connections: false
-      image_size: 128
+      image_size: 256
       embed_dim: 256  # Match RAD-DINO ViT-B feature dimension
       embed_proj_dim: 256  # Project down for efficiency
       feature_grid_size: 64  # Match RAD-DINO output grid
       patch_feature_grid_size: 8
-      num_heads: 8  # More heads for 768-dim features
+      num_heads: 4  # More heads for 768-dim features
       num_layers: 2
       num_context_layers: 1
       num_registers: 4
@@ -152,7 +155,7 @@ model:
       append_zero_attn: true
       use_mask_prior: true
       use_context_mask: true  # Masks handled at backbone level
-      mask_fusion_type: "additive"
+      mask_fusion_type: "concat"
       predict_confidence: true  # Enable confidence head (set true to use)
 
     loss:

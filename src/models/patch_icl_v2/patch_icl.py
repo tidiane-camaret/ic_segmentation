@@ -803,28 +803,35 @@ class PatchICL(nn.Module):
 
                 # Blend predictions
                 if self.confidence_blend and combined_conf is not None and aggregated_conf is not None:
-                    # Use confidence for blending: high conf regions use current, low conf use previous
+                    # Use relative confidence for blending in covered regions
+                    # Higher confidence prediction gets more weight
                     conf_upsampled = F.interpolate(
                         combined_conf, size=(resolution, resolution),
                         mode='bilinear', align_corners=False
                     )
-                    # Blend using current level confidence where covered
-                    blend_weight = coverage * aggregated_conf + (1 - coverage) * conf_upsampled
+                    eps = 1e-6
+                    # Relative weight: current_conf / (current_conf + prev_conf)
+                    relative_current = aggregated_conf / (aggregated_conf + conf_upsampled + eps)
+                    # Only blend in covered regions; uncovered regions use previous
+                    blend_weight = coverage * relative_current
                     combined_pred = blend_weight * pred + (1 - blend_weight) * combined_upsampled
+
+                    # Update combined confidence: max of current and previous in covered regions
+                    combined_conf = coverage * torch.max(aggregated_conf, conf_upsampled) + (1 - coverage) * conf_upsampled
                 else:
                     # Standard coverage-based blending
                     combined_pred = coverage * pred + (1 - coverage) * combined_upsampled
 
-                # Update combined confidence
-                if aggregated_conf is not None:
-                    if combined_conf is not None:
-                        conf_upsampled = F.interpolate(
-                            combined_conf, size=(resolution, resolution),
-                            mode='bilinear', align_corners=False
-                        )
-                        combined_conf = coverage * aggregated_conf + (1 - coverage) * conf_upsampled
-                    else:
-                        combined_conf = aggregated_conf
+                    # Update combined confidence (if available)
+                    if aggregated_conf is not None:
+                        if combined_conf is not None:
+                            conf_upsampled = F.interpolate(
+                                combined_conf, size=(resolution, resolution),
+                                mode='bilinear', align_corners=False
+                            )
+                            combined_conf = coverage * aggregated_conf + (1 - coverage) * conf_upsampled
+                        else:
+                            combined_conf = aggregated_conf
             else:
                 combined_pred = pred
                 combined_conf = aggregated_conf

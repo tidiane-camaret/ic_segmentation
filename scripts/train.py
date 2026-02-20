@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.losses import build_loss_fn
-from src.train_utils import seed_everything, train_epoch, validate
+from src.train_utils import seed_everything, train_epoch, validate, wait_for_image_saves
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
@@ -586,6 +586,8 @@ def main(cfg: DictConfig) -> None:
         print(f"\nTraining complete! Best Dice: {best_dice:.5f}")
 
     if cfg.logging.use_wandb and accelerator.is_main_process:
+        # Wait for background image saving threads to complete before closing wandb
+        wait_for_image_saves()
         wandb.finish()
 
 

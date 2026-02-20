@@ -21,8 +21,6 @@ download: false
 context_size: 1
 random_coloring_nb: 0
 
-train_label_ids: "train"
-val_label_ids: "val"
 
 # MedSegBench-specific settings (used when dataset=medsegbench)
 medsegbench:
@@ -31,7 +29,6 @@ medsegbench:
 
 # Preprocessing
 preprocessing:
-  image_size: [512, 512, 512]
   spacing: [1.5, 1.5, 1.5]
   crop_to_bbox: false
   bbox_padding: 20
@@ -72,70 +69,9 @@ training:
   log_every: 10
   mixed_precision: fp16
 
-method: "patch_icl"
+method: null
 checkpoint: null  # Path to model checkpoint to load weights from
 
-# Feature extraction mode: "precomputed" or "on_the_fly"
-feature_mode: "precomputed"
-feature_extractor_type: "meddino"
-feature_extraction_resolution: 256
-meddino_layer_idx: 11
-
-# Model
-model:
-  patch_icl:
-    levels:
-      - resolution: 32
-        patch_size: 16
-        num_patches: 16
-        sampling_temperature: 0.1
-
-    oracle_levels_train: [true]
-    oracle_levels_valid: [true]
-
-    sampler:
-      type: "continuous"  # Options: "continuous", "sliding_window"
-      sliding_window_stride: null
-      augmentation:
-        enabled: false
-        rotation: "90"
-        rotation_range: 0.5
-        flip_horizontal: true
-        flip_vertical: true
-
-    aggregator:
-      type: "gaussian"  # Options: "average", "gaussian"
-      combine_mode: "coverage"
-      combine_weight: 0.5
-      fill_uncovered: "zero"
-      min_coverage: 0.000001
-      sigma_ratio: 0.125
-
-    backbone:
-      image_size: 224
-      embed_dim: 1024
-      embed_proj_dim: 128
-      feature_grid_size: 16
-      patch_feature_grid_size: 16
-      num_heads: 8
-      num_layers: 1
-      num_registers: 4
-      dropout: 0.0
-      target_self_attention: false
-
-    loss:
-      patch_loss:
-        type: "binarycrossentropy"
-        args: null
-      aggreg_loss:
-        type: "dice"
-        args: null
-      weights:
-        default:
-          target_patch: 0.5
-          target_aggreg: 0.5
-          context_patch: 0.5
-          context_aggreg: 0.5
 
 # Hydra settings
 hydra:

@@ -74,7 +74,7 @@ class UniverSegExtractor(nn.Module):
             Required when using multiple layers since they have different native sizes.
     """
 
-    INPUT_SIZE = 128  # UniverSeg expects 128x128
+    INPUT_SIZE = 256  # UniverSeg expects 128x128
     FEATURE_DIM_PER_LAYER = 64  # Each encoder block outputs 64 channels
 
     def __init__(
@@ -175,6 +175,20 @@ class UniverSegExtractor(nn.Module):
             self.model.to(device)
 
         B = images.shape[0]
+        original_dtype = images.dtype
+
+        # Force float32 for numerical stability (UniverSeg not compatible with float16)
+        images = images.float()
+
+        # Batched percentile normalization to handle outliers (prevents NaN)
+        flat = images[:, 0].reshape(B, -1)
+        lower = torch.quantile(flat, 0.005, dim=1, keepdim=True)
+        upper = torch.quantile(flat, 0.995, dim=1, keepdim=True)
+        flat = torch.clamp(flat, lower, upper)
+        img_min = flat.min(dim=1, keepdim=True)[0]
+        img_max = flat.max(dim=1, keepdim=True)[0]
+        flat = (flat - img_min) / (img_max - img_min).clamp(min=1e-8)
+        images = flat.view(B, 1, images.shape[2], images.shape[3])
 
         # Resize to 128x128
         if images.shape[-2:] != (self.INPUT_SIZE, self.INPUT_SIZE):
@@ -187,9 +201,10 @@ class UniverSegExtractor(nn.Module):
 
         if masks is not None:
             # Self-support: image is its own support, with real mask
+            masks = masks.float()
             if masks.shape[-2:] != (self.INPUT_SIZE, self.INPUT_SIZE):
                 masks = F.interpolate(
-                    masks.float(),
+                    masks,
                     size=(self.INPUT_SIZE, self.INPUT_SIZE),
                     mode="nearest",
                 )
@@ -198,9 +213,9 @@ class UniverSegExtractor(nn.Module):
         else:
             # Dummy support: zeros (image-only features)
             support_images = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
-                                         device=device)
+                                         device=device, dtype=torch.float32)
             support_labels = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
-                                         device=device)
+                                         device=device, dtype=torch.float32)
 
         # Register hooks to capture features at each requested layer
         captured = {}
@@ -234,6 +249,10 @@ class UniverSegExtractor(nn.Module):
         # [B, D, G, G] -> [B, G*G, D] = [B, N, D]
         B, D, G, _ = feat.shape
         features = feat.reshape(B, D, G * G).permute(0, 2, 1)
+
+        # Replace NaN/Inf with zeros to prevent gradient explosion
+        if torch.isnan(features).any() or torch.isinf(features).any():
+            features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
         if was_training and not self._frozen:
             self.model.train()
