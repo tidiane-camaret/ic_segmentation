@@ -9,7 +9,9 @@ paths:
   dataset: ${.DATA_DIR}/${dataset}
   dataset2d: ${.DATA_DIR}/${dataset}2d
   dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
-  dataset_stats: ${.DATA_DIR}/${dataset}/${dataset}_stats.pkl
+  #totalseg2d_every_n_slice: ${.DATA_DIR}/totalseg2d_every_n_slice
+  dataset_stats: ${.DATA_DIR}/${dataset}/stats.pkl
+  #totalseg2d_every_n_slice_stats: ${.DATA_DIR}/$totalseg2d_every_n_slice/stats.pkl
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints
     medverse: /nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt

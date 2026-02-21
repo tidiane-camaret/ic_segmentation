@@ -8,7 +8,8 @@ paths:
   dataset: ${.DATA_DIR}/${dataset}
   dataset2d: ${.DATA_DIR}/${dataset}2d
   dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
-  dataset_stats: ${.DATA_DIR}/${dataset}/${dataset}_stats.pkl
+  #dataset2d_every_n_slice: ${.DATA_DIR}/${dataset}2d_every_n_slice
+  dataset_stats: ${.DATA_DIR}/${dataset}/stats.pkl
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints
     medverse: ${..root}/checkpoints/Medverse.ckpt

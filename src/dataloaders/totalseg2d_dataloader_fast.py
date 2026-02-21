@@ -93,8 +93,12 @@ class TotalSeg2DDataset(Dataset):
         max_labels: Optional[int] = None,
         max_cases: Optional[int] = None,
         class_balanced: bool = False,
+        modality: str = "ct",  # "ct" or "mri"
+        slice_coverage_ratio: float = 0.5,  # Filter slices with coverage < ratio * max_coverage
     ):
         self.root_dir = Path(root_dir)
+        self.modality = modality.lower()
+        self.slice_coverage_ratio = slice_coverage_ratio
 
         # Resolve label_id_list
         if isinstance(label_id_list, str):
@@ -156,32 +160,57 @@ class TotalSeg2DDataset(Dataset):
             with h5py.File(h5_file_path, 'r') as h5f:
                 for label_id in h5f.keys():
                     if label_id in label_id_set:
-                        # Check if this label has non-zero coverage from stats
-                        coverage_ok = False
-                        if self.stats.get(case_id, {}).get(label_id, {}):
-                             slice_coverage = self.stats[case_id][label_id].get("slice_coverage", {})
-                             if any(slice_coverage.get(axis, 0) > 0 for axis in self.axes):
-                                coverage_ok = True
+                        label_stats = self.stats.get(case_id, {}).get(label_id, {})
+                        if not label_stats:
+                            continue
 
-                        if coverage_ok:
+                        # Support both old (slice_coverage) and new (num_slices) formats
+                        num_slices = label_stats.get("num_slices", {})
+                        slice_coverage = label_stats.get("slice_coverage", {})
+
+                        # Check if any axis has slices
+                        has_slices = False
+                        for axis in self.axes:
+                            n_slices = num_slices.get(axis, 0) if num_slices else (1 if slice_coverage.get(axis, 0) > 0 else 0)
+                            if n_slices > 0:
+                                has_slices = True
+                                break
+
+                        if has_slices:
                             self.label_to_cases.setdefault(label_id, []).append(case_id)
                             self.case_to_labels[case_id].add(label_id)
-                            for axis in self.axes:
-                                 if slice_coverage.get(axis, 0) > 0:
-                                    self.samples.append((case_id, label_id, axis))
 
-        # This is a simplified valid_contexts. Original checked coverage, which we now do above.
+                            # Get slice coverages for filtering
+                            slice_coverages = label_stats.get("slice_coverages", {})
+
+                            for axis in self.axes:
+                                n_slices = num_slices.get(axis, 0) if num_slices else (1 if slice_coverage.get(axis, 0) > 0 else 0)
+                                axis_coverages = slice_coverages.get(axis, [])
+
+                                # Filter slices by coverage ratio
+                                if axis_coverages and self.slice_coverage_ratio > 0:
+                                    max_cov = max(axis_coverages) if axis_coverages else 1
+                                    threshold = max_cov * self.slice_coverage_ratio
+                                    for slice_idx in range(n_slices):
+                                        if slice_idx < len(axis_coverages) and axis_coverages[slice_idx] >= threshold:
+                                            self.samples.append((case_id, label_id, axis, slice_idx))
+                                else:
+                                    # No coverage data or ratio=0: include all slices
+                                    for slice_idx in range(n_slices):
+                                        self.samples.append((case_id, label_id, axis, slice_idx))
+
+        # Map (label, axis) -> list of cases for context selection
         self.valid_contexts = {(label, axis): cases for label, cases in self.label_to_cases.items() for axis in self.axes}
 
         # Class-balanced sampling: group samples by label for uniform label selection
         self.class_balanced = class_balanced
-        self.label_to_samples: Dict[str, List[Tuple[str, str]]] = {}
-        for case_id, label_id, axis in self.samples:
-            self.label_to_samples.setdefault(label_id, []).append((case_id, axis))
+        self.label_to_samples: Dict[str, List[Tuple[str, str, int]]] = {}
+        for case_id, label_id, axis, slice_idx in self.samples:
+            self.label_to_samples.setdefault(label_id, []).append((case_id, axis, slice_idx))
         self.active_labels = list(self.label_to_samples.keys())
 
         print(f"Built mapping for {len(self.label_to_cases)} labels.")
-        print(f"Created {len(self.samples)} samples")
+        print(f"Created {len(self.samples)} samples (modality={self.modality}, slice_coverage_ratio={self.slice_coverage_ratio})")
         if self.class_balanced:
             label_counts = {l: len(s) for l, s in self.label_to_samples.items()}
             min_l = min(label_counts, key=label_counts.get)
@@ -392,11 +421,26 @@ class TotalSeg2DDataset(Dataset):
             self._h5_cache[case_id] = h5py.File(h5_path, 'r', swmr=True)
         return self._h5_cache[case_id]
 
-    def _load_slice(self, case_id: str, label_id: str, axis: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Load image and label slice from HDF5 file (cached handle)."""
+    def _load_slice(self, case_id: str, label_id: str, axis: str, slice_idx: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        """Load image and label slice from HDF5 file (cached handle).
+
+        Supports both old format (2D arrays with keys like '{label}/{axis}_slice_img')
+        and new format (3D arrays with keys like '{label}/{axis}_slices_img').
+        """
         h5f = self._get_h5_file(case_id)
-        img = h5f[f"{label_id}/{axis}_slice_img"][:]
-        mask = h5f[f"{label_id}/{axis}_slice"][:]
+
+        # Try new format first (3D arrays)
+        new_img_key = f"{label_id}/{axis}_slices_img"
+        new_mask_key = f"{label_id}/{axis}_slices"
+
+        if new_img_key in h5f:
+            img = h5f[new_img_key][slice_idx]
+            mask = h5f[new_mask_key][slice_idx]
+        else:
+            # Fall back to old format (2D arrays, ignore slice_idx)
+            img = h5f[f"{label_id}/{axis}_slice_img"][:]
+            mask = h5f[f"{label_id}/{axis}_slice"][:]
+
         return img, mask
 
     def _load_carve_mix_donor(
@@ -413,7 +457,13 @@ class TotalSeg2DDataset(Dataset):
         random.shuffle(candidates)
         for donor_case_id in candidates[:3]:
             try:
-                donor_img, donor_mask = self._load_slice(donor_case_id, label_id, axis)
+                # Get number of slices for this donor
+                donor_stats = self.stats.get(donor_case_id, {}).get(label_id, {})
+                num_slices = donor_stats.get("num_slices", {})
+                n_donor_slices = num_slices.get(axis, 1) if num_slices else 1
+                donor_slice_idx = random.randint(0, n_donor_slices - 1) if n_donor_slices > 1 else 0
+
+                donor_img, donor_mask = self._load_slice(donor_case_id, label_id, axis, donor_slice_idx)
                 if donor_mask.max() == 0:
                     continue
                 # Apply same preprocessing as __getitem__
@@ -677,20 +727,20 @@ class TotalSeg2DDataset(Dataset):
         if self.class_balanced:
             # Two-stage sampling: pick label uniformly, then pick a random sample
             label_id = random.choice(self.active_labels)
-            target_case_id, axis = random.choice(self.label_to_samples[label_id])
+            target_case_id, axis, slice_idx = random.choice(self.label_to_samples[label_id])
         else:
-            target_case_id, label_id, axis = self.samples[idx]
+            target_case_id, label_id, axis, slice_idx = self.samples[idx]
 
         # Use unified or legacy flow
         if getattr(self, 'use_unified_augmentation', False):
-            return self._getitem_unified(target_case_id, label_id, axis)
+            return self._getitem_unified(target_case_id, label_id, axis, slice_idx)
         else:
-            return self._getitem_legacy(target_case_id, label_id, axis)
+            return self._getitem_legacy(target_case_id, label_id, axis, slice_idx)
 
-    def _getitem_unified(self, target_case_id: str, label_id: str, axis: str) -> Dict[str, torch.Tensor]:
+    def _getitem_unified(self, target_case_id: str, label_id: str, axis: str, slice_idx: int = 0) -> Dict[str, torch.Tensor]:
         """Get item using unified augmentation pipeline."""
         # 1. Load target slice
-        img, mask = self._load_slice(target_case_id, label_id, axis)
+        img, mask = self._load_slice(target_case_id, label_id, axis, slice_idx)
 
         # 2. Bbox crop and normalization
         if self.crop_to_bbox:
@@ -717,7 +767,13 @@ class TotalSeg2DDataset(Dataset):
                 if len(context_imgs) >= self.context_size:
                     break
                 try:
-                    ctx_img, ctx_label = self._load_slice(ctx_case_id, label_id, axis)
+                    # Get number of slices for this context
+                    ctx_stats = self.stats.get(ctx_case_id, {}).get(label_id, {})
+                    num_slices = ctx_stats.get("num_slices", {})
+                    n_ctx_slices = num_slices.get(axis, 1) if num_slices else 1
+                    ctx_slice_idx = random.randint(0, n_ctx_slices - 1) if n_ctx_slices > 1 else 0
+
+                    ctx_img, ctx_label = self._load_slice(ctx_case_id, label_id, axis, ctx_slice_idx)
                     if ctx_label.max() == 0:
                         continue
 
@@ -767,10 +823,10 @@ class TotalSeg2DDataset(Dataset):
             "label_id": label_id, "axis": axis,
         }
 
-    def _getitem_legacy(self, target_case_id: str, label_id: str, axis: str) -> Dict[str, torch.Tensor]:
+    def _getitem_legacy(self, target_case_id: str, label_id: str, axis: str, slice_idx: int = 0) -> Dict[str, torch.Tensor]:
         """Get item using legacy augmentation pipeline (backwards compatible)."""
         # Load target slice
-        img, mask = self._load_slice(target_case_id, label_id, axis)
+        img, mask = self._load_slice(target_case_id, label_id, axis, slice_idx)
 
         # Bbox crop (if enabled)
         if self.crop_to_bbox:
@@ -829,7 +885,13 @@ class TotalSeg2DDataset(Dataset):
             if len(context_imgs) >= self.context_size:
                 break
             try:
-                ctx_img, ctx_label = self._load_slice(ctx_case_id, label_id, axis)
+                # Get number of slices for this context
+                ctx_stats = self.stats.get(ctx_case_id, {}).get(label_id, {})
+                num_slices = ctx_stats.get("num_slices", {})
+                n_ctx_slices = num_slices.get(axis, 1) if num_slices else 1
+                ctx_slice_idx = random.randint(0, n_ctx_slices - 1) if n_ctx_slices > 1 else 0
+
+                ctx_img, ctx_label = self._load_slice(ctx_case_id, label_id, axis, ctx_slice_idx)
                 if ctx_label.max() == 0:
                     continue
 
@@ -925,12 +987,33 @@ class TotalSeg2DDataset(Dataset):
         col_max = min(w, col_max + self.bbox_padding + 1)
         return img[row_min:row_max, col_min:col_max], label[row_min:row_max, col_min:col_max]
 
-    def _normalize_image(self, img: np.ndarray, a_min: float = -200, a_max: float = 300, jitter: float = 0) -> np.ndarray:
-        if jitter > 0:
-            a_min = a_min + random.uniform(-jitter, jitter)
-            a_max = a_max + random.uniform(-jitter, jitter)
-            if a_max - a_min < 200:
-                a_max = a_min + 200
+    def _normalize_image(self, img: np.ndarray, jitter: float = 0) -> np.ndarray:
+        """Normalize image based on modality.
+
+        CT: Clip to [-500, 1000], min-max normalize to [0, 1].
+        MRI: Clip to [0.5, 99.5] percentiles of non-zero voxels, min-max normalize to [0, 1].
+        """
+        if self.modality == "mri":
+            # MRI: percentile-based normalization on non-zero voxels
+            nonzero_mask = img > 0
+            if nonzero_mask.any():
+                nonzero_vals = img[nonzero_mask]
+                a_min = np.percentile(nonzero_vals, 0.5)
+                a_max = np.percentile(nonzero_vals, 99.5)
+            else:
+                a_min, a_max = img.min(), img.max()
+            # Ensure valid range
+            if a_max - a_min < 1e-6:
+                a_max = a_min + 1.0
+        else:
+            # CT: fixed window [-500, 1000]
+            a_min, a_max = -500.0, 1000.0
+            if jitter > 0:
+                a_min = a_min + random.uniform(-jitter, jitter)
+                a_max = a_max + random.uniform(-jitter, jitter)
+                if a_max - a_min < 200:
+                    a_max = a_min + 200
+
         img = np.clip(img, a_min, a_max)
         img = (img - a_min) / (a_max - a_min)
         return img

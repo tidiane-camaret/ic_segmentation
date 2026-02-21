@@ -108,7 +108,7 @@ def main(cfg: DictConfig) -> None:
     val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
 
     # Get dataset class and dataloader
-    if cfg.dataset in ["totalseg", "totalsegmri"]:
+    if cfg.dataset in ["totalseg", "totalsegmri", "totalseg2d_every_n_slice"]:
         from src.dataloaders.totalseg2d_dataloader_fast import (
             get_dataloader as get_totalseg2d_dataloader,
         )
@@ -137,11 +137,11 @@ def main(cfg: DictConfig) -> None:
     else:
         max_ds_len_val = max_ds_len_cfg
 
-    if cfg.dataset == "totalseg":
+    if cfg.dataset in ["totalseg", "totalsegmri", "totalseg2d_every_n_slice"]:
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.dataset2d_h5,
+            root_dir=cfg.paths.dataset,
             stats_path=cfg.paths.dataset_stats,
             label_id_list=val_labels,
             context_size=cfg.context_size,
@@ -157,26 +157,7 @@ def main(cfg: DictConfig) -> None:
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             max_labels=cfg.get("max_labels", None),
         )
-    elif cfg.dataset == "totalsegmri":
-        # Handle label_ids: keep string for split names, convert to list for explicit IDs
-        val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
-        val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.dataset2d_h5,
-            stats_path=cfg.paths.dataset_stats,
-            label_id_list=val_labels,
-            context_size=cfg.context_size,
-            batch_size=cfg.val_batch_size,
-            image_size=tuple(cfg.preprocessing.image_size[:2]),
-            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-            bbox_padding=cfg.preprocessing.bbox_padding,
-            num_workers=cfg.training.get("num_workers", 4),
-            split=val_split,
-            shuffle=False,
-            random_context=False,
-            max_ds_len=max_ds_len_val,
-            random_coloring_nb=cfg.get("random_coloring_nb", 0),
-            max_labels=cfg.get("max_labels", None),
-        )
+
     elif cfg.dataset == "medsegbench":
         msb_cfg = cfg.get("medsegbench", {})
         msb_val_datasets = msb_cfg.get("val_datasets", None)
