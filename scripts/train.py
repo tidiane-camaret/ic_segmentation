@@ -227,6 +227,7 @@ def main(cfg: DictConfig) -> None:
             max_labels=cfg.get("max_labels", None),
             max_cases=max_cases_train,
             class_balanced=cfg.get("class_balanced", False),
+            slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
         val_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.dataset,
@@ -245,6 +246,7 @@ def main(cfg: DictConfig) -> None:
             augment=False,  # No augmentation for validation
             max_labels=cfg.get("max_labels", None),
             max_cases=max_cases_val,
+            slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
 
     # Model (PatchICL v2)
@@ -575,6 +577,39 @@ def main(cfg: DictConfig) -> None:
                 for key, value in val_detailed.items():
                     if key not in skip_keys:
                         log_dict[f"val/{key}"] = value
+                # Log mask size statistics from per_case results
+                per_case = val_detailed.get("per_case", [])
+                if per_case:
+                    target_sizes = [c["target_mask_size"] for c in per_case if c.get("target_mask_size") is not None]
+                    if target_sizes:
+                        log_dict["val/target_mask_size_mean"] = sum(target_sizes) / len(target_sizes)
+                        log_dict["val/target_mask_size_min"] = min(target_sizes)
+                        log_dict["val/target_mask_size_max"] = max(target_sizes)
+                    # Context mask sizes (average across all context images per sample)
+                    ctx_sizes = []
+                    for c in per_case:
+                        if c.get("context_mask_sizes"):
+                            ctx_sizes.extend(c["context_mask_sizes"])
+                    if ctx_sizes:
+                        log_dict["val/context_mask_size_mean"] = sum(ctx_sizes) / len(ctx_sizes)
+                        log_dict["val/context_mask_size_min"] = min(ctx_sizes)
+                        log_dict["val/context_mask_size_max"] = max(ctx_sizes)
+                    # Log per-case table with mask sizes
+                    case_table = wandb.Table(columns=[
+                        "case_id", "label_id", "axis", "dice",
+                        "target_mask_size", "context_mask_sizes"
+                    ])
+                    for c in per_case:
+                        ctx_sizes_str = ",".join(map(str, c.get("context_mask_sizes") or []))
+                        case_table.add_data(
+                            c.get("case_id", ""),
+                            c.get("label_id", ""),
+                            c.get("axis", ""),
+                            c.get("dice", 0),
+                            c.get("target_mask_size", 0),
+                            ctx_sizes_str,
+                        )
+                    log_dict["val/per_case"] = case_table
             wandb.log(log_dict)
 
         # Save best — sync all ranks before checkpoint to avoid collective mismatch

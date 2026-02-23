@@ -957,12 +957,22 @@ def validate(
             label_id = batch_label_ids[i] if batch_label_ids else "unknown"
             axis = batch_axes[i] if batch_axes else None
             dice_val = per_sample_dice[i].item()
+
+            # Compute mask sizes (number of positive pixels)
+            target_mask_size = (labels[i] > 0.5).sum().item()
+            context_mask_sizes = None
+            if context_out is not None:
+                context_mask_sizes = [(context_out[i, c] > 0.5).sum().item()
+                                      for c in range(context_out.shape[1])]
+
             case_results.append(
                 {
                     "case_id": case_id,
                     "label_id": label_id,
                     "axis": axis,
                     "dice": dice_val,
+                    "target_mask_size": target_mask_size,
+                    "context_mask_sizes": context_mask_sizes,
                 }
             )
             if label_id not in label_dice_scores:

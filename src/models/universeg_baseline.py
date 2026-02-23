@@ -24,12 +24,12 @@ class UniverSegBaseline(nn.Module):
     And outputs: (B, 1, H, W) predictions
     """
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, input_size: int = 128):
         super().__init__()
         sys.path.append("/work/dlclarge2/ndirt-SegFM3D/repos/UniVerseg")  # Add path to import universeg
         from universeg import universeg
         self.model = universeg(pretrained=pretrained)
-        self.input_size = 128  # UniverSeg expects 128x128 inputs
+        self.input_size = input_size  # Configurable eval resolution (trained on 128)
         
         # Placeholder loss function (can be set via set_loss_functions)
         self.aggreg_criterion = None

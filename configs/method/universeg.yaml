@@ -1,0 +1,12 @@
+# @package _global_
+# UniverSeg baseline method configuration
+
+method: "universeg"
+
+model:
+  universeg:
+    pretrained: true
+    input_size: 128  # UniverSeg native resolution
+
+preprocessing:
+    image_size: ["${model.universeg.input_size}", "${model.universeg.input_size}", "${model.universeg.input_size}"]

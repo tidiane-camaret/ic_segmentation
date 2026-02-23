@@ -1,0 +1,99 @@
+# @package _global_
+# PatchICL method configuration
+
+method: "patch_icl"
+feature_mode: "on_the_fly"
+
+model:
+  patch_icl:
+    feature_extractor:
+      type: "universeg"
+      layer_idx: "all"
+      target_size: 512
+      output_grid_size: 64
+      freeze: true
+
+    levels:
+      - resolution: 18
+        patch_size: 8
+        sampling_method: "sliding_window"
+        stride: 6
+        num_patches: 9
+        pad_before: 1
+        pad_after: 1
+      - resolution: 36
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
+      - resolution: 66
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
+
+    oracle_levels_train: [false, false, false]
+    oracle_levels_valid: [false, false, false]
+
+    aggregator:
+      type: "average"
+      combine_mode: "average"
+      min_coverage: 1e-6
+      use_confidence: true
+      confidence_mode: "multiply"
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: 256
+      embed_dim: 256
+      embed_proj_dim: 256
+      feature_grid_size: 64
+      patch_feature_grid_size: 8
+      num_heads: 4
+      num_layers: 2
+      num_context_layers: 1
+      num_registers: 4
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: true
+      use_context_mask: true
+      mask_fusion_type: "concat"
+      predict_confidence: false
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      aggreg_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 0.5
+          context_aggreg: 0.5
+      level_weights: [1.0, 1.0]
+      confidence:
+        method: "entropy"
+        enabled: true
+        supervision_weight: 0
+        boundary_weight: 0
+        boundary_width: 2
+        weighted_seg: false
+
+    cascade:
+      detach_between_levels: true
+      confidence_blend: true

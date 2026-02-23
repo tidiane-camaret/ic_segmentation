@@ -1,0 +1,7 @@
+# Evaluation config - inherits from base config
+defaults:
+  - config
+  - _self_
+
+class_balanced: false
+context_size: 10

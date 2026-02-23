@@ -1,0 +1,9 @@
+# @package _global_
+# Inherits from method/patch_icl.yaml for model config.
+# Entropy-based confidence: conf = 1 - H(p)/log(2)
+
+defaults:
+  - /method: patch_icl
+  - /augmentation
+
+

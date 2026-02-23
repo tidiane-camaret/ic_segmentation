@@ -75,7 +75,7 @@ def measure_flops(model, val_loader, device, accelerator=None):
     }
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="train")
+@hydra.main(version_base=None, config_path="../configs", config_name="eval")
 def main(cfg: DictConfig) -> None:
     """Main training function."""
     # Print config
@@ -156,6 +156,7 @@ def main(cfg: DictConfig) -> None:
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             max_labels=cfg.get("max_labels", None),
+            slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
 
     elif cfg.dataset == "medsegbench":
@@ -325,14 +326,18 @@ def main(cfg: DictConfig) -> None:
     elif cfg.method == "universeg":
         from src.models.universeg_baseline import UniverSegBaseline
 
-        model = UniverSegBaseline(pretrained=True)
-        
+        universeg_cfg = cfg.model.get("universeg", {})
+        model = UniverSegBaseline(
+            pretrained=universeg_cfg.get("pretrained", True),
+            input_size=universeg_cfg.get("input_size", 128),
+        )
+
         # Set loss functions for evaluation
         aggreg_criterion = build_loss_fn("dice", None)
         patch_criterion = build_loss_fn("dice", None)
         model.set_loss_functions(patch_criterion, aggreg_criterion)
         if accelerator.is_main_process:
-            print("Using UniverSeg baseline model")
+            print(f"Using UniverSeg baseline model (input_size={model.input_size})")
     else:
         raise ValueError(f"Unknown method: {cfg.method}")
     
