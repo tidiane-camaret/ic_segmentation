@@ -1,11 +1,15 @@
 # @package _global_
-# RAD-DINO pretrained encoder for multi-modality medical image segmentation
-# Uses Microsoft's radiology-specific DINOv2 trained on RadImageNet (CT, MRI, US, X-ray)
-# Masks are handled at backbone level (use_context_mask), not in feature extractor
+# Generalization improvements ablation experiment.
+# Builds on 88_entropy with:
+# - Sampling dropout (randomly use uniform sampling during training)
+# - Temperature annealing (start uniform, sharpen over epochs)
+# - Progressive level weights (emphasize finer levels)
+# - Confidence temperature calibration
+# - Feature-based context diversity selection
 
 dataset: totalseg2d
-max_labels: 50 
-class_balanced: true  # Uniform label sampling (each label equally likely per step)
+max_labels: 50
+class_balanced: true
 train_label_ids: "train"
 val_label_ids: "val"
 
@@ -17,11 +21,17 @@ preprocessing:
 
 context_size: 3
 
+# Context diversity selection (farthest-point sampling)
+# Requires pre-computed mean_features in stats.pkl
+context_diversity:
+  type: "farthest"  # "random" or "farthest"
+  num_candidates: 10  # Pool size for selection
+  feature_key: "mean_features"
+
 # Unified augmentation config
 augmentation:
   enabled: true
 
-  # Mix augmentation: CutMix (simple) or CarveMix (foreground-aware)
   mix:
     type: "cutmix"
     probability: 0.5
@@ -33,7 +43,6 @@ augmentation:
       harmonize: true
       harmonize_sigma: 5.0
 
-  # Spatial augmentation (rotation, scale, elastic)
   spatial:
     enabled: true
     rotation_limit: 15.0
@@ -46,7 +55,6 @@ augmentation:
       min_crop_frac: 0.5
       disable_with_mix: true
 
-  # Intensity augmentation
   intensity:
     enabled: true
     brightness_limit: 0.1
@@ -56,20 +64,17 @@ augmentation:
     asymmetric: true
     asymmetric_probability: 0.5
 
-  # Resolution degradation
   resolution_degradation:
     enabled: true
     probability: 0.2
     min_scale: 0.25
 
-  # Context-specific augmentations
   context:
     mask_perturbation:
       enabled: true
       probability: 0.3
       max_kernel: 5
 
-  # Task-level augmentation
   task_level:
     enabled: true
     probability: 0.3
@@ -78,7 +83,6 @@ augmentation:
       flip_vertical: true
       rotate_90: true
 
-  # CT windowing jitter
   windowing_jitter: 100
 
 training:
@@ -99,9 +103,9 @@ model:
     feature_extractor:
       type: "universeg"
       layer_idx: "all"
-      target_size: 512  # ViT-B/14 native input size
-      output_grid_size: 64  # Native ViT-B/14 output (224/14=16)
-      freeze: true  # Keep frozen for cross-modality generalization
+      target_size: 512
+      output_grid_size: 64
+      freeze: true
 
     levels:
       - resolution: 18
@@ -131,22 +135,29 @@ model:
     oracle_levels_train: [false, false, false]
     oracle_levels_valid: [false, false, false]
 
+    # Sampling robustness: reduces train/val gap
+    sampling_robustness:
+      dropout: 0.2           # 20% chance of using uniform sampling
+      temperature_start: 2.0  # Start more uniform
+      temperature_end: 1.0    # Anneal to normal sharpness
+      temperature_epochs: 50  # Anneal over first 50 epochs
+
     aggregator:
       type: "average"
       combine_mode: "average"
       min_coverage: 1e-6
-      use_confidence: true      # Modulate aggregation weights by confidence
-      confidence_mode: "multiply" # "multiply" or "replace"
+      use_confidence: true
+      confidence_mode: "multiply"
 
     backbone:
       compile: false
       decoder_use_skip_connections: false
       image_size: 256
-      embed_dim: 256  # Match RAD-DINO ViT-B feature dimension
-      embed_proj_dim: 256  # Project down for efficiency
-      feature_grid_size: 64  # Match RAD-DINO output grid
+      embed_dim: 256
+      embed_proj_dim: 256
+      feature_grid_size: 64
       patch_feature_grid_size: 8
-      num_heads: 4  # More heads for 768-dim features
+      num_heads: 4
       num_layers: 2
       num_context_layers: 1
       num_registers: 4
@@ -154,9 +165,9 @@ model:
       dropout: 0.1
       append_zero_attn: true
       use_mask_prior: true
-      use_context_mask: true  # Masks handled at backbone level
+      use_context_mask: true  # Set false to ablate dual mask pathway
       mask_fusion_type: "concat"
-      predict_confidence: true  # Enable confidence head (set true to use)
+      predict_confidence: false
 
     loss:
       patch_loss:
@@ -175,15 +186,17 @@ model:
           target_aggreg: 1.0
           context_patch: 0.5
           context_aggreg: 0.5
-      level_weights: [1.0, 1.0]
-      # Confidence loss settings (requires predict_confidence: true in backbone)
+      # Progressive level weights: emphasize finer levels
+      level_weights: "progressive"  # or [0.3, 0.65, 1.0]
       confidence:
-        enabled: true           # Enable confidence supervision
-        supervision_weight: 0.5  # MSE(conf, 1-|pred-gt|) weight
-        boundary_weight: 0     # Penalize high confidence at patch borders
-        boundary_width: 2        # Pixels from edge to penalize
-        weighted_seg: false      # Use confidence-weighted segmentation loss
+        method: "entropy"
+        enabled: true
+        temperature: 1.5     # Slightly soften overconfident predictions
+        supervision_weight: 0
+        boundary_weight: 0
+        boundary_width: 2
+        weighted_seg: false
 
     cascade:
       detach_between_levels: true
-      confidence_blend: true    # Use confidence for multi-level blending
+      confidence_blend: true

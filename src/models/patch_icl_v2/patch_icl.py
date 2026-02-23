@@ -165,19 +165,30 @@ def extract_patch_features(
     return patch_features
 
 
-def compute_entropy_confidence(logits: torch.Tensor) -> torch.Tensor:
-    """Compute confidence from binary prediction entropy (no learned params).
+def compute_entropy_confidence(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Compute confidence from binary prediction entropy.
 
     Confidence = 1 - H(p)/log(2), where H(p) = -(p*log(p) + (1-p)*log(1-p)).
     Fully differentiable. Returns 1 near p=0 or p=1, 0 at p=0.5.
 
+    Temperature scaling improves calibration:
+    - T > 1.0: softens logits -> lower confidence (good for overconfident models)
+    - T < 1.0: sharpens logits -> higher confidence
+    - T = 1.0: no scaling (default)
+
     Args:
         logits: [B, K, C, H, W] - raw prediction logits
+        temperature: temperature for logit scaling (default 1.0)
 
     Returns:
         confidence: [B, K, 1, H, W] - confidence in [0, 1]
     """
-    p = torch.sigmoid(logits)
+    # Apply temperature scaling before sigmoid
+    scaled_logits = logits / temperature if temperature != 1.0 else logits
+    p = torch.sigmoid(scaled_logits)
     p = p.clamp(1e-6, 1 - 1e-6)
     entropy = -(p * p.log() + (1 - p) * (1 - p).log())
     # Normalize by max entropy (log(2)) so output is in [0, 1]
@@ -228,6 +239,14 @@ class PatchICL(nn.Module):
         # Cascade config
         cascade_cfg = config.get('cascade', {})
         self.detach_between_levels = cascade_cfg.get('detach_between_levels', True)
+
+        # Sampling robustness config (improves train/val generalization gap)
+        sampling_robustness_cfg = config.get('sampling_robustness', {})
+        self.sampling_dropout = sampling_robustness_cfg.get('dropout', 0.0)  # Probability of using uniform sampling
+        self.sampling_temp_start = sampling_robustness_cfg.get('temperature_start', 1.0)  # Start temperature
+        self.sampling_temp_end = sampling_robustness_cfg.get('temperature_end', 1.0)  # End temperature
+        self.sampling_temp_epochs = sampling_robustness_cfg.get('temperature_epochs', 100)  # Epochs for annealing
+        self._current_epoch = 0  # Updated by train loop
 
         # Sampler config (type shared, per-level instances)
         sampler_cfg = config.get('sampler', {})
@@ -290,7 +309,24 @@ class PatchICL(nn.Module):
             'context_patch': weights_cfg.get('context_patch', 1.0),
             'context_aggreg': weights_cfg.get('context_aggreg', 1.0),
         }
-        self.level_loss_weights = list(loss_cfg.get('level_weights', [1.0] * self.num_levels))
+        # Per-level loss weights. Options:
+        # - "uniform": all 1.0 (default for backward compatibility)
+        # - "progressive": [0.3, 0.7, 1.0] - finer levels weighted more
+        # - list of floats: explicit weights
+        level_weights_cfg = loss_cfg.get('level_weights', 'uniform')
+        if level_weights_cfg == 'uniform':
+            self.level_loss_weights = [1.0] * self.num_levels
+        elif level_weights_cfg == 'progressive':
+            # Linear progression from 0.3 to 1.0
+            if self.num_levels == 1:
+                self.level_loss_weights = [1.0]
+            else:
+                self.level_loss_weights = [
+                    0.3 + 0.7 * i / (self.num_levels - 1)
+                    for i in range(self.num_levels)
+                ]
+        else:
+            self.level_loss_weights = list(level_weights_cfg)
         while len(self.level_loss_weights) < self.num_levels:
             self.level_loss_weights.append(1.0)
 
@@ -299,6 +335,10 @@ class PatchICL(nn.Module):
         self.confidence_method = conf_cfg.get('method', 'learned')
         assert self.confidence_method in ('learned', 'entropy'), \
             f"confidence.method must be 'learned' or 'entropy', got '{self.confidence_method}'"
+
+        # Temperature scaling for entropy confidence (calibration)
+        # T > 1.0 softens overconfident predictions, T < 1.0 sharpens
+        self.confidence_temperature = conf_cfg.get('temperature', 1.0)
 
         # Confidence loss config
         self.confidence_enabled = conf_cfg.get('enabled', False)
@@ -361,6 +401,63 @@ class PatchICL(nn.Module):
     def set_feature_extractor(self, feature_extractor: nn.Module):
         """Set or update the feature extractor."""
         self.feature_extractor = feature_extractor
+
+    def set_epoch(self, epoch: int):
+        """Set current epoch for temperature annealing."""
+        self._current_epoch = epoch
+
+    def _get_sampling_temperature(self) -> float:
+        """Compute current sampling temperature based on epoch-based annealing."""
+        if self.sampling_temp_epochs <= 0:
+            return self.sampling_temp_end
+        progress = min(1.0, self._current_epoch / self.sampling_temp_epochs)
+        # Linear interpolation from start to end
+        return self.sampling_temp_start + progress * (self.sampling_temp_end - self.sampling_temp_start)
+
+    def _apply_sampling_robustness(
+        self,
+        sampling_weights: torch.Tensor,
+        training: bool,
+    ) -> torch.Tensor:
+        """Apply sampling dropout and temperature scaling for robustness.
+
+        During training:
+        - With probability `sampling_dropout`, replace weights with uniform
+        - Apply temperature scaling: weights^(1/T) where T is annealed
+
+        Args:
+            sampling_weights: [B, 1, H, W] - raw sampling weights
+            training: whether in training mode
+
+        Returns:
+            Adjusted sampling weights
+        """
+        if not training:
+            return sampling_weights
+
+        B = sampling_weights.shape[0]
+        device = sampling_weights.device
+
+        # Sampling dropout: replace some samples with uniform weights
+        if self.sampling_dropout > 0:
+            dropout_mask = torch.rand(B, 1, 1, 1, device=device) < self.sampling_dropout
+            uniform_weights = torch.ones_like(sampling_weights)
+            sampling_weights = torch.where(dropout_mask, uniform_weights, sampling_weights)
+
+        # Temperature scaling (annealed)
+        temp = self._get_sampling_temperature()
+        if temp != 1.0 and temp > 0:
+            # Normalize to [0, 1] range, apply temp, renormalize
+            w_min = sampling_weights.amin(dim=(2, 3), keepdim=True)
+            w_max = sampling_weights.amax(dim=(2, 3), keepdim=True)
+            w_range = (w_max - w_min).clamp(min=1e-6)
+            w_normalized = (sampling_weights - w_min) / w_range
+            # Higher temp -> more uniform; lower temp -> sharper
+            w_tempered = w_normalized.pow(1.0 / temp)
+            # Renormalize back to original scale (optional, samplers handle unnormalized)
+            sampling_weights = w_tempered
+
+        return sampling_weights
 
     def _downsample(self, x: torch.Tensor, resolution: int) -> torch.Tensor:
         """Downsample tensor to given resolution."""
@@ -665,9 +762,13 @@ class PatchICL(nn.Module):
             patch_confidence = None
             context_patch_confidence = None
             if self.confidence_method == 'entropy':
-                # Compute confidence from prediction entropy (zero-parameter)
-                patch_confidence = compute_entropy_confidence(patch_logits)
-                context_patch_confidence = compute_entropy_confidence(context_patch_logits)
+                # Compute confidence from prediction entropy with temperature calibration
+                patch_confidence = compute_entropy_confidence(
+                    patch_logits, temperature=self.confidence_temperature
+                )
+                context_patch_confidence = compute_entropy_confidence(
+                    context_patch_logits, temperature=self.confidence_temperature
+                )
             elif all_confidence is not None:
                 patch_confidence = all_confidence[:, :K]
                 context_patch_confidence = all_confidence[:, K:]
@@ -700,7 +801,9 @@ class PatchICL(nn.Module):
             )
             patch_logits = backbone_out['mask_patch_logit_preds']
             if self.confidence_method == 'entropy':
-                patch_confidence = compute_entropy_confidence(patch_logits)
+                patch_confidence = compute_entropy_confidence(
+                    patch_logits, temperature=self.confidence_temperature
+                )
             else:
                 patch_confidence = backbone_out.get('confidence_preds')
 
@@ -808,6 +911,9 @@ class PatchICL(nn.Module):
             else:
                 sampling_weights = torch.ones(B, 1, resolution, resolution, device=device)
                 refined_probs = None
+
+            # Apply sampling robustness (dropout + temperature annealing)
+            sampling_weights = self._apply_sampling_robustness(sampling_weights, training)
 
             # Pass previous prediction as mask prior (level 0 has None)
             mask_prior = None

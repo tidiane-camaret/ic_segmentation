@@ -95,10 +95,18 @@ class TotalSeg2DDataset(Dataset):
         class_balanced: bool = False,
         modality: str = "ct",  # "ct" or "mri"
         slice_coverage_ratio: float = 0.5,  # Filter slices with coverage < ratio * max_coverage
+        # Context diversity selection
+        context_diversity: Optional[Dict] = None,  # {type: "farthest", num_candidates: 10}
     ):
         self.root_dir = Path(root_dir)
         self.modality = modality.lower()
         self.slice_coverage_ratio = slice_coverage_ratio
+
+        # Context diversity config
+        div_cfg = context_diversity or {}
+        self.context_diversity_type = div_cfg.get('type', 'random')  # 'random', 'farthest'
+        self.context_diversity_candidates = div_cfg.get('num_candidates', 10)  # Sample pool size
+        self.context_feature_key = div_cfg.get('feature_key', 'mean_features')  # Key in stats
 
         # Resolve label_id_list
         if isinstance(label_id_list, str):
@@ -772,7 +780,13 @@ class TotalSeg2DDataset(Dataset):
         if self.context_size > 0:
             context_key = (label_id, axis)
             available_contexts = [c for c in self.valid_contexts.get(context_key, []) if c != target_case_id]
-            if self.random_context:
+
+            # Apply diversity selection or random shuffle
+            if self.context_diversity_type == 'farthest':
+                available_contexts = self._select_diverse_contexts(
+                    available_contexts, target_case_id, label_id, self.context_size
+                )
+            elif self.random_context:
                 random.shuffle(available_contexts)
 
             for ctx_case_id in available_contexts:
@@ -888,7 +902,13 @@ class TotalSeg2DDataset(Dataset):
         context_imgs, context_labels, valid_context_ids = [], [], []
         context_key = (label_id, axis)
         available_contexts = [c for c in self.valid_contexts.get(context_key, []) if c != target_case_id]
-        if self.random_context:
+
+        # Apply diversity selection or random shuffle
+        if self.context_diversity_type == 'farthest':
+            available_contexts = self._select_diverse_contexts(
+                available_contexts, target_case_id, label_id, self.context_size
+            )
+        elif self.random_context:
             random.shuffle(available_contexts)
 
         jitter = self.adv_windowing_jitter if getattr(self, 'advanced_augmentation', False) else 0
@@ -982,6 +1002,74 @@ class TotalSeg2DDataset(Dataset):
     # --- Other helper methods (_get_2d_bbox, _crop_to_bbox, _normalize_image, _resize, _apply_augmentation, etc.) ---
     # These methods are mostly unchanged as they operate on numpy arrays.
     # I will include them for completeness.
+
+    def _select_diverse_contexts(
+        self,
+        available_contexts: List[str],
+        target_case_id: str,
+        label_id: str,
+        n_contexts: int,
+    ) -> List[str]:
+        """Select diverse contexts using farthest-point sampling.
+
+        Requires pre-computed mean features in stats file under `mean_features` key.
+        Falls back to random selection if features unavailable.
+
+        Args:
+            available_contexts: List of candidate case IDs
+            target_case_id: Current target case ID
+            label_id: Label being segmented
+            n_contexts: Number of contexts to select
+
+        Returns:
+            List of selected case IDs
+        """
+        if self.context_diversity_type == 'random' or len(available_contexts) <= n_contexts:
+            # Random: shuffle and take first n
+            random.shuffle(available_contexts)
+            return available_contexts[:n_contexts]
+
+        # Get features for candidates
+        candidates = available_contexts[:self.context_diversity_candidates]
+        features = []
+        valid_candidates = []
+
+        for case_id in candidates:
+            case_stats = self.stats.get(case_id, {}).get(label_id, {})
+            feat = case_stats.get(self.context_feature_key)
+            if feat is not None:
+                features.append(np.array(feat))
+                valid_candidates.append(case_id)
+
+        # Fall back to random if no features available
+        if len(features) < n_contexts:
+            random.shuffle(available_contexts)
+            return available_contexts[:n_contexts]
+
+        features = np.stack(features)  # [N, D]
+
+        # Farthest-point sampling
+        selected_indices = []
+        distances = np.full(len(features), np.inf)
+
+        # Start with random seed point
+        first_idx = random.randint(0, len(features) - 1)
+        selected_indices.append(first_idx)
+
+        for _ in range(n_contexts - 1):
+            if len(selected_indices) >= len(features):
+                break
+            # Update distances to nearest selected point
+            last_feat = features[selected_indices[-1]]
+            dists_to_last = np.linalg.norm(features - last_feat, axis=1)
+            distances = np.minimum(distances, dists_to_last)
+            distances[selected_indices] = -np.inf  # Already selected
+
+            # Select point farthest from all selected points
+            next_idx = np.argmax(distances)
+            selected_indices.append(next_idx)
+
+        return [valid_candidates[i] for i in selected_indices]
 
     def _get_2d_bbox(self, case_id: str, label_id: str, axis: str) -> Tuple[int, int, int, int]:
         bbox_3d = self.stats[case_id][label_id]["bbox"]

@@ -1,0 +1,18 @@
+# @package _global_
+# Ablation A4: Confidence temperature calibration only
+# Tests whether softening overconfident entropy predictions helps
+
+defaults:
+  - 88_entropy
+
+model:
+  patch_icl:
+    loss:
+      confidence:
+        method: "entropy"
+        enabled: true
+        temperature: 2.0     # Soften overconfident predictions
+        supervision_weight: 0
+        boundary_weight: 0
+        boundary_width: 2
+        weighted_seg: false

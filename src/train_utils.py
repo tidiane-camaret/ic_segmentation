@@ -513,6 +513,10 @@ def train_epoch(
         accelerator.unwrap_model(model) if accelerator is not None else model
     )
 
+    # Set epoch for temperature annealing in sampling robustness
+    if hasattr(unwrapped_model, 'set_epoch'):
+        unwrapped_model.set_epoch(epoch)
+
     if use_wandb and is_main:
         try:
             import wandb

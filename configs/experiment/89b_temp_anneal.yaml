@@ -1,0 +1,15 @@
+# @package _global_
+# Ablation A2: Temperature annealing only
+# Tests whether gradual sharpening of sampling helps generalization
+
+defaults:
+  - 88_entropy
+
+model:
+  patch_icl:
+    # Only enable temperature annealing
+    sampling_robustness:
+      dropout: 0.0           # No dropout
+      temperature_start: 3.0  # Start very uniform
+      temperature_end: 0.5    # End sharper than normal
+      temperature_epochs: 50  # Anneal over 50 epochs

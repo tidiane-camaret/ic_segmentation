@@ -7,7 +7,7 @@ paths:
   RESULTS_DIR: ${.root}/results
   medsegbench: ${.DATA_DIR}/medsegbench
   dataset: ${.DATA_DIR}/${dataset}
-  dataset2d: ${.DATA_DIR}/${dataset}2d
+  #dataset2d: ${.DATA_DIR}/${dataset}2d
   dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
   #totalseg2d_every_n_slice: ${.DATA_DIR}/totalseg2d_every_n_slice
   dataset_stats: ${.DATA_DIR}/${dataset}/stats.pkl
@@ -25,4 +25,4 @@ paths:
 train_batch_size: 64
 val_batch_size: 64
 training:
-  num_workers: 8
+  num_workers: 14

@@ -1,0 +1,11 @@
+# @package _global_
+# Ablation A6: Disable dual mask pathway
+# Tests whether redundant mask conditioning hurts (UniverSeg already has mask in cross-conv)
+
+defaults:
+  - 88_entropy
+
+model:
+  patch_icl:
+    backbone:
+      use_context_mask: false  # Disable backbone mask fusion (UniverSeg has it)

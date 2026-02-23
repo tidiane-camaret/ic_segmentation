@@ -1,0 +1,12 @@
+# @package _global_
+# Ablation A5: Progressive level weights only
+# Tests whether emphasizing finer levels improves final prediction quality
+
+defaults:
+  - 88_entropy
+
+model:
+  patch_icl:
+    loss:
+      # Progressive level weights: [0.3, 0.65, 1.0]
+      level_weights: "progressive"

@@ -389,15 +389,19 @@ def main(cfg: DictConfig) -> None:
 
     # Optionally load model weights from checkpoint
     ckpt_path = cfg.get("checkpoint", None)
+    reset_optimizer = cfg.get("reset_optimizer", False)  # Skip optimizer/scheduler state
     start_epoch = 0
     if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        start_epoch = checkpoint.get("epoch", 0) + 1
+        if not reset_optimizer:
+            start_epoch = checkpoint.get("epoch", 0) + 1
         if accelerator.is_main_process:
             print(
                 f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})"
             )
+            if reset_optimizer:
+                print("reset_optimizer=true: Starting fresh optimizer/scheduler (epoch 0)")
     else:
         if accelerator.is_main_process:
             print("No checkpoint loaded, training from scratch")
@@ -415,12 +419,17 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Load optimizer state from checkpoint (after optimizer is created)
-    if ckpt_path:
+    if ckpt_path and not reset_optimizer:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         if "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if accelerator.is_main_process:
-                print("Loaded optimizer state from checkpoint")
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if accelerator.is_main_process:
+                    print("Loaded optimizer state from checkpoint")
+            except ValueError as e:
+                if accelerator.is_main_process:
+                    print(f"Warning: Could not load optimizer state (architecture mismatch?): {e}")
+                    print("Starting with fresh optimizer state")
 
     # Scheduler
     warmup_cfg = cfg.get("warmup_scheduler", {})
@@ -462,12 +471,17 @@ def main(cfg: DictConfig) -> None:
 
 
     # Load scheduler state after preparing for distributed training
-    if ckpt_path:
+    if ckpt_path and not reset_optimizer:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         if "scheduler_state_dict" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            if accelerator.is_main_process:
-                print(f"Loaded scheduler state from checkpoint")
+            try:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                if accelerator.is_main_process:
+                    print(f"Loaded scheduler state from checkpoint")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"Warning: Could not load scheduler state: {e}")
+                    print("Starting with fresh scheduler state")
 
     # Training loop
     best_dice = 0.0

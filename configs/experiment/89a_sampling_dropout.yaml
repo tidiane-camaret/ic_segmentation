@@ -1,0 +1,15 @@
+# @package _global_
+# Ablation A1: Sampling dropout only
+# Tests whether random dropout of confidence sampling improves generalization
+
+defaults:
+  - 88_entropy
+
+model:
+  patch_icl:
+    # Only enable sampling dropout
+    sampling_robustness:
+      dropout: 0.3           # 30% uniform sampling dropout
+      temperature_start: 1.0  # No temperature annealing
+      temperature_end: 1.0
+      temperature_epochs: 100

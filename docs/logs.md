@@ -4,6 +4,95 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-02-23: Generalization Improvements
+
+**Goal:** Address train/val gap and improve generalization for in-context segmentation.
+
+### Problem Analysis
+
+Identified key issues affecting generalization:
+1. **Train/val sampling gap**: Model learns to rely on specific sampling distributions that differ at validation
+2. **Context selection**: Random context selection ignores feature diversity
+3. **Confidence calibration**: Entropy-based confidence can be overconfident
+4. **Level weighting**: Uniform level weights may undertrain finer levels
+
+### Implemented Improvements
+
+#### A1 & A2: Sampling Robustness (`src/models/patch_icl_v2/patch_icl.py`)
+
+Added sampling dropout and temperature annealing to reduce dependence on specific sampling patterns:
+
+```yaml
+sampling_robustness:
+  dropout: 0.2           # 20% chance of uniform sampling
+  temperature_start: 2.0  # Start more uniform
+  temperature_end: 1.0    # Anneal to normal
+  temperature_epochs: 50  # Anneal over 50 epochs
+```
+
+- **Dropout**: Randomly replaces confidence/oracle weights with uniform sampling during training
+- **Temperature annealing**: `weights^(1/T)` where T anneals from high (uniform) to low (sharp)
+
+#### A3: Feature-Based Context Diversity (`src/dataloaders/totalseg2d_dataloader_fast.py`)
+
+Implemented farthest-point sampling for context selection:
+
+```yaml
+context_diversity:
+  type: "farthest"       # or "random"
+  num_candidates: 10     # Pool size for selection
+  feature_key: "mean_features"  # Key in stats.pkl
+```
+
+Requires pre-computed mean features per case/label in stats file.
+
+#### A4: Confidence Temperature Calibration (`src/models/patch_icl_v2/patch_icl.py`)
+
+Added temperature scaling for entropy-based confidence to calibrate overconfident predictions:
+
+```yaml
+confidence:
+  method: "entropy"
+  temperature: 1.5  # T > 1 softens, T < 1 sharpens
+```
+
+Formula: `conf = 1 - H(sigmoid(logits/T))` where T is the temperature.
+
+#### A5: Progressive Level Weights
+
+Added `"progressive"` option for level weights that linearly increases from 0.3 to 1.0:
+
+```yaml
+loss:
+  level_weights: "progressive"  # or [0.3, 0.65, 1.0]
+```
+
+#### A6: Dual Mask Pathway Ablation
+
+The existing `use_context_mask: false` option can ablate the backbone mask fusion when UniverSeg already provides mask-conditioned features.
+
+### Experiment Configs
+
+| Config | Description |
+|--------|-------------|
+| `89_generalization.yaml` | Combined best settings |
+| `89a_sampling_dropout.yaml` | A1: Sampling dropout only |
+| `89b_temp_anneal.yaml` | A2: Temperature annealing only |
+| `89c_progressive_weights.yaml` | A5: Progressive level weights |
+| `89d_conf_temp.yaml` | A4: Confidence temperature |
+| `89e_no_dual_mask.yaml` | A6: Disable dual mask pathway |
+
+### Files Changed
+
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl_v2/patch_icl.py` | Added `sampling_robustness` config, `set_epoch()`, `_apply_sampling_robustness()`, temperature param to `compute_entropy_confidence()`, progressive level weights |
+| `src/dataloaders/totalseg2d_dataloader_fast.py` | Added `context_diversity` config, `_select_diverse_contexts()` |
+| `src/train_utils.py` | Call `set_epoch()` on model for temperature annealing |
+| `configs/experiment/89*.yaml` | New ablation configs |
+
+---
+
 ## 2026-02-18: Confidence Head Implementation
 
 **Goal:** Add patch-level confidence prediction to enable confidence-weighted loss, confidence-aware aggregation, and multi-level blending.
