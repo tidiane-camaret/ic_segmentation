@@ -28,6 +28,7 @@ from src.dataloaders.augmentations import (
     perturb_mask,
     degrade_resolution,
     apply_task_level_augmentation,
+    apply_universeg_augmentation,
 )
 
 
@@ -242,6 +243,56 @@ class TotalSeg2DDataset(Dataset):
         self.augment = True
         self.use_unified_augmentation = True
 
+        # Check augmentation type
+        aug_type = cfg.get("type", "legacy")
+        self.aug_type = aug_type
+
+        if aug_type == "universeg":
+            self._setup_universeg_augmentation(cfg)
+            return
+
+        # Legacy unified augmentation
+        self._setup_legacy_unified_augmentation(cfg)
+
+    def _setup_universeg_augmentation(self, cfg: Dict):
+        """Setup UniverSeg-style two-level augmentation."""
+        self.universeg_task_config = cfg.get("task", {})
+        self.universeg_example_config = cfg.get("example", {})
+
+        # Convert list configs to tuples for the augmentation functions
+        for key in ["rotation_range", "scale_range", "elastic_alpha", "elastic_sigma",
+                    "brightness_range", "contrast_range", "blur_sigma", "noise_mean", "noise_var"]:
+            if key in self.universeg_task_config and isinstance(self.universeg_task_config[key], list):
+                self.universeg_task_config[key] = tuple(self.universeg_task_config[key])
+            if key in self.universeg_example_config and isinstance(self.universeg_example_config[key], list):
+                self.universeg_example_config[key] = tuple(self.universeg_example_config[key])
+
+        # Disable mix augmentation for UniverSeg style (uses its own augmentation)
+        self.mix_type = "none"
+        self.mix_probability = 0.0
+
+        # Disable other legacy augmentation components
+        self.spatial_enabled = False
+        self.spatial_transform = None
+        self.intensity_enabled = False
+        self.intensity_transform = None
+        self.fg_crop_enabled = False
+        self.degrade_enabled = False
+        self.mask_perturb_enabled = False
+        self.task_level_enabled = False
+        self.adv_windowing_jitter = 0
+
+        print(f"UniverSeg-style augmentation enabled:")
+        print(f"  Task-level: flip_intensities={self.universeg_task_config.get('flip_intensities_p', 0.5):.1f}, "
+              f"flip_labels={self.universeg_task_config.get('flip_labels_p', 0.5):.1f}, "
+              f"sobel_edge={self.universeg_task_config.get('sobel_edge_p', 0.5):.1f}")
+        print(f"  Task-level: affine={self.universeg_task_config.get('affine_p', 0.5):.1f}, "
+              f"rotation={self.universeg_task_config.get('rotation_range', (0, 360))}")
+        print(f"  Example-level: enabled={self.universeg_example_config.get('enabled', True)}, "
+              f"elastic_p={self.universeg_example_config.get('elastic_p', 0.8):.1f}")
+
+    def _setup_legacy_unified_augmentation(self, cfg: Dict):
+        """Setup legacy unified augmentation (pre-UniverSeg style)."""
         # Mix augmentation (CutMix or CarveMix)
         mix_cfg = cfg.get("mix", {})
         self.mix_type = mix_cfg.get("type", "none")  # "cutmix", "carve_mix", "none"
@@ -325,7 +376,7 @@ class TotalSeg2DDataset(Dataset):
             self.mix_type = "none"
 
         # Print configuration summary
-        print(f"Unified augmentation enabled:")
+        print(f"Legacy unified augmentation enabled:")
         print(f"  Mix: type={self.mix_type}, p={self.mix_probability}")
         print(f"  Spatial: enabled={self.spatial_enabled}")
         print(f"  Foreground crop: enabled={self.fg_crop_enabled}, p={self.fg_crop_probability}, disable_with_mix={self.fg_crop_disable_with_mix}")
@@ -657,6 +708,27 @@ class TotalSeg2DDataset(Dataset):
         result = self.intensity_transform(image=img_uint8)
         return result['image'].astype(np.float32) / 255.0
 
+    def _apply_universeg_augmentation(
+        self,
+        target_img: np.ndarray,
+        target_mask: np.ndarray,
+        context_imgs: List[np.ndarray],
+        context_masks: List[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
+        """Apply UniverSeg-style two-level augmentation.
+
+        1. Task-level: Same transform applied to all images (target + context)
+        2. Example-level: Different transform per context image
+        """
+        return apply_universeg_augmentation(
+            target_img=target_img,
+            target_mask=target_mask,
+            context_imgs=context_imgs,
+            context_masks=context_masks,
+            task_config=self.universeg_task_config,
+            example_config=self.universeg_example_config,
+        )
+
     def _apply_unified_augmentation(
         self,
         target_img: np.ndarray,
@@ -669,7 +741,7 @@ class TotalSeg2DDataset(Dataset):
     ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
         """Apply the unified augmentation pipeline.
 
-        Flow:
+        Flow (legacy):
         1. Mix augmentation (CutMix OR CarveMix) on target
         2. Foreground crop (only if mix not applied, based on config)
         3. Re-resize if shapes changed
@@ -678,7 +750,18 @@ class TotalSeg2DDataset(Dataset):
         6. Intensity augmentation (different per image, or skip based on asymmetric setting)
         7. Context mask perturbation
         8. Resolution degradation
+
+        Flow (UniverSeg):
+        1. Task-level augmentation (same transform to ALL, includes intensity/spatial)
+        2. Example-level augmentation (different per context image)
         """
+        # Check if using UniverSeg-style augmentation
+        if getattr(self, 'aug_type', 'legacy') == "universeg":
+            return self._apply_universeg_augmentation(
+                target_img, target_mask, context_imgs, context_masks
+            )
+
+        # Legacy unified augmentation flow
         # 1. Mix augmentation on target
         target_img, target_mask, mix_applied = self._apply_mix_augmentation(
             target_img, target_mask, label_id, axis, exclude_case_ids

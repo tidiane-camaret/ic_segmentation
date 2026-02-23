@@ -15,30 +15,57 @@ import sys
 class UniverSegBaseline(nn.Module):
     """
     Wrapper for UniverSeg model that matches the PatchICL evaluation interface.
-    
+
     UniverSeg expects:
         - target_image: (B, 1, H, W)
         - support_images: (B, S, 1, H, W)
         - support_labels: (B, S, 1, H, W)
-    
+
     And outputs: (B, 1, H, W) predictions
     """
 
-    def __init__(self, pretrained: bool = True, input_size: int = 128):
+    def __init__(self, pretrained: bool = True, input_size: int = 128, freeze: bool = False):
         super().__init__()
         sys.path.append("/work/dlclarge2/ndirt-SegFM3D/repos/UniVerseg")  # Add path to import universeg
         from universeg import universeg
         self.model = universeg(pretrained=pretrained)
         self.input_size = input_size  # Configurable eval resolution (trained on 128)
-        
+
+        # Optionally freeze the pretrained model (for evaluation only)
+        if freeze:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
         # Placeholder loss function (can be set via set_loss_functions)
         self.aggreg_criterion = None
         self.patch_criterion = None
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
-        """Set the loss functions for compatibility with eval.py."""
+        """Set the loss functions for compatibility with train_utils."""
         self.patch_criterion = patch_criterion
         self.aggreg_criterion = aggreg_criterion
+
+    def compute_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute loss for training. Matches PatchICL interface."""
+        if self.aggreg_criterion is None:
+            raise RuntimeError("Loss functions not set. Call set_loss_functions() first.")
+
+        if labels.dim() == 3:
+            labels = labels.unsqueeze(1)
+
+        final_logit = outputs["final_logit"]
+
+        # Compute main segmentation loss
+        seg_loss = self.aggreg_criterion(final_logit, labels.float())
+
+        return {
+            "total_loss": seg_loss,
+            "seg_loss": seg_loss,
+        }
 
     def _resize_to_model(self, x: torch.Tensor) -> torch.Tensor:
         """Resize tensor to model input size (128x128)."""

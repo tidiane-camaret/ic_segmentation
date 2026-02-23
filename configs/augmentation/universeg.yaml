@@ -1,0 +1,81 @@
+# UniverSeg-style augmentation config
+# Two-level augmentation: task-level (consistent) + example-level (per-image)
+
+augmentation:
+  enabled: true
+  type: "universeg"  # Signals to use UniverSeg augmentation pipeline
+
+  # Task-level augmentations (applied consistently to target + all context)
+  task:
+    # Flip transforms
+    flip_intensities_p: 0.5    # Invert image intensities
+    flip_labels_p: 0.5         # Swap foreground/background
+    flip_horizontal_p: 0.5
+    flip_vertical_p: 0.5
+
+    # Sobel edge label (converts mask to boundary detection)
+    sobel_edge_p: 0.5
+    sobel_threshold: 0.1
+
+    # Affine transforms
+    affine_p: 0.5
+    rotation_range: [0, 360]   # Full rotation (UniverSeg uses 0-360)
+    scale_range: [0.8, 1.1]
+    translate_max: 0.2
+
+    # Elastic deformation
+    elastic_p: 0.25
+    elastic_alpha: [1, 2]
+    elastic_sigma: [6, 8]
+
+    # Intensity transforms
+    brightness_contrast_p: 0.5
+    brightness_range: [-0.1, 0.1]
+    contrast_range: [0.8, 1.2]
+
+    # Blur and noise
+    blur_p: 0.5
+    blur_kernel: 5
+    blur_sigma: [0.1, 1.1]
+
+    noise_p: 0.5
+    noise_mean: [0, 0.05]
+    noise_var: [0, 0.05]
+
+    # Sharpness
+    sharpness_p: 0.5
+    sharpness_factor: 5.0
+
+  # Example-level augmentations (different per context image)
+  example:
+    enabled: true
+
+    # Affine transforms
+    affine_p: 0.5
+    rotation_range: [0, 360]
+    scale_range: [0.8, 1.1]
+    translate_max: 0.2
+
+    # Elastic deformation (high probability in UniverSeg!)
+    elastic_p: 0.8
+    elastic_alpha: [1, 2.5]
+    elastic_sigma: [7, 8]
+
+    # Intensity transforms (wider contrast range for diversity)
+    brightness_contrast_p: 0.25
+    brightness_range: [-0.1, 0.1]
+    contrast_range: [0.5, 1.5]
+
+    # Blur (larger kernel for example-level)
+    blur_p: 0.25
+    blur_kernel: 50
+    blur_sigma: [0.1, 1.1]
+
+    # Noise
+    noise_p: 0.25
+    noise_mean: [0, 0.05]
+    noise_var: [0, 0.05]
+
+    # Sharpness
+    sharpness_p: 0.25
+    sharpness_factor: 5.0

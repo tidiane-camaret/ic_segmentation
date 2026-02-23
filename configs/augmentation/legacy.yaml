@@ -1,0 +1,59 @@
+# Legacy augmentation config (pre-UniverSeg style)
+# Kept for backwards compatibility
+
+augmentation:
+  enabled: true
+  type: "legacy"
+
+  mix:
+    type: "cutmix"
+    probability: 0.5
+    cutmix:
+      min_ratio: 0.3
+      max_ratio: 0.7
+    carve_mix:
+      margin_range: [0.1, 0.5]
+      harmonize: true
+      harmonize_sigma: 5.0
+
+  spatial:
+    enabled: true
+    rotation_limit: 15.0
+    scale_limit: 0.1
+    elastic_alpha: 50.0
+    elastic_sigma: 5.0
+    foreground_crop:
+      enabled: true
+      probability: 0.3
+      min_crop_frac: 0.5
+      disable_with_mix: true
+
+  intensity:
+    enabled: true
+    brightness_limit: 0.1
+    contrast_limit: 0.1
+    gamma_limit: [80, 120]
+    noise_std_range: [0.02, 0.05]
+    asymmetric: true
+    asymmetric_probability: 0.5
+
+  resolution_degradation:
+    enabled: true
+    probability: 0.2
+    min_scale: 0.25
+
+  context:
+    mask_perturbation:
+      enabled: true
+      probability: 0.3
+      max_kernel: 5
+
+  task_level:
+    enabled: true
+    probability: 0.3
+    transforms:
+      flip_horizontal: true
+      flip_vertical: true
+      rotate_90: true
+
+  windowing_jitter: 100

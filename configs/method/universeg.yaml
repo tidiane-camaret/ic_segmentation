@@ -7,6 +7,13 @@ model:
   universeg:
     pretrained: true
     input_size: 128  # UniverSeg native resolution
+    freeze: false    # Set to true for evaluation only
 
 preprocessing:
     image_size: ["${model.universeg.input_size}", "${model.universeg.input_size}", "${model.universeg.input_size}"]
+
+# Loss configuration for training
+loss:
+  aggreg_loss:
+    type: "softdice"
+    args: null

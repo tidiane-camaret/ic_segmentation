@@ -249,140 +249,173 @@ def main(cfg: DictConfig) -> None:
             slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
 
-    # Model (PatchICL v2)
-    from src.models.patch_icl_v2 import PatchICL
+    # Model selection based on method config
+    method = cfg.get("method", "patch_icl")
 
-    patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
-    random_coloring_nb = cfg.get("random_coloring_nb", 0)
-    patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
+    if method == "universeg":
+        # UniverSeg baseline model
+        from src.models.universeg_baseline import UniverSegBaseline
 
-    if accelerator.is_main_process:
-        print(
-            f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})"
+        universeg_cfg = cfg.model.get("universeg", {})
+        model = UniverSegBaseline(
+            pretrained=universeg_cfg.get("pretrained", True),
+            input_size=universeg_cfg.get("input_size", 128),
+            freeze=universeg_cfg.get("freeze", False),
         )
 
-    # Feature extractor for on-the-fly mode
-    feature_extractor = None
-    if feature_mode == "on_the_fly":
-        fe_cfg = patch_icl_cfg.get("feature_extractor", None)
-        extractor_type = (
-            fe_cfg.get("type", "meddino").lower()
-            if fe_cfg
-            else cfg.get("feature_extractor_type", "meddino").lower()
-        )
-
-        if extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
-            from src.models.meddino_extractor import create_meddino_extractor
-
-            if accelerator.is_main_process:
-                print("Initializing MedDINOv3 for on-the-fly feature extraction...")
-            if fe_cfg and fe_cfg.get("type") in ["meddino", "meddinov3", "meddino_v3"]:
-                feature_extractor = create_meddino_extractor(
-                    model_path=fe_cfg.get("model_path", cfg.paths.ckpts.meddino_vit),
-                    target_size=fe_cfg.get("target_size", 256),
-                    device=device,
-                    layer_idx=fe_cfg.get("layer_idx", 11),
-                    freeze=fe_cfg.get("freeze", True),
-                )
-            else:
-                feature_extractor = create_meddino_extractor(
-                    model_path=cfg.paths.ckpts.meddino_vit,
-                    target_size=cfg.get("feature_extraction_resolution", 256),
-                    device=device,
-                    layer_idx=cfg.get("meddino_layer_idx", 11),
-                    freeze=True,
-                )
-            if accelerator.is_main_process:
-                print(f"Feature mode: on_the_fly (MedDINO)")
-
-        elif extractor_type in ["medsam_v1", "medsam_v1_layer"]:
-            from src.models.medsam_extractor import MedSAMv1LayerExtractor
-
-            if accelerator.is_main_process:
-                print("Initializing MedSAM v1 for on-the-fly feature extraction...")
-            target_size = fe_cfg.get("target_size", 1024) if fe_cfg else 1024
-            output_grid = fe_cfg.get("output_grid_size") if fe_cfg else None
-            feature_extractor = MedSAMv1LayerExtractor(
-                checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
-                target_size=target_size,
-                device=device,
-                layer_idx=fe_cfg.get("layer_idx", 11) if fe_cfg else 11,
-                freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
-                output_grid_size=output_grid,
-            )
-            if accelerator.is_main_process:
-                info = feature_extractor.get_feature_info()
-                print(
-                    f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, grid={info['output_grid_size']})"
-                )
-        elif extractor_type == "universeg":
-            from src.models.universeg_extractor import UniverSegExtractor
-
-            if accelerator.is_main_process:
-                print("Initializing UniverSeg for on-the-fly feature extraction...")
-            feature_extractor = UniverSegExtractor(
-                layer_idx=fe_cfg.get("layer_idx", 3) if fe_cfg else 3,
-                device=device,
-                pretrained=fe_cfg.get("pretrained", True) if fe_cfg else True,
-                freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
-                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-            )
-            if accelerator.is_main_process:
-                info = feature_extractor.get_feature_info()
-                print(
-                    f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
-                    f"dim={info['feature_dim']}, grid={info['output_grid_size']})"
-                )
-        elif extractor_type == "icl_encoder":
-            from src.models.icl_encoder import ICLEncoder
-
-            if accelerator.is_main_process:
-                print("Initializing ICLEncoder for on-the-fly feature extraction...")
-            feature_extractor = ICLEncoder(
-                layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
-                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-                freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
-            )
-            if accelerator.is_main_process:
-                info = feature_extractor.get_feature_info()
-                print(
-                    f"Feature mode: on_the_fly (ICLEncoder layers={info['layer_indices']}, "
-                    f"dim={info['feature_dim']}, grid={info['output_grid_size']})"
-                )
-        elif extractor_type == "rad_dino":
-            from src.models.rad_dino_extractor import RADDINOExtractor
-
-            if accelerator.is_main_process:
-                print("Initializing RAD-DINO for on-the-fly feature extraction...")
-            feature_extractor = RADDINOExtractor(
-                model_name=fe_cfg.get("model_name", "microsoft/rad-dino") if fe_cfg else "microsoft/rad-dino",
-                target_size=fe_cfg.get("target_size", 224) if fe_cfg else 224,
-                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-                device=device,
-                freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
-            )
-            if accelerator.is_main_process:
-                info = feature_extractor.get_feature_info()
-                print(
-                    f"Feature mode: on_the_fly (RAD-DINO model={info['model_name']}, "
-                    f"dim={info['feature_dim']}, grid={info['output_grid_size']}, frozen={info['frozen']})"
-                )
-        else:
-            raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
-    else:
         if accelerator.is_main_process:
-            print("Feature mode: precomputed")
+            print(f"Using UniverSeg model (input_size={universeg_cfg.get('input_size', 128)}, "
+                  f"pretrained={universeg_cfg.get('pretrained', True)}, "
+                  f"freeze={universeg_cfg.get('freeze', False)})")
 
-    model = PatchICL(
-        patch_icl_cfg,
-        context_size=cfg.get("context_size", 0),
-        feature_extractor=feature_extractor,
-    )
+        # UniverSeg doesn't use feature extractors
+        feature_extractor = None
+        patch_icl_cfg = {}  # Empty config for loss setup
+
+    else:
+        # Default: PatchICL v2
+        from src.models.patch_icl_v2 import PatchICL
+
+        patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
+        random_coloring_nb = cfg.get("random_coloring_nb", 0)
+        patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
+
+        if accelerator.is_main_process:
+            print(
+                f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})"
+            )
+
+    # Feature extractor and PatchICL model creation (only for patch_icl method)
+    if method != "universeg":
+        feature_extractor = None
+        if feature_mode == "on_the_fly":
+            fe_cfg = patch_icl_cfg.get("feature_extractor", None)
+            extractor_type = (
+                fe_cfg.get("type", "meddino").lower()
+                if fe_cfg
+                else cfg.get("feature_extractor_type", "meddino").lower()
+            )
+
+            if extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
+                from src.models.meddino_extractor import create_meddino_extractor
+
+                if accelerator.is_main_process:
+                    print("Initializing MedDINOv3 for on-the-fly feature extraction...")
+                if fe_cfg and fe_cfg.get("type") in ["meddino", "meddinov3", "meddino_v3"]:
+                    feature_extractor = create_meddino_extractor(
+                        model_path=fe_cfg.get("model_path", cfg.paths.ckpts.meddino_vit),
+                        target_size=fe_cfg.get("target_size", 256),
+                        device=device,
+                        layer_idx=fe_cfg.get("layer_idx", 11),
+                        freeze=fe_cfg.get("freeze", True),
+                    )
+                else:
+                    feature_extractor = create_meddino_extractor(
+                        model_path=cfg.paths.ckpts.meddino_vit,
+                        target_size=cfg.get("feature_extraction_resolution", 256),
+                        device=device,
+                        layer_idx=cfg.get("meddino_layer_idx", 11),
+                        freeze=True,
+                    )
+                if accelerator.is_main_process:
+                    print("Feature mode: on_the_fly (MedDINO)")
+
+            elif extractor_type in ["medsam_v1", "medsam_v1_layer"]:
+                from src.models.medsam_extractor import MedSAMv1LayerExtractor
+
+                if accelerator.is_main_process:
+                    print("Initializing MedSAM v1 for on-the-fly feature extraction...")
+                target_size = fe_cfg.get("target_size", 1024) if fe_cfg else 1024
+                output_grid = fe_cfg.get("output_grid_size") if fe_cfg else None
+                feature_extractor = MedSAMv1LayerExtractor(
+                    checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
+                    target_size=target_size,
+                    device=device,
+                    layer_idx=fe_cfg.get("layer_idx", 11) if fe_cfg else 11,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=output_grid,
+                )
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(
+                        f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, grid={info['output_grid_size']})"
+                    )
+            elif extractor_type == "universeg":
+                from src.models.universeg_extractor import UniverSegExtractor
+
+                if accelerator.is_main_process:
+                    print("Initializing UniverSeg for on-the-fly feature extraction...")
+                feature_extractor = UniverSegExtractor(
+                    layer_idx=fe_cfg.get("layer_idx", 3) if fe_cfg else 3,
+                    device=device,
+                    pretrained=fe_cfg.get("pretrained", True) if fe_cfg else True,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                )
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(
+                        f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
+                        f"dim={info['feature_dim']}, grid={info['output_grid_size']})"
+                    )
+            elif extractor_type == "icl_encoder":
+                from src.models.icl_encoder import ICLEncoder
+
+                if accelerator.is_main_process:
+                    print("Initializing ICLEncoder for on-the-fly feature extraction...")
+                feature_extractor = ICLEncoder(
+                    layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
+                )
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(
+                        f"Feature mode: on_the_fly (ICLEncoder layers={info['layer_indices']}, "
+                        f"dim={info['feature_dim']}, grid={info['output_grid_size']})"
+                    )
+            elif extractor_type == "rad_dino":
+                from src.models.rad_dino_extractor import RADDINOExtractor
+
+                if accelerator.is_main_process:
+                    print("Initializing RAD-DINO for on-the-fly feature extraction...")
+                feature_extractor = RADDINOExtractor(
+                    model_name=fe_cfg.get("model_name", "microsoft/rad-dino") if fe_cfg else "microsoft/rad-dino",
+                    target_size=fe_cfg.get("target_size", 224) if fe_cfg else 224,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    device=device,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                )
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(
+                        f"Feature mode: on_the_fly (RAD-DINO model={info['model_name']}, "
+                        f"dim={info['feature_dim']}, grid={info['output_grid_size']}, frozen={info['frozen']})"
+                    )
+            else:
+                raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
+        else:
+            if accelerator.is_main_process:
+                print("Feature mode: precomputed")
+
+        # Create PatchICL model
+        model = PatchICL(
+            patch_icl_cfg,
+            context_size=cfg.get("context_size", 0),
+            feature_extractor=feature_extractor,
+        )
 
     # Loss functions
-    loss_cfg = patch_icl_cfg.get("loss", {})
-    patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
-    aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+    if method == "universeg":
+        # Simple loss config for UniverSeg
+        loss_cfg = cfg.get("loss", {})
+        patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
+        aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+    else:
+        loss_cfg = patch_icl_cfg.get("loss", {})
+        patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
+        aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+
     patch_criterion = build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args"))
     aggreg_criterion = build_loss_fn(
         aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args")
@@ -461,15 +494,16 @@ def main(cfg: DictConfig) -> None:
         model, optimizer, train_loader, val_loader, scheduler
     )
 
-    # torch.compile encoder/attention/decoder after DDP wrapping
-    backbone_cfg = patch_icl_cfg.get("backbone", {})
-    if backbone_cfg.get("compile", False):
-        if accelerator.is_main_process:
-            print("Compiling backbone submodules with torch.compile...")
-        bb = accelerator.unwrap_model(model).backbone
-        bb.encoder = torch.compile(bb.encoder)
-        bb.attention = torch.compile(bb.attention)
-        bb.decoder = torch.compile(bb.decoder)
+    # torch.compile encoder/attention/decoder after DDP wrapping (PatchICL only)
+    if method != "universeg":
+        backbone_cfg = patch_icl_cfg.get("backbone", {})
+        if backbone_cfg.get("compile", False):
+            if accelerator.is_main_process:
+                print("Compiling backbone submodules with torch.compile...")
+            bb = accelerator.unwrap_model(model).backbone
+            bb.encoder = torch.compile(bb.encoder)
+            bb.attention = torch.compile(bb.attention)
+            bb.decoder = torch.compile(bb.decoder)
 
 
     # Load scheduler state after preparing for distributed training

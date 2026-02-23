@@ -440,3 +440,430 @@ def create_intensity_only_transform(
             p=0.2
         ),
     ])
+
+
+# =============================================================================
+# UniverSeg-style Augmentations
+# =============================================================================
+
+def flip_intensities(img: np.ndarray) -> np.ndarray:
+    """Invert image intensities (1 - img). UniverSeg Task Augmentation."""
+    return 1.0 - img
+
+
+def flip_labels(mask: np.ndarray) -> np.ndarray:
+    """Swap foreground and background in mask. UniverSeg Task Augmentation."""
+    return 1.0 - mask
+
+
+def sobel_edge_label(mask: np.ndarray, threshold: float = 0.1) -> np.ndarray:
+    """Convert mask to edge detection using Sobel. UniverSeg Task Augmentation.
+
+    This forces the model to generalize to boundary-detection style tasks.
+    """
+    if mask.max() < 0.5:
+        return mask
+
+    # Compute Sobel edges
+    sobelx = cv2.Sobel(mask.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(mask.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    edges = np.sqrt(sobelx**2 + sobely**2)
+
+    # Normalize and threshold
+    if edges.max() > 0:
+        edges = edges / edges.max()
+    edges = (edges > threshold).astype(np.float32)
+
+    return edges
+
+
+def apply_sharpness(img: np.ndarray, factor: float = 5.0) -> np.ndarray:
+    """Apply sharpening filter. UniverSeg Augmentation."""
+    # Sharpening kernel: emphasize center, subtract neighbors
+    kernel = np.array([
+        [0, -1, 0],
+        [-1, 5, -1],
+        [0, -1, 0]
+    ], dtype=np.float32)
+
+    # Blend original with sharpened based on factor
+    sharpened = cv2.filter2D(img.astype(np.float32), -1, kernel)
+    alpha = min(factor / 10.0, 1.0)  # factor=5 -> alpha=0.5
+    result = (1 - alpha) * img + alpha * sharpened
+    return np.clip(result, 0, 1).astype(np.float32)
+
+
+def apply_gaussian_blur(
+    img: np.ndarray,
+    kernel_size: int = 5,
+    sigma_range: Tuple[float, float] = (0.1, 1.1),
+) -> np.ndarray:
+    """Apply Gaussian blur. UniverSeg Augmentation."""
+    sigma = random.uniform(*sigma_range)
+    # Ensure odd kernel size
+    k = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+    return cv2.GaussianBlur(img.astype(np.float32), (k, k), sigma)
+
+
+def apply_gaussian_noise(
+    img: np.ndarray,
+    mean_range: Tuple[float, float] = (0, 0.05),
+    var_range: Tuple[float, float] = (0, 0.05),
+) -> np.ndarray:
+    """Apply Gaussian noise. UniverSeg Augmentation."""
+    mean = random.uniform(*mean_range)
+    var = random.uniform(*var_range)
+    std = np.sqrt(var)
+    noise = np.random.normal(mean, std, img.shape).astype(np.float32)
+    return np.clip(img + noise, 0, 1).astype(np.float32)
+
+
+def apply_affine_transform(
+    img: np.ndarray,
+    mask: np.ndarray,
+    rotation_range: Tuple[float, float] = (0, 360),
+    translate_range: Tuple[float, float] = (0, 0.2),
+    scale_range: Tuple[float, float] = (0.8, 1.1),
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply affine transformation (rotation, translation, scale). UniverSeg Augmentation."""
+    H, W = img.shape[:2]
+    center = (W / 2, H / 2)
+
+    # Random parameters
+    angle = random.uniform(*rotation_range)
+    scale = random.uniform(*scale_range)
+    tx = random.uniform(-translate_range[1], translate_range[1]) * W
+    ty = random.uniform(-translate_range[1], translate_range[1]) * H
+
+    # Rotation + scale matrix
+    M = cv2.getRotationMatrix2D(center, angle, scale)
+    # Add translation
+    M[0, 2] += tx
+    M[1, 2] += ty
+
+    # Apply to image and mask
+    img_out = cv2.warpAffine(img.astype(np.float32), M, (W, H),
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask_out = cv2.warpAffine(mask.astype(np.float32), M, (W, H),
+                               flags=cv2.INTER_NEAREST,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    return img_out, mask_out
+
+
+def apply_elastic_transform(
+    img: np.ndarray,
+    mask: np.ndarray,
+    alpha_range: Tuple[float, float] = (1, 2),
+    sigma_range: Tuple[float, float] = (6, 8),
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply elastic deformation. UniverSeg Augmentation.
+
+    Note: UniverSeg uses lower alpha (1-2) compared to typical medical imaging (50-120).
+    """
+    alpha = random.uniform(*alpha_range)
+    sigma = random.uniform(*sigma_range)
+
+    H, W = img.shape[:2]
+
+    # Random displacement fields
+    dx = cv2.GaussianBlur(
+        (np.random.rand(H, W) * 2 - 1).astype(np.float32),
+        (0, 0), sigma
+    ) * alpha * W
+    dy = cv2.GaussianBlur(
+        (np.random.rand(H, W) * 2 - 1).astype(np.float32),
+        (0, 0), sigma
+    ) * alpha * H
+
+    # Create meshgrid
+    x, y = np.meshgrid(np.arange(W), np.arange(H))
+    map_x = (x + dx).astype(np.float32)
+    map_y = (y + dy).astype(np.float32)
+
+    # Apply remapping
+    img_out = cv2.remap(img.astype(np.float32), map_x, map_y,
+                        interpolation=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask_out = cv2.remap(mask.astype(np.float32), map_x, map_y,
+                         interpolation=cv2.INTER_NEAREST,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    return img_out, mask_out
+
+
+def apply_brightness_contrast(
+    img: np.ndarray,
+    brightness_range: Tuple[float, float] = (-0.1, 0.1),
+    contrast_range: Tuple[float, float] = (0.8, 1.2),
+) -> np.ndarray:
+    """Apply brightness and contrast adjustment. UniverSeg Augmentation."""
+    brightness = random.uniform(*brightness_range)
+    contrast = random.uniform(*contrast_range)
+
+    # Apply contrast then brightness
+    result = img * contrast + brightness
+    return np.clip(result, 0, 1).astype(np.float32)
+
+
+def apply_universeg_task_augmentation(
+    images: List[np.ndarray],
+    masks: List[np.ndarray],
+    config: Optional[Dict] = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Apply UniverSeg task-level augmentations (same transform to all images).
+
+    Task augmentations are applied consistently to target + all context images.
+    This ensures semantic consistency while providing diversity.
+
+    Args:
+        images: List of [H, W] images (target + context)
+        masks: List of [H, W] masks
+        config: Augmentation config dict
+
+    Returns:
+        Augmented images and masks
+    """
+    if not images:
+        return images, masks
+
+    cfg = config or {}
+
+    # Decide on transforms (same decision for all images)
+    do_flip_intensities = random.random() < cfg.get("flip_intensities_p", 0.5)
+    do_flip_labels = random.random() < cfg.get("flip_labels_p", 0.5)
+    do_sobel_edge = random.random() < cfg.get("sobel_edge_p", 0.5)
+    do_flip_h = random.random() < cfg.get("flip_horizontal_p", 0.5)
+    do_flip_v = random.random() < cfg.get("flip_vertical_p", 0.5)
+    do_affine = random.random() < cfg.get("affine_p", 0.5)
+    do_brightness = random.random() < cfg.get("brightness_contrast_p", 0.5)
+    do_elastic = random.random() < cfg.get("elastic_p", 0.25)
+    do_blur = random.random() < cfg.get("blur_p", 0.5)
+    do_noise = random.random() < cfg.get("noise_p", 0.5)
+    do_sharpness = random.random() < cfg.get("sharpness_p", 0.5)
+
+    # Generate shared random parameters for affine
+    if do_affine:
+        rotation = random.uniform(*cfg.get("rotation_range", (0, 360)))
+        scale = random.uniform(*cfg.get("scale_range", (0.8, 1.1)))
+        tx_frac = random.uniform(-cfg.get("translate_max", 0.2), cfg.get("translate_max", 0.2))
+        ty_frac = random.uniform(-cfg.get("translate_max", 0.2), cfg.get("translate_max", 0.2))
+
+    # Generate shared elastic displacement
+    if do_elastic:
+        H, W = images[0].shape[:2]
+        alpha = random.uniform(*cfg.get("elastic_alpha", (1, 2)))
+        sigma = random.uniform(*cfg.get("elastic_sigma", (6, 8)))
+        dx = cv2.GaussianBlur(
+            (np.random.rand(H, W) * 2 - 1).astype(np.float32), (0, 0), sigma
+        ) * alpha * W
+        dy = cv2.GaussianBlur(
+            (np.random.rand(H, W) * 2 - 1).astype(np.float32), (0, 0), sigma
+        ) * alpha * H
+        x, y = np.meshgrid(np.arange(W), np.arange(H))
+        map_x = (x + dx).astype(np.float32)
+        map_y = (y + dy).astype(np.float32)
+
+    transformed_images = []
+    transformed_masks = []
+
+    for img, mask in zip(images, masks):
+        # Flip intensities (before other transforms)
+        if do_flip_intensities:
+            img = flip_intensities(img)
+
+        # Flip labels
+        if do_flip_labels:
+            mask = flip_labels(mask)
+
+        # Sobel edge (converts mask to boundaries)
+        if do_sobel_edge:
+            mask = sobel_edge_label(mask, threshold=cfg.get("sobel_threshold", 0.1))
+
+        # Horizontal flip
+        if do_flip_h:
+            img = np.fliplr(img).copy()
+            mask = np.fliplr(mask).copy()
+
+        # Vertical flip
+        if do_flip_v:
+            img = np.flipud(img).copy()
+            mask = np.flipud(mask).copy()
+
+        # Affine (same params for all)
+        if do_affine:
+            H, W = img.shape[:2]
+            center = (W / 2, H / 2)
+            M = cv2.getRotationMatrix2D(center, rotation, scale)
+            M[0, 2] += tx_frac * W
+            M[1, 2] += ty_frac * H
+            img = cv2.warpAffine(img.astype(np.float32), M, (W, H),
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            mask = cv2.warpAffine(mask.astype(np.float32), M, (W, H),
+                                   flags=cv2.INTER_NEAREST,
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        # Elastic (same displacement field for all)
+        if do_elastic:
+            img = cv2.remap(img.astype(np.float32), map_x, map_y,
+                           interpolation=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            mask = cv2.remap(mask.astype(np.float32), map_x, map_y,
+                            interpolation=cv2.INTER_NEAREST,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        # Brightness/contrast
+        if do_brightness:
+            img = apply_brightness_contrast(
+                img,
+                brightness_range=cfg.get("brightness_range", (-0.1, 0.1)),
+                contrast_range=cfg.get("contrast_range", (0.8, 1.2)),
+            )
+
+        # Gaussian blur
+        if do_blur:
+            img = apply_gaussian_blur(
+                img,
+                kernel_size=cfg.get("blur_kernel", 5),
+                sigma_range=cfg.get("blur_sigma", (0.1, 1.1)),
+            )
+
+        # Gaussian noise
+        if do_noise:
+            img = apply_gaussian_noise(
+                img,
+                mean_range=cfg.get("noise_mean", (0, 0.05)),
+                var_range=cfg.get("noise_var", (0, 0.05)),
+            )
+
+        # Sharpness
+        if do_sharpness:
+            img = apply_sharpness(img, factor=cfg.get("sharpness_factor", 5.0))
+
+        transformed_images.append(img)
+        transformed_masks.append(mask)
+
+    return transformed_images, transformed_masks
+
+
+def apply_universeg_example_augmentation(
+    img: np.ndarray,
+    mask: np.ndarray,
+    config: Optional[Dict] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply UniverSeg example-level augmentations (different per image).
+
+    Example augmentations create diversity within the support set while
+    maintaining the same semantic task.
+
+    Args:
+        img: [H, W] image
+        mask: [H, W] mask
+        config: Augmentation config dict
+
+    Returns:
+        Augmented image and mask
+    """
+    cfg = config or {}
+
+    # Affine transform
+    if random.random() < cfg.get("affine_p", 0.5):
+        img, mask = apply_affine_transform(
+            img, mask,
+            rotation_range=cfg.get("rotation_range", (0, 360)),
+            translate_range=(0, cfg.get("translate_max", 0.2)),
+            scale_range=cfg.get("scale_range", (0.8, 1.1)),
+        )
+
+    # Elastic transform (high probability in UniverSeg: 0.8)
+    if random.random() < cfg.get("elastic_p", 0.8):
+        img, mask = apply_elastic_transform(
+            img, mask,
+            alpha_range=cfg.get("elastic_alpha", (1, 2.5)),
+            sigma_range=cfg.get("elastic_sigma", (7, 8)),
+        )
+
+    # Brightness/contrast
+    if random.random() < cfg.get("brightness_contrast_p", 0.25):
+        img = apply_brightness_contrast(
+            img,
+            brightness_range=cfg.get("brightness_range", (-0.1, 0.1)),
+            contrast_range=cfg.get("contrast_range", (0.5, 1.5)),  # Wider range
+        )
+
+    # Gaussian blur (larger kernel for example-level)
+    if random.random() < cfg.get("blur_p", 0.25):
+        img = apply_gaussian_blur(
+            img,
+            kernel_size=cfg.get("blur_kernel", 50),  # Larger kernel
+            sigma_range=cfg.get("blur_sigma", (0.1, 1.1)),
+        )
+
+    # Gaussian noise
+    if random.random() < cfg.get("noise_p", 0.25):
+        img = apply_gaussian_noise(
+            img,
+            mean_range=cfg.get("noise_mean", (0, 0.05)),
+            var_range=cfg.get("noise_var", (0, 0.05)),
+        )
+
+    # Sharpness
+    if random.random() < cfg.get("sharpness_p", 0.25):
+        img = apply_sharpness(img, factor=cfg.get("sharpness_factor", 5.0))
+
+    return img, mask
+
+
+def apply_universeg_augmentation(
+    target_img: np.ndarray,
+    target_mask: np.ndarray,
+    context_imgs: List[np.ndarray],
+    context_masks: List[np.ndarray],
+    task_config: Optional[Dict] = None,
+    example_config: Optional[Dict] = None,
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
+    """Apply full UniverSeg two-level augmentation pipeline.
+
+    1. Task-level: Same transform applied to all (target + context)
+    2. Example-level: Different transform per context image
+
+    Args:
+        target_img: Target image [H, W]
+        target_mask: Target mask [H, W]
+        context_imgs: List of context images
+        context_masks: List of context masks
+        task_config: Config for task-level augmentation
+        example_config: Config for example-level augmentation
+
+    Returns:
+        Augmented target_img, target_mask, context_imgs, context_masks
+    """
+    # Combine all images for task-level augmentation
+    all_imgs = [target_img] + list(context_imgs)
+    all_masks = [target_mask] + list(context_masks)
+
+    # Apply task-level augmentation (same transform to all)
+    all_imgs, all_masks = apply_universeg_task_augmentation(
+        all_imgs, all_masks, task_config
+    )
+
+    # Split back
+    target_img = all_imgs[0]
+    target_mask = all_masks[0]
+    context_imgs = all_imgs[1:]
+    context_masks = all_masks[1:]
+
+    # Apply example-level augmentation (different per context image)
+    if example_config and example_config.get("enabled", True):
+        augmented_ctx_imgs = []
+        augmented_ctx_masks = []
+        for ctx_img, ctx_mask in zip(context_imgs, context_masks):
+            aug_img, aug_mask = apply_universeg_example_augmentation(
+                ctx_img, ctx_mask, example_config
+            )
+            augmented_ctx_imgs.append(aug_img)
+            augmented_ctx_masks.append(aug_mask)
+        context_imgs = augmented_ctx_imgs
+        context_masks = augmented_ctx_masks
+
+    return target_img, target_mask, context_imgs, context_masks

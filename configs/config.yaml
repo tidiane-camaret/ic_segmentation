@@ -51,7 +51,7 @@ max_ds_len:  # Can be null, int, or dict with train/val keys
 optimizer:
   optimizer_type: "adamw"
   optimizer_args:
-    lr: 0.0003
+    lr: 0.0001
     weight_decay: 0.01
 
 # Schedulers
