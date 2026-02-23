@@ -2,7 +2,7 @@
 #SBATCH -p ml_gpu-rtx2080
 #SBATCH -c 20
 #SBATCH --mem 48000
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --time=12:00:00
 
 
@@ -24,13 +24,13 @@ export NCCL_TIMEOUT=1800
 nvidia-smi
 
 # run with sbatch scripts/slurm_train.sh
-# uv run scripts/totalseg_3d_to_2d_fast.py cluster=dlclarge
+# uv run scripts/totalseg_3d_to_2d_every_n_slice.py cluster=dlclarge max_files_3d_to_2d=500
 uv run accelerate launch \
     --multi_gpu \
     --num_processes=2 \
     --mixed_precision=fp16 \
     scripts/train.py \
-    +max_labels=50 \
-    experiment=87_universeg \
-    cluster=dlclarge \
-    checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt
+    max_labels=50 \
+    experiment=88_entropy \
+    cluster=dlclarge
+    #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt

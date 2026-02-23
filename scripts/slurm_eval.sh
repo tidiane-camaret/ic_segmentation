@@ -25,7 +25,7 @@ nvidia-smi
 #uv run accelerate launch --multi_gpu scripts/eval.py experiment=60_2_levels cluster=dlclarge dataset=medsegbench checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/deep-feather-217/best_model.pt
 uv run accelerate launch \
     scripts/eval.py \
-    +max_labels=100 \
-    experiment=70_attention \
+    max_labels=50 \
+    experiment=88_entropy \
     cluster=dlclarge \
     checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_wooing-balloon-274/best_model.pt

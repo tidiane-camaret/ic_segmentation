@@ -5,6 +5,8 @@ consistency in thresholds and naming.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -251,6 +253,57 @@ def compute_all_metrics(
             metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
             if return_per_sample:
                 metrics['per_sample_dice'] = dice_result['dice']
+
+    # Uncertainty metrics from final_conf or final_logit
+    metrics.update(compute_uncertainty_metrics(outputs, labels))
+
+    return metrics
+
+
+def compute_uncertainty_metrics(
+    outputs: dict[str, torch.Tensor],
+    labels: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute uncertainty/confidence metrics from model outputs.
+
+    Computes entropy-based metrics from final_conf (if provided) or from
+    final_logit. Reports mean confidence, mean entropy, and error-uncertainty
+    correlation (AUCO-like: whether uncertain pixels are also wrong).
+
+    Args:
+        outputs: Model output dict (needs 'final_logit', optionally 'final_conf')
+        labels: Ground truth [B, C, H, W]
+
+    Returns:
+        Dict with uncertainty metrics (all scalar tensors)
+    """
+    metrics = {}
+    final_logit = outputs.get('final_logit')
+    if final_logit is None:
+        return metrics
+
+    if labels.dim() == 3:
+        labels = labels.unsqueeze(1)
+
+    with torch.no_grad():
+        p = torch.sigmoid(final_logit).clamp(1e-6, 1 - 1e-6)
+        entropy = -(p * p.log() + (1 - p) * (1 - p).log()) / math.log(2)
+        confidence = 1.0 - entropy  # [0, 1]
+
+        # Mean entropy and confidence across all pixels
+        metrics['mean_entropy'] = entropy.mean()
+        metrics['mean_confidence'] = confidence.mean()
+
+        # Error-weighted entropy: avg entropy where predictions are wrong
+        pred_binary = (p > PRED_THRESHOLD).float()
+        gt_binary = (labels.float() > GT_AREA_THRESHOLD).float()
+        errors = (pred_binary != gt_binary).float()
+        n_errors = errors.sum()
+        if n_errors > 0:
+            metrics['mean_entropy_on_errors'] = (entropy * errors).sum() / n_errors
+            metrics['mean_entropy_on_correct'] = (
+                (entropy * (1 - errors)).sum() / (1 - errors).sum().clamp(min=1)
+            )
 
     return metrics
 

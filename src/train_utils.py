@@ -928,6 +928,13 @@ def validate(
                     dice_accum[key] += metrics[key].item()
                     dice_count[key] += 1
 
+        # Uncertainty metrics accumulation
+        for ukey in ["mean_entropy", "mean_confidence",
+                      "mean_entropy_on_errors", "mean_entropy_on_correct"]:
+            if ukey in metrics:
+                dice_accum[ukey] += metrics[ukey].item()
+                dice_count[ukey] += 1
+
         # Per-case tracking (reuse per_sample_dice from compute_all_metrics)
         per_sample_dice = metrics.get("per_sample_dice")
         if per_sample_dice is None:
@@ -958,8 +965,9 @@ def validate(
                 label_dice_scores[label_id] = []
             label_dice_scores[label_id].append(dice_val)
 
-            # Store one sample per label for visualization
-            if is_main and label_id not in label_samples:
+            # Store one sample per label for visualization (only when saving)
+            should_save = (use_wandb or save_dir is not None) and is_main
+            if should_save and label_id not in label_samples:
                 label_samples[label_id] = _collect_sample_for_viz(
                     i, images, labels, outputs, context_in, context_out, dice_val
                 )

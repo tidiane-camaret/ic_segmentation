@@ -225,8 +225,9 @@ class TotalSeg2DDataset(Dataset):
         if self.random_coloring_nb > 0:
             self.color_palette = define_colors_by_mean_sep(num_colors=max(256, len(self.label_id_list)))
 
-        # Per-worker H5 file cache (populated lazily)
+        # Per-worker H5 file cache (populated lazily, max 8 handles to bound RAM)
         self._h5_cache: Dict[str, h5py.File] = {}
+        self._h5_cache_max = 8
 
     def _setup_unified_augmentation(self, cfg: Dict):
         """Setup augmentation from unified config format."""
@@ -415,10 +416,21 @@ class TotalSeg2DDataset(Dataset):
         # (This is a simplified version of the logic in __init__)
 
     def _get_h5_file(self, case_id: str) -> h5py.File:
-        """Get cached H5 file handle (lazy initialization per worker)."""
+        """Get cached H5 file handle (lazy initialization per worker, LRU-bounded)."""
         if case_id not in self._h5_cache:
+            # Evict oldest entry if at capacity
+            if len(self._h5_cache) >= self._h5_cache_max:
+                oldest = next(iter(self._h5_cache))
+                try:
+                    self._h5_cache[oldest].close()
+                except Exception:
+                    pass
+                del self._h5_cache[oldest]
             h5_path = self.root_dir / f"{case_id}.h5"
             self._h5_cache[case_id] = h5py.File(h5_path, 'r', swmr=True)
+        else:
+            # Move to end (most-recently-used) using dict insertion order
+            self._h5_cache[case_id] = self._h5_cache.pop(case_id)
         return self._h5_cache[case_id]
 
     def _load_slice(self, case_id: str, label_id: str, axis: str, slice_idx: int = 0) -> Tuple[np.ndarray, np.ndarray]:
@@ -1113,5 +1125,6 @@ def get_dataloader(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
-        persistent_workers=num_workers > 0,
+        persistent_workers=False,
+        prefetch_factor=1 if num_workers > 0 else None,  # halves shared-memory buffer vs default 2
     )

@@ -5,10 +5,12 @@ Wraps the UniverSeg model to match the interface expected by eval.py.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import sys 
+import sys
 
 class UniverSegBaseline(nn.Module):
     """
@@ -148,7 +150,12 @@ class UniverSegBaseline(nn.Module):
             final_logit = F.interpolate(prediction, size=(H, W), mode='bilinear', align_corners=False)
         else:
             final_logit = prediction
-        
+
+        # Compute entropy-based confidence from logits (no learned params)
+        p = torch.sigmoid(final_logit).clamp(1e-6, 1 - 1e-6)
+        entropy = -(p * p.log() + (1 - p) * (1 - p).log())
+        final_conf = 1.0 - entropy / math.log(2)  # [0, 1]
+
         # Create dummy outputs for compatibility with validate()
         # patch_logits and patch_coords are needed by validate()
         dummy_patch_size = 32
@@ -164,6 +171,7 @@ class UniverSegBaseline(nn.Module):
         return {
             'final_pred': final_logit,
             'final_logit': final_logit,
+            'final_conf': final_conf,
             'coarse_pred': final_logit,
             'level_outputs': [],  # No level outputs for this simple model
             'patches': dummy_patches,

@@ -108,7 +108,7 @@ def main(cfg: DictConfig) -> None:
     val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
 
     # Get dataset class and dataloader
-    if cfg.dataset in ["totalseg", "totalsegmri", "totalseg2d_every_n_slice"]:
+    if cfg.dataset in ["totalseg2d", "totalsegmri2d", "totalseg2d_every_n_slice"]:
         from src.dataloaders.totalseg2d_dataloader_fast import (
             get_dataloader as get_totalseg2d_dataloader,
         )
@@ -137,7 +137,7 @@ def main(cfg: DictConfig) -> None:
     else:
         max_ds_len_val = max_ds_len_cfg
 
-    if cfg.dataset in ["totalseg", "totalsegmri", "totalseg2d_every_n_slice"]:
+    if cfg.dataset in ["totalseg2d", "totalsegmri2d", "totalseg2d_every_n_slice"]:
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         val_loader = get_totalseg2d_dataloader(
@@ -443,6 +443,11 @@ def main(cfg: DictConfig) -> None:
         for key, value in sorted(detailed_results.items()):
             if key.startswith("level_"):
                 print(f"  {key}: {value:.4f}")
+        # Print uncertainty metrics
+        for key in ["mean_entropy", "mean_confidence",
+                     "mean_entropy_on_errors", "mean_entropy_on_correct"]:
+            if key in detailed_results:
+                print(f"  {key}: {detailed_results[key]:.4f}")
         # Print per-label dice
         print("\nPer-label Dice:")
         for label_id, dice in sorted(detailed_results["per_label"].items(), key=lambda x: x[1], reverse=True):
@@ -459,9 +464,9 @@ def main(cfg: DictConfig) -> None:
             "val_final_pixel_mae": val_pixel_mae,
             "val_context_dice": val_context_dice,
         }
-        # Log all per-level metrics (dice, soft_dice, pixel_mae)
+        # Log all per-level and uncertainty metrics
         for key, value in detailed_results.items():
-            if key.startswith("level_"):
+            if key.startswith("level_") or key.startswith("mean_"):
                 log_dict[f"val/{key}"] = value
         if flop_info:
             log_dict["gflops_per_sample"] = flop_info["gflops_per_sample"]

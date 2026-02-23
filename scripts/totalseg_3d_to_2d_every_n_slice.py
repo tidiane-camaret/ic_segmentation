@@ -212,7 +212,7 @@ def main(cfg: DictConfig) -> None:
     min_coverage_ratio = getattr(cfg, 'min_coverage_ratio', 0.1)  # Filter slices with < 10% of max coverage
     print(cfg.dataset)
     orig_dir = Path(cfg.paths.dataset)
-    output_dir = Path("/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data/totalseg2d_every_n_slice")
+    output_dir = Path("/work/dlclarge2/ndirt-SegFM3D/data/totalseg2d")
     #Path(cfg.paths.totalseg2d_every_n_slice)
     stats_path = output_dir / "stats.pkl"
 

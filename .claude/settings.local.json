@@ -24,7 +24,8 @@
       "WebFetch(domain:ar5iv.labs.arxiv.org)",
       "Bash(timeout 30 bash:*)",
       "Bash(find:*)",
-      "WebFetch(domain:encord.com)"
+      "WebFetch(domain:encord.com)",
+      "Bash(uv run accelerate launch:*)"
     ],
     "deny": [
       "Read(./old/**)"

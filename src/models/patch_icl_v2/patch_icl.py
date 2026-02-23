@@ -6,6 +6,8 @@ to guide patch sampling at finer levels.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -163,6 +165,30 @@ def extract_patch_features(
     return patch_features
 
 
+def compute_entropy_confidence(logits: torch.Tensor) -> torch.Tensor:
+    """Compute confidence from binary prediction entropy (no learned params).
+
+    Confidence = 1 - H(p)/log(2), where H(p) = -(p*log(p) + (1-p)*log(1-p)).
+    Fully differentiable. Returns 1 near p=0 or p=1, 0 at p=0.5.
+
+    Args:
+        logits: [B, K, C, H, W] - raw prediction logits
+
+    Returns:
+        confidence: [B, K, 1, H, W] - confidence in [0, 1]
+    """
+    p = torch.sigmoid(logits)
+    p = p.clamp(1e-6, 1 - 1e-6)
+    entropy = -(p * p.log() + (1 - p) * (1 - p).log())
+    # Normalize by max entropy (log(2)) so output is in [0, 1]
+    normalized_entropy = entropy / math.log(2)
+    confidence = 1.0 - normalized_entropy
+    # If multi-channel, take mean across channels -> [B, K, 1, H, W]
+    if confidence.shape[2] > 1:
+        confidence = confidence.mean(dim=2, keepdim=True)
+    return confidence
+
+
 class PatchICL(nn.Module):
     """Multi-level cascaded PatchICL model.
 
@@ -268,16 +294,21 @@ class PatchICL(nn.Module):
         while len(self.level_loss_weights) < self.num_levels:
             self.level_loss_weights.append(1.0)
 
-        # Confidence loss config
+        # Confidence method: "learned" (CNN head) or "entropy" (from prediction logits)
         conf_cfg = loss_cfg.get('confidence', {})
+        self.confidence_method = conf_cfg.get('method', 'learned')
+        assert self.confidence_method in ('learned', 'entropy'), \
+            f"confidence.method must be 'learned' or 'entropy', got '{self.confidence_method}'"
+
+        # Confidence loss config
         self.confidence_enabled = conf_cfg.get('enabled', False)
         self.confidence_supervision_weight = conf_cfg.get('supervision_weight', 0.5)
         self.confidence_boundary_weight = conf_cfg.get('boundary_weight', 0.1)
         self.confidence_boundary_width = conf_cfg.get('boundary_width', 2)
         self.use_confidence_weighted_seg = conf_cfg.get('weighted_seg', False)
 
-        # Initialize confidence loss functions if enabled
-        if self.confidence_enabled:
+        # Initialize confidence loss functions (only for learned method)
+        if self.confidence_enabled and self.confidence_method == 'learned':
             from src.losses import ConfidenceSupervisionLoss, BoundaryConfidenceLoss
             self.conf_supervision_loss = ConfidenceSupervisionLoss()
             self.conf_boundary_loss = BoundaryConfidenceLoss(
@@ -629,11 +660,15 @@ class PatchICL(nn.Module):
             patch_logits = all_logits[:, :K]
             context_patch_logits = all_logits[:, K:]
 
-            # Extract confidence predictions if available
+            # Extract confidence predictions
             all_confidence = backbone_out.get('confidence_preds')
             patch_confidence = None
             context_patch_confidence = None
-            if all_confidence is not None:
+            if self.confidence_method == 'entropy':
+                # Compute confidence from prediction entropy (zero-parameter)
+                patch_confidence = compute_entropy_confidence(patch_logits)
+                context_patch_confidence = compute_entropy_confidence(context_patch_logits)
+            elif all_confidence is not None:
                 patch_confidence = all_confidence[:, :K]
                 context_patch_confidence = all_confidence[:, K:]
 
@@ -664,7 +699,10 @@ class PatchICL(nn.Module):
                 mask_prior_patches=mask_prior_patches,
             )
             patch_logits = backbone_out['mask_patch_logit_preds']
-            patch_confidence = backbone_out.get('confidence_preds')
+            if self.confidence_method == 'entropy':
+                patch_confidence = compute_entropy_confidence(patch_logits)
+            else:
+                patch_confidence = backbone_out.get('confidence_preds')
 
         # Apply inverse augmentation and aggregate
         patch_logits_for_agg = patch_logits
@@ -997,10 +1035,10 @@ class PatchICL(nn.Module):
                 losses[f'level_{i}_refined_probs_dice'] = dice_result['dice'].mean()
                 losses[f'level_{i}_refined_probs_soft_dice'] = dice_result['soft_dice'].mean()
 
-        # Confidence losses (if enabled)
+        # Confidence losses (only for learned method - entropy has no learned params)
         sum_conf_supervision = 0.0
         sum_conf_boundary = 0.0
-        if self.confidence_enabled:
+        if self.confidence_enabled and self.confidence_method == 'learned':
             for i, level_out in enumerate(outputs['level_outputs']):
                 lw = self.level_loss_weights[i]
                 conf_preds = level_out.get('confidence_preds')

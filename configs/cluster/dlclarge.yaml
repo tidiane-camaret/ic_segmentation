@@ -6,7 +6,7 @@ paths:
   DATA_DIR: ${.root}/data
   RESULTS_DIR: ${.root}/ic_segmentation/results
   dataset: ${.DATA_DIR}/${dataset}
-  dataset2d: ${.DATA_DIR}/${dataset}2d
+  dataset2d: ${.DATA_DIR}/${dataset}
   dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
   #dataset2d_every_n_slice: ${.DATA_DIR}/${dataset}2d_every_n_slice
   dataset_stats: ${.DATA_DIR}/${dataset}/stats.pkl
@@ -21,7 +21,7 @@ paths:
     # patch_icl_v2: ${..RESULTS_DIR}/checkpoints/scarlet-firefly-161/best_model.pt
 
 # Cluster-specific training settings
-train_batch_size: 48
-val_batch_size: 48
+train_batch_size: 12
+val_batch_size: 12
 training:
-  num_workers: 18
+  num_workers: 6  # higher values OOM with 512x512 images (forked workers inherit parent address space)

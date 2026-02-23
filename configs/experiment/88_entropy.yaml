@@ -1,0 +1,182 @@
+# @package _global_
+# Same as 87_universeg but with entropy-based confidence instead of learned head.
+# Confidence derived from prediction entropy: conf = 1 - H(p)/log(2)
+# No extra parameters, no confidence supervision loss needed.
+
+dataset: totalseg2d
+max_labels: 50
+class_balanced: true
+train_label_ids: "train"
+val_label_ids: "val"
+
+method: "patch_icl"
+feature_mode: "on_the_fly"
+
+preprocessing:
+  image_size: [512, 512, 512]
+
+context_size: 3
+
+# Unified augmentation config
+augmentation:
+  enabled: true
+
+  mix:
+    type: "cutmix"
+    probability: 0.5
+    cutmix:
+      min_ratio: 0.3
+      max_ratio: 0.7
+    carve_mix:
+      margin_range: [0.1, 0.5]
+      harmonize: true
+      harmonize_sigma: 5.0
+
+  spatial:
+    enabled: true
+    rotation_limit: 15.0
+    scale_limit: 0.1
+    elastic_alpha: 50.0
+    elastic_sigma: 5.0
+    foreground_crop:
+      enabled: true
+      probability: 0.3
+      min_crop_frac: 0.5
+      disable_with_mix: true
+
+  intensity:
+    enabled: true
+    brightness_limit: 0.1
+    contrast_limit: 0.1
+    gamma_limit: [80, 120]
+    noise_std_range: [0.02, 0.05]
+    asymmetric: true
+    asymmetric_probability: 0.5
+
+  resolution_degradation:
+    enabled: true
+    probability: 0.2
+    min_scale: 0.25
+
+  context:
+    mask_perturbation:
+      enabled: true
+      probability: 0.3
+      max_kernel: 5
+
+  task_level:
+    enabled: true
+    probability: 0.3
+    transforms:
+      flip_horizontal: true
+      flip_vertical: true
+      rotate_90: true
+
+  windowing_jitter: 100
+
+training:
+  seed: 42
+  num_epochs: 100
+  print_every: 50
+  grad_accumulate_steps: 1
+  num_workers: 12
+  log_every: 20
+  compute_metrics_every: 20
+
+warmup_scheduler:
+  enabled: true
+  warmup_epochs: 10
+
+model:
+  patch_icl:
+    feature_extractor:
+      type: "universeg"
+      layer_idx: "all"
+      target_size: 512
+      output_grid_size: 64
+      freeze: true
+
+    levels:
+      - resolution: 18
+        patch_size: 8
+        sampling_method: "sliding_window"
+        stride: 6
+        num_patches: 9
+        pad_before: 1
+        pad_after: 1
+      - resolution: 36
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
+      - resolution: 66
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 8
+        pad_before: 1
+        pad_after: 1
+
+    oracle_levels_train: [false, false, false]
+    oracle_levels_valid: [false, false, false]
+
+    aggregator:
+      type: "average"
+      combine_mode: "average"
+      min_coverage: 1e-6
+      use_confidence: true
+      confidence_mode: "multiply"
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: 256
+      embed_dim: 256
+      embed_proj_dim: 256
+      feature_grid_size: 64
+      patch_feature_grid_size: 8
+      num_heads: 4
+      num_layers: 2
+      num_context_layers: 1
+      num_registers: 4
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: true
+      use_context_mask: true
+      mask_fusion_type: "concat"
+      predict_confidence: false  # No learned head needed for entropy method
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      aggreg_loss:
+        type: "softdiceFocal"
+        args:
+          alpha: 0.5
+          gamma: 2.0
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 0.5
+          context_aggreg: 0.5
+      level_weights: [1.0, 1.0]
+      confidence:
+        method: "entropy"        # Entropy-based confidence (no learned params)
+        enabled: true            # Enable confidence for aggregation/blending
+        supervision_weight: 0    # Not used for entropy method
+        boundary_weight: 0       # Not used for entropy method
+        boundary_width: 2
+        weighted_seg: false
+
+    cascade:
+      detach_between_levels: true
+      confidence_blend: true
