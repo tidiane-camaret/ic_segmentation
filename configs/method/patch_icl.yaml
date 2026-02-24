@@ -1,6 +1,10 @@
 # @package _global_
 # PatchICL method configuration
 
+preprocessing:
+  image_size: [128, 128, 128]
+
+
 method: "patch_icl"
 feature_mode: "on_the_fly"
 
@@ -9,7 +13,7 @@ model:
     feature_extractor:
       type: "universeg"
       layer_idx: "all"
-      target_size: 512
+      target_size: 128
       output_grid_size: 64
       freeze: true
 

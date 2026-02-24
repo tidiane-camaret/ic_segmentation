@@ -167,7 +167,7 @@ def extract_patch_features(
 
 def compute_entropy_confidence(
     logits: torch.Tensor,
-    temperature: float = 1.0,
+    temperature: float | torch.Tensor = 1.0,
 ) -> torch.Tensor:
     """Compute confidence from binary prediction entropy.
 
@@ -181,13 +181,14 @@ def compute_entropy_confidence(
 
     Args:
         logits: [B, K, C, H, W] - raw prediction logits
-        temperature: temperature for logit scaling (default 1.0)
+        temperature: temperature for logit scaling (default 1.0), can be learnable tensor
 
     Returns:
         confidence: [B, K, 1, H, W] - confidence in [0, 1]
     """
-    # Apply temperature scaling before sigmoid
-    scaled_logits = logits / temperature if temperature != 1.0 else logits
+    # Apply temperature scaling before sigmoid (supports learnable tensor)
+    is_unit_temp = (temperature == 1.0) if isinstance(temperature, (int, float)) else False
+    scaled_logits = logits if is_unit_temp else logits / temperature
     p = torch.sigmoid(scaled_logits)
     p = p.clamp(1e-6, 1 - 1e-6)
     entropy = -(p * p.log() + (1 - p) * (1 - p).log())
@@ -338,7 +339,14 @@ class PatchICL(nn.Module):
 
         # Temperature scaling for entropy confidence (calibration)
         # T > 1.0 softens overconfident predictions, T < 1.0 sharpens
-        self.confidence_temperature = conf_cfg.get('temperature', 1.0)
+        # Can be learned via learn_temperature: true
+        init_temp = conf_cfg.get('temperature', 1.0)
+        self.learn_temperature = conf_cfg.get('learn_temperature', False)
+        if self.learn_temperature:
+            # Store log(T) as learnable parameter; T = exp(log_T) ensures T > 0
+            self._log_temperature = nn.Parameter(torch.tensor(math.log(init_temp)))
+        else:
+            self.register_buffer('_log_temperature', torch.tensor(math.log(init_temp)))
 
         # Confidence loss config
         self.confidence_enabled = conf_cfg.get('enabled', False)
@@ -392,6 +400,11 @@ class PatchICL(nn.Module):
             use_context_mask=backbone_cfg.get('use_context_mask', False),
             predict_confidence=backbone_cfg.get('predict_confidence', False),
         )
+
+    @property
+    def confidence_temperature(self) -> torch.Tensor:
+        """Get current temperature value (always positive via exp)."""
+        return self._log_temperature.exp()
 
     def set_loss_functions(self, patch_criterion: nn.Module, aggreg_criterion: nn.Module):
         """Set the loss functions for patch and aggreg losses."""
@@ -498,7 +511,7 @@ class PatchICL(nn.Module):
         Returns:
             coverage_mask: [B, 1, H, W] - 1 where patches cover, 0 elsewhere
         """
-        B, K, _ = coords.shape
+        B, _K, _ = coords.shape
         H, W = output_size
         device = coords.device
 
@@ -599,7 +612,7 @@ class PatchICL(nn.Module):
         W: int,
         return_attn_weights: bool = False,
         mask_prior: torch.Tensor | None = None,
-    ) -> tuple[dict, torch.Tensor]:
+    ) -> tuple[dict, torch.Tensor, torch.Tensor | None]:
         """Process a single resolution level.
 
         Args:
@@ -609,6 +622,7 @@ class PatchICL(nn.Module):
         Returns:
             level_out: Dict with all level outputs (patches, logits, coords, etc.)
             pred: Aggregated prediction logits [B, C, resolution, resolution]
+            aggregated_conf: Aggregated confidence map or None
         """
         level_cfg = self.levels[level_idx]
         resolution = level_cfg['resolution']
@@ -757,21 +771,15 @@ class PatchICL(nn.Module):
             patch_logits = all_logits[:, :K]
             context_patch_logits = all_logits[:, K:]
 
-            # Extract confidence predictions
+            # Extract confidence predictions (only for target patches - context doesn't use confidence)
             all_confidence = backbone_out.get('confidence_preds')
             patch_confidence = None
-            context_patch_confidence = None
             if self.confidence_method == 'entropy':
-                # Compute confidence from prediction entropy with temperature calibration
                 patch_confidence = compute_entropy_confidence(
                     patch_logits, temperature=self.confidence_temperature
                 )
-                context_patch_confidence = compute_entropy_confidence(
-                    context_patch_logits, temperature=self.confidence_temperature
-                )
             elif all_confidence is not None:
                 patch_confidence = all_confidence[:, :K]
-                context_patch_confidence = all_confidence[:, K:]
 
             # Aggregate context predictions
             context_preds = []
@@ -1020,6 +1028,7 @@ class PatchICL(nn.Module):
         validity: torch.Tensor | None,
     ) -> torch.Tensor:
         """Compute patch loss, masking out invalid (out-of-image) pixels."""
+        assert self.patch_criterion is not None, "Call set_loss_functions() first"
         if validity is None:
             return self.patch_criterion(logits, labels)
         # For invalid pixels: set logit to -100 (sigmoid~0) and label to 0,
@@ -1173,6 +1182,10 @@ class PatchICL(nn.Module):
             losses['conf_boundary_loss'] = sum_conf_boundary / self.num_levels
 
         losses['total_loss'] = total_loss
+
+        # Log learned temperature if applicable
+        if self.confidence_method == 'entropy':
+            losses['confidence_temperature'] = self.confidence_temperature.detach()
 
         # Aggregated losses for logging (mean across levels)
         n = self.num_levels

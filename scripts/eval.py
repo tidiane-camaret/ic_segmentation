@@ -2,13 +2,14 @@
 eval script
 for each case in val set:
 - save img/gt/pred logits/probits as npz
-- save attention maps and register tokens 
+- save attention maps and register tokens
 """
 import datetime
 import sys
 from pathlib import Path
 
 import hydra
+import numpy as np
 import torch
 from datetime import datetime
 
@@ -73,6 +74,146 @@ def measure_flops(model, val_loader, device, accelerator=None):
         "gflops_per_sample": per_sample / 1e9,
         "batch_size": batch_size,
     }
+
+
+@torch.no_grad()
+def save_register_tokens_eval(
+    model,
+    val_loader,
+    device,
+    save_dir: Path,
+    accelerator=None,
+    save_images: bool = False,
+):
+    """Run evaluation and save register tokens per case to disk.
+
+    Saves for each case:
+    - level{i}_register_tokens.npy: [R, D] register tokens per level
+    - metadata.npz: case_id, label_id, axis, dice score
+    Optionally (if save_images=True):
+    - img.npy, gt_mask.npy, pred_mask.npy (uncompressed numpy for speed)
+    """
+    from src.models.patch_icl_v2.metrics import compute_per_sample_dice
+
+    model.eval()
+    is_main = accelerator is None or accelerator.is_main_process
+
+    save_dir = Path(save_dir)
+    if is_main:
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    pbar = tqdm(
+        val_loader,
+        desc="Saving register tokens",
+        disable=not is_main,
+        unit="batch",
+        dynamic_ncols=True,
+    )
+
+    case_count = 0
+    for batch_idx, batch in enumerate(pbar):
+        images = batch["image"].to(device)
+        labels = batch["label"].to(device)
+
+        context_in = batch.get("context_in")
+        context_out = batch.get("context_out")
+        if context_in is not None:
+            context_in = context_in.to(device)
+        if context_out is not None:
+            context_out = context_out.to(device)
+
+        target_features = batch.get("target_features")
+        context_features = batch.get("context_features")
+        if target_features is not None:
+            target_features = target_features.to(device)
+        if context_features is not None:
+            context_features = context_features.to(device)
+
+        if labels.dim() == 3:
+            labels = labels.unsqueeze(1)
+
+        outputs = model(
+            images,
+            labels=labels,
+            context_in=context_in,
+            context_out=context_out,
+            target_features=target_features,
+            context_features=context_features,
+            mode="val",
+            return_attn_weights=True,  # Required to get register tokens
+        )
+
+        # Compute per-sample dice
+        per_sample_dice = compute_per_sample_dice(outputs, labels)
+
+        # Get case/label identifiers
+        batch_case_ids = batch.get("target_case_ids") or batch.get(
+            "case_id", [None] * images.shape[0]
+        )
+        batch_label_ids = batch.get("label_ids") or batch.get(
+            "label_id", [None] * images.shape[0]
+        )
+        batch_axes = batch.get("axes", [None] * images.shape[0])
+
+        level_outputs = outputs.get("level_outputs", [])
+
+        # Process each sample in batch
+        for i in range(images.shape[0]):
+            case_id = batch_case_ids[i] if batch_case_ids else f"case{case_count:04d}"
+            label_id = batch_label_ids[i] if batch_label_ids else "unk"
+            axis = batch_axes[i] if batch_axes else "unk"
+            dice = per_sample_dice[i].item()
+            case_dir = save_dir / f"{case_id}_{label_id}_{axis}"
+            case_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save register tokens, attention weights, and patch mask percentages per level
+            for level_idx, level_out in enumerate(level_outputs):
+                register_tokens = level_out.get("register_tokens")
+                if register_tokens is not None:
+                    reg_np = register_tokens[i].cpu().numpy()  # [R, D]
+                    np.save(case_dir / f"level{level_idx}_register_tokens.npy", reg_np)
+
+                attn_weights = level_out.get("attn_weights")
+                if attn_weights is not None:
+                    # attn_weights is a list of [B, H, K, K+1] tensors per layer
+                    # Last column is attention to zero_attn token
+                    for layer_idx, layer_attn in enumerate(attn_weights):
+                        attn_np = layer_attn[i].cpu().numpy()  # [H, K, K+1]
+                        np.save(
+                            case_dir / f"level{level_idx}_layer{layer_idx}_attn_weights.npy",
+                            attn_np,
+                        )
+
+                # Save patch mask percentages (for correlation with zero_attn)
+                patch_labels = level_out.get("patch_labels")
+                if patch_labels is not None:
+                    # patch_labels: [B, K, 1, ps, ps] -> compute mean per patch
+                    mask_pct = patch_labels[i].mean(dim=(1, 2, 3)).cpu().numpy()  # [K]
+                    np.save(case_dir / f"level{level_idx}_patch_mask_pct.npy", mask_pct)
+
+            # Save minimal metadata
+            np.savez(
+                case_dir / "metadata.npz",
+                case_id=case_id,
+                label_id=label_id,
+                axis=axis,
+                dice=dice,
+            )
+
+            # Optionally save images (uncompressed .npy for speed)
+            if save_images:
+                np.save(case_dir / "img.npy", images[i, 0].cpu().numpy())
+                np.save(case_dir / "gt_mask.npy", labels[i, 0].cpu().numpy())
+                final_logit = outputs.get("final_logit")
+                if final_logit is not None:
+                    pred_prob = torch.sigmoid(final_logit[i, 0]).cpu().numpy()
+                    np.save(case_dir / "pred_mask.npy", pred_prob)
+
+            case_count += 1
+
+        pbar.set_postfix({"cases": case_count})
+
+    return case_count
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="eval")
@@ -428,6 +569,19 @@ def main(cfg: DictConfig) -> None:
             print(f"Saving evaluation images to: {save_dir}")
     else:
         save_dir = None
+
+    # Save register tokens per case (separate from validation)
+    save_register_tokens = cfg.logging.get("save_register_tokens", False)
+    if save_register_tokens and accelerator.is_main_process:
+        date_str = datetime.today().strftime('%Y-%m-%d')
+        register_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}_register_tokens"
+        print(f"Saving register tokens to: {register_dir}")
+        save_register_images = cfg.logging.get("save_register_images", False)
+        n_cases = save_register_tokens_eval(
+            model, val_loader, device, register_dir, accelerator,
+            save_images=save_register_images,
+        )
+        print(f"Saved register tokens for {n_cases} cases")
 
     val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
         model, val_loader, device,

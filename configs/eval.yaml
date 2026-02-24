@@ -5,3 +5,4 @@ defaults:
 
 class_balanced: false
 context_size: 10
+slice_coverage_ratio: 0.5
