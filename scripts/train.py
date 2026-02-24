@@ -14,6 +14,14 @@ from src.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate, wait_for_image_saves
 
 
+def _get_image_size(cfg) -> tuple[int, int]:
+    """Get image size as tuple, handling both scalar and list formats."""
+    img_size = cfg.preprocessing.image_size
+    if isinstance(img_size, (list, tuple)):
+        return tuple(img_size[:2])
+    return (img_size, img_size)
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     """Main training function."""
@@ -108,7 +116,7 @@ def main(cfg: DictConfig) -> None:
             split="train",
             context_size=cfg.context_size,
             batch_size=cfg.train_batch_size,
-            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
             shuffle=True,
             augment=use_image_augmentation,
@@ -121,7 +129,7 @@ def main(cfg: DictConfig) -> None:
             split="val",
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,
-            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
             shuffle=False,
             augment=False,
@@ -207,7 +215,7 @@ def main(cfg: DictConfig) -> None:
             label_id_list=train_labels,
             context_size=cfg.context_size,
             batch_size=cfg.train_batch_size,
-            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            image_size=_get_image_size(cfg),
             crop_to_bbox=cfg.preprocessing.crop_to_bbox,
             bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
@@ -235,7 +243,7 @@ def main(cfg: DictConfig) -> None:
             label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,
-            image_size=tuple(cfg.preprocessing.image_size[:2]),
+            image_size=_get_image_size(cfg),
             crop_to_bbox=cfg.preprocessing.crop_to_bbox,
             bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
@@ -351,12 +359,14 @@ def main(cfg: DictConfig) -> None:
                     pretrained=fe_cfg.get("pretrained", True) if fe_cfg else True,
                     freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
                     output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    input_size=fe_cfg.get("input_size", 128) if fe_cfg else 128,
                 )
                 if accelerator.is_main_process:
                     info = feature_extractor.get_feature_info()
                     print(
                         f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
-                        f"dim={info['feature_dim']}, grid={info['output_grid_size']})"
+                        f"dim={info['feature_dim']}, input={info['input_size']}x{info['input_size']}, "
+                        f"grid={info['output_grid_size']})"
                     )
             elif extractor_type == "icl_encoder":
                 from src.models.icl_encoder import ICLEncoder

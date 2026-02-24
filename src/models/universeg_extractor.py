@@ -72,9 +72,11 @@ class UniverSegExtractor(nn.Module):
         freeze: Freeze all model weights.
         output_grid_size: Resize features to this grid. None = native (single-layer only).
             Required when using multiple layers since they have different native sizes.
+        input_size: Input image size. Images are resized to this before feature extraction.
+            Default 128 (UniverSeg native size).
     """
 
-    INPUT_SIZE = 256  # UniverSeg expects 128x128
+    DEFAULT_INPUT_SIZE = 128  # UniverSeg native input size
     FEATURE_DIM_PER_LAYER = 64  # Each encoder block outputs 64 channels
 
     def __init__(
@@ -84,9 +86,11 @@ class UniverSegExtractor(nn.Module):
         pretrained: bool = True,
         freeze: bool = True,
         output_grid_size: Optional[int] = None,
+        input_size: int = 128,
     ):
         super().__init__()
         self.device = torch.device(device) if isinstance(device, str) else device
+        self.input_size = input_size
 
         # Parse layer indices
         self.layer_indices = _parse_layer_idx(layer_idx)
@@ -120,6 +124,7 @@ class UniverSegExtractor(nn.Module):
         layers_str = "all" if layer_idx == "all" else self.layer_indices
         print(f"UniverSeg extractor: layers={layers_str}, "
               f"feature_dim={self.feature_dim}, "
+              f"input={self.input_size}x{self.input_size}, "
               f"output={self.output_grid_size}x{self.output_grid_size}")
 
     def _load_model(self, pretrained: bool):
@@ -190,11 +195,11 @@ class UniverSegExtractor(nn.Module):
         flat = (flat - img_min) / (img_max - img_min).clamp(min=1e-8)
         images = flat.view(B, 1, images.shape[2], images.shape[3])
 
-        # Resize to 128x128
-        if images.shape[-2:] != (self.INPUT_SIZE, self.INPUT_SIZE):
+        # Resize to target_size
+        if images.shape[-2:] != (self.input_size, self.input_size):
             images = F.interpolate(
                 images,
-                size=(self.INPUT_SIZE, self.INPUT_SIZE),
+                size=(self.input_size, self.input_size),
                 mode="bilinear",
                 align_corners=False,
             )
@@ -202,19 +207,19 @@ class UniverSegExtractor(nn.Module):
         if masks is not None:
             # Self-support: image is its own support, with real mask
             masks = masks.float()
-            if masks.shape[-2:] != (self.INPUT_SIZE, self.INPUT_SIZE):
+            if masks.shape[-2:] != (self.input_size, self.input_size):
                 masks = F.interpolate(
                     masks,
-                    size=(self.INPUT_SIZE, self.INPUT_SIZE),
+                    size=(self.input_size, self.input_size),
                     mode="nearest",
                 )
             support_images = images.unsqueeze(1)  # [B, 1, 1, H, W]
             support_labels = masks.unsqueeze(1)    # [B, 1, 1, H, W]
         else:
             # Dummy support: zeros (image-only features)
-            support_images = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
+            support_images = torch.zeros(B, 1, 1, self.input_size, self.input_size,
                                          device=device, dtype=torch.float32)
-            support_labels = torch.zeros(B, 1, 1, self.INPUT_SIZE, self.INPUT_SIZE,
+            support_labels = torch.zeros(B, 1, 1, self.input_size, self.input_size,
                                          device=device, dtype=torch.float32)
 
         # Register hooks to capture features at each requested layer
@@ -317,7 +322,7 @@ class UniverSegExtractor(nn.Module):
             "feature_dim": self.feature_dim,
             "feature_dim_per_layer": self.FEATURE_DIM_PER_LAYER,
             "num_layers": len(self.layer_indices),
-            "input_size": self.INPUT_SIZE,
+            "input_size": self.input_size,
             "native_grid_size": self.native_grid_size,
             "output_grid_size": grid,
             "num_tokens": grid * grid,

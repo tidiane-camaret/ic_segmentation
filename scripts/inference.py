@@ -129,6 +129,7 @@ def create_feature_extractor(config: dict, device: str = "cuda"):
             pretrained=fe_cfg.get('pretrained', True),
             freeze=fe_cfg.get('freeze', True),
             output_grid_size=fe_cfg.get('output_grid_size'),
+            input_size=fe_cfg.get('input_size', 128),
         )
 
     else:

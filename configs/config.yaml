@@ -33,6 +33,7 @@ medsegbench:
 
 # Preprocessing
 preprocessing:
+  image_size: 128
   spacing: [1.5, 1.5, 1.5]
   crop_to_bbox: false
   bbox_padding: 20
