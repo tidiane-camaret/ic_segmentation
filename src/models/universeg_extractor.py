@@ -1,7 +1,8 @@
 """
 UniverSeg Feature Extractor for on-the-fly feature computation.
 
-Extracts per-image features from UniverSeg encoder blocks using forward hooks.
+Extracts per-image features from UniverSeg encoder blocks directly (encoder-only,
+skipping decoder for efficiency).
 
 For target images (no mask): dummy support (zeros) is used.
 For context images (with mask): self-support trick — the image is passed as both
@@ -59,8 +60,8 @@ def _parse_layer_idx(layer_idx) -> List[int]:
 class UniverSegExtractor(nn.Module):
     """Extract per-image features from UniverSeg encoder blocks.
 
-    Uses forward hooks to capture intermediate features. A single dummy
-    support (zeros) is passed so the cross-conv sees no real context.
+    Runs encoder blocks directly (skipping decoder for efficiency). A single
+    dummy support (zeros) is passed so the cross-conv sees no real context.
 
     Args:
         layer_idx: Encoder block(s) to extract from. Options:
@@ -74,6 +75,8 @@ class UniverSegExtractor(nn.Module):
             Required when using multiple layers since they have different native sizes.
         input_size: Input image size. Images are resized to this before feature extraction.
             Default 128 (UniverSeg native size).
+        skip_preprocess: If True, skip percentile normalization (assumes dataloader
+            already normalized images to [0, 1]). Saves ~7% compute. Default False.
     """
 
     DEFAULT_INPUT_SIZE = 128  # UniverSeg native input size
@@ -87,10 +90,12 @@ class UniverSegExtractor(nn.Module):
         freeze: bool = True,
         output_grid_size: Optional[int] = None,
         input_size: int = 128,
+        skip_preprocess: bool = False,
     ):
         super().__init__()
         self.device = torch.device(device) if isinstance(device, str) else device
         self.input_size = input_size
+        self.skip_preprocess = skip_preprocess
 
         # Parse layer indices
         self.layer_indices = _parse_layer_idx(layer_idx)
@@ -125,13 +130,16 @@ class UniverSegExtractor(nn.Module):
         print(f"UniverSeg extractor: layers={layers_str}, "
               f"feature_dim={self.feature_dim}, "
               f"input={self.input_size}x{self.input_size}, "
-              f"output={self.output_grid_size}x{self.output_grid_size}")
+              f"output={self.output_grid_size}x{self.output_grid_size}, "
+              f"skip_preprocess={self.skip_preprocess}")
 
     def _load_model(self, pretrained: bool):
         """Load UniverSeg model."""
         if UNIVERSEG_REPO not in sys.path:
             sys.path.insert(0, UNIVERSEG_REPO)
         from universeg import universeg
+        from universeg.nn import vmap
+        self._vmap = vmap  # Store for use in encoder-only forward
         self.model = universeg(pretrained=pretrained).to(self.device)
         print(f"UniverSeg loaded (pretrained={pretrained})")
 
@@ -154,13 +162,47 @@ class UniverSegExtractor(nn.Module):
             mode="bilinear", align_corners=False,
         )
 
+    def _encoder_only_forward(
+        self,
+        images: torch.Tensor,
+        support_images: torch.Tensor,
+        support_labels: torch.Tensor,
+    ) -> dict[int, torch.Tensor]:
+        """Run encoder blocks only, skipping decoder entirely.
+
+        Args:
+            images: [B, 1, H, W] preprocessed images
+            support_images: [B, 1, 1, H, W] support images
+            support_labels: [B, 1, 1, H, W] support labels
+
+        Returns:
+            Dict mapping layer_idx to features [B, 64, H, W]
+        """
+        # Reshape to UniverSeg expected format: [B, 1, 1, H, W]
+        # images is [B, 1, H, W], need [B, 1, 1, H, W]
+        target = images.unsqueeze(2)
+        support = torch.cat([support_images, support_labels], dim=2)
+
+        max_layer = max(self.layer_indices)
+        captured = {}
+
+        for i in range(max_layer + 1):
+            target, support = self.model.enc_blocks[i](target, support)
+            if i in self.layer_indices:
+                captured[i] = target[:, 0]  # [B, C, H, W]
+            if i < max_layer:
+                target = self._vmap(self.model.downsample, target)
+                support = self._vmap(self.model.downsample, support)
+
+        return captured
+
     @torch.no_grad()
     def extract_features(
         self,
         images: torch.Tensor,
         masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Extract features from encoder block(s) via forward hooks.
+        """Extract features from encoder block(s) directly (encoder-only, no decoder).
 
         Args:
             images: [B, 1, H, W] grayscale images, normalized to [0, 1]
@@ -180,22 +222,23 @@ class UniverSegExtractor(nn.Module):
             self.model.to(device)
 
         B = images.shape[0]
-        original_dtype = images.dtype
 
         # Force float32 for numerical stability (UniverSeg not compatible with float16)
         images = images.float()
 
-        # Batched percentile normalization to handle outliers (prevents NaN)
-        flat = images[:, 0].reshape(B, -1)
-        lower = torch.quantile(flat, 0.005, dim=1, keepdim=True)
-        upper = torch.quantile(flat, 0.995, dim=1, keepdim=True)
-        flat = torch.clamp(flat, lower, upper)
-        img_min = flat.min(dim=1, keepdim=True)[0]
-        img_max = flat.max(dim=1, keepdim=True)[0]
-        flat = (flat - img_min) / (img_max - img_min).clamp(min=1e-8)
-        images = flat.view(B, 1, images.shape[2], images.shape[3])
+        if not self.skip_preprocess:
+            # Batched percentile normalization to handle outliers (prevents NaN)
+            # Skip if dataloader already normalized to [0, 1]
+            flat = images[:, 0].reshape(B, -1)
+            lower = torch.quantile(flat, 0.005, dim=1, keepdim=True)
+            upper = torch.quantile(flat, 0.995, dim=1, keepdim=True)
+            flat = torch.clamp(flat, lower, upper)
+            img_min = flat.min(dim=1, keepdim=True)[0]
+            img_max = flat.max(dim=1, keepdim=True)[0]
+            flat = (flat - img_min) / (img_max - img_min).clamp(min=1e-8)
+            images = flat.view(B, 1, images.shape[2], images.shape[3])
 
-        # Resize to target_size
+        # Resize to input_size if needed
         if images.shape[-2:] != (self.input_size, self.input_size):
             images = F.interpolate(
                 images,
@@ -222,25 +265,8 @@ class UniverSegExtractor(nn.Module):
             support_labels = torch.zeros(B, 1, 1, self.input_size, self.input_size,
                                          device=device, dtype=torch.float32)
 
-        # Register hooks to capture features at each requested layer
-        captured = {}
-        handles = []
-
-        def make_hook(layer_id):
-            def hook_fn(module, input, output):
-                target, support = output
-                captured[layer_id] = target[:, 0]  # [B, C, H, W]
-            return hook_fn
-
-        for lid in self.layer_indices:
-            h = self.model.enc_blocks[lid].register_forward_hook(make_hook(lid))
-            handles.append(h)
-
-        # Forward pass (output is discarded, we only want the hooked features)
-        self.model(images, support_images, support_labels)
-
-        for h in handles:
-            h.remove()
+        # Run encoder only (skip decoder for efficiency)
+        captured = self._encoder_only_forward(images, support_images, support_labels)
 
         # Collect and resize features from each layer
         feat_list = []
@@ -326,4 +352,5 @@ class UniverSegExtractor(nn.Module):
             "native_grid_size": self.native_grid_size,
             "output_grid_size": grid,
             "num_tokens": grid * grid,
+            "skip_preprocess": self.skip_preprocess,
         }

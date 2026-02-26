@@ -256,6 +256,7 @@ class TotalSeg2DDataset(Dataset):
 
     def _setup_universeg_augmentation(self, cfg: Dict):
         """Setup UniverSeg-style two-level augmentation."""
+        self.universeg_full_config = cfg  # Store full config for apply_universeg_augmentation
         self.universeg_task_config = cfg.get("task", {})
         self.universeg_example_config = cfg.get("example", {})
 
@@ -725,8 +726,7 @@ class TotalSeg2DDataset(Dataset):
             target_mask=target_mask,
             context_imgs=context_imgs,
             context_masks=context_masks,
-            task_config=self.universeg_task_config,
-            example_config=self.universeg_example_config,
+            full_config=self.universeg_full_config,
         )
 
     def _apply_unified_augmentation(

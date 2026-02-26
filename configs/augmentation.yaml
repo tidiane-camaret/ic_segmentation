@@ -2,4 +2,4 @@
 # For legacy config, use: augmentation=augmentation/legacy
 
 defaults:
-  - augmentation/universeg
+  - augmentation/custom

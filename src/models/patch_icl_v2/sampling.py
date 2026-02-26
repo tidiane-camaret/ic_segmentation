@@ -214,6 +214,7 @@ class ContinuousSampler(nn.Module):
         augmenter: PatchAugmenter | None = None,
         pad_before: int | None = None,
         pad_after: int | None = None,
+        extract_patches: bool = False,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -224,6 +225,7 @@ class ContinuousSampler(nn.Module):
         self.augmenter = augmenter
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.extract_patches = extract_patches
 
     def forward(
         self,
@@ -302,9 +304,13 @@ class ContinuousSampler(nn.Module):
         cols_2d = (w_coords_pad.unsqueeze(-1) + col_offsets).unsqueeze(-2).expand(B, K, ps, ps)
         flat_idx = (rows_2d * W_pad + cols_2d).reshape(B, K * ps * ps)
 
-        img_flat = image_pad.reshape(B, C, -1)
-        patches = img_flat.gather(2, flat_idx.unsqueeze(1).expand(B, C, -1))
-        patches = patches.reshape(B, C, K, ps, ps).permute(0, 2, 1, 3, 4)
+        # Only extract image patches if needed (labels/validity always needed)
+        if self.extract_patches:
+            img_flat = image_pad.reshape(B, C, -1)
+            patches = img_flat.gather(2, flat_idx.unsqueeze(1).expand(B, C, -1))
+            patches = patches.reshape(B, C, K, ps, ps).permute(0, 2, 1, 3, 4)
+        else:
+            patches = None
 
         lbl_flat = labels_pad.reshape(B, C_mask, -1)
         patch_labels = lbl_flat.gather(2, flat_idx.unsqueeze(1).expand(B, C_mask, -1))
@@ -322,13 +328,13 @@ class ContinuousSampler(nn.Module):
         # Apply augmentation (validity is augmented alongside labels)
         aug_params = {}
         aug_features = patch_features
-        if self.augmenter is not None:
+        if self.augmenter is not None and patches is not None:
             combined = torch.cat([patch_labels, patch_validity], dim=2)
             patches, combined, aug_features, aug_params = self.augmenter(patches, combined, patch_features)
             patch_labels = combined[:, :, :C_mask]
             patch_validity = combined[:, :, C_mask:]
 
-        return patches, patch_labels, coords, aug_features, aug_params, patch_validity
+        return patches, patch_labels, coords, aug_features, aug_params, patch_validity, K
 
 
 class SlidingWindowSampler(nn.Module):
@@ -343,6 +349,7 @@ class SlidingWindowSampler(nn.Module):
         augmenter: PatchAugmenter | None = None,
         pad_before: int | None = None,
         pad_after: int | None = None,
+        extract_patches: bool = False,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -352,6 +359,7 @@ class SlidingWindowSampler(nn.Module):
         self.augmenter = augmenter
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.extract_patches = extract_patches
 
     def forward(
         self,
@@ -391,10 +399,14 @@ class SlidingWindowSampler(nn.Module):
 
         grid_h = max(1, (H_pad - ps) // stride + 1)
         grid_w = max(1, (W_pad - ps) // stride + 1)
+        K = grid_h * grid_w
 
         # Extract patches using unfold on padded tensors
-        patches_unfolded = image_pad.unfold(2, ps, stride).unfold(3, ps, stride)
-        patches = patches_unfolded.reshape(B, C, -1, ps, ps).permute(0, 2, 1, 3, 4)
+        if self.extract_patches:
+            patches_unfolded = image_pad.unfold(2, ps, stride).unfold(3, ps, stride)
+            patches = patches_unfolded.reshape(B, C, -1, ps, ps).permute(0, 2, 1, 3, 4)
+        else:
+            patches = None
 
         labels_unfolded = labels_pad.unfold(2, ps, stride).unfold(3, ps, stride)
         patch_labels = labels_unfolded.reshape(B, C_mask, -1, ps, ps).permute(0, 2, 1, 3, 4)
@@ -413,13 +425,13 @@ class SlidingWindowSampler(nn.Module):
         # Apply augmentation (validity is augmented alongside labels)
         aug_params = {}
         aug_features = patch_features
-        if self.augmenter is not None:
+        if self.augmenter is not None and patches is not None:
             combined = torch.cat([patch_labels, patch_validity], dim=2)
             patches, combined, aug_features, aug_params = self.augmenter(patches, combined, patch_features)
             patch_labels = combined[:, :, :C_mask]
             patch_validity = combined[:, :, C_mask:]
 
-        return patches, patch_labels, coords, aug_features, aug_params, patch_validity
+        return patches, patch_labels, coords, aug_features, aug_params, patch_validity, K
 
 
 def create_sampler(
@@ -432,6 +444,7 @@ def create_sampler(
     augmenter: PatchAugmenter | None = None,
     pad_before: int | None = None,
     pad_after: int | None = None,
+    extract_patches: bool = False,
 ) -> nn.Module:
     """Factory function to create samplers from config."""
     if sampler_type == "continuous":
@@ -444,6 +457,7 @@ def create_sampler(
             augmenter=augmenter,
             pad_before=pad_before,
             pad_after=pad_after,
+            extract_patches=extract_patches,
         )
     elif sampler_type == "sliding_window":
         return SlidingWindowSampler(
@@ -454,6 +468,7 @@ def create_sampler(
             augmenter=augmenter,
             pad_before=pad_before,
             pad_after=pad_after,
+            extract_patches=extract_patches,
         )
     else:
         raise ValueError(f"Unknown sampler type: {sampler_type}. Use 'continuous' or 'sliding_window'.")

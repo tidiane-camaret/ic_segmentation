@@ -1,3 +1,4 @@
+# @package _global_
 # UniverSeg-style augmentation config
 # Two-level augmentation: task-level (consistent) + example-level (per-image)
 

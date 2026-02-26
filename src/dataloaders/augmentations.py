@@ -1,15 +1,9 @@
-import pickle
 import random
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import albumentations as A
-import nibabel as nib
 import numpy as np
-import torch
-from torch.utils.data import DataLoader, Dataset
 import cv2
-from data.label_ids_totalseg import get_label_ids
 
 def create_augmentation_transforms(
     img_size: int = 512,
@@ -557,24 +551,21 @@ def apply_elastic_transform(
     alpha_range: Tuple[float, float] = (1, 2),
     sigma_range: Tuple[float, float] = (6, 8),
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply elastic deformation. UniverSeg Augmentation.
-
-    Note: UniverSeg uses lower alpha (1-2) compared to typical medical imaging (50-120).
-    """
     alpha = random.uniform(*alpha_range)
     sigma = random.uniform(*sigma_range)
 
     H, W = img.shape[:2]
 
-    # Random displacement fields
+    # CORRECTED: Removed '* W' and '* H'
     dx = cv2.GaussianBlur(
         (np.random.rand(H, W) * 2 - 1).astype(np.float32),
         (0, 0), sigma
-    ) * alpha * W
+    ) * alpha 
+    
     dy = cv2.GaussianBlur(
         (np.random.rand(H, W) * 2 - 1).astype(np.float32),
         (0, 0), sigma
-    ) * alpha * H
+    ) * alpha
 
     # Create meshgrid
     x, y = np.meshgrid(np.arange(W), np.arange(H))
@@ -649,17 +640,21 @@ def apply_universeg_task_augmentation(
         tx_frac = random.uniform(-cfg.get("translate_max", 0.2), cfg.get("translate_max", 0.2))
         ty_frac = random.uniform(-cfg.get("translate_max", 0.2), cfg.get("translate_max", 0.2))
 
-    # Generate shared elastic displacement
+# Generate shared elastic displacement
     if do_elastic:
         H, W = images[0].shape[:2]
         alpha = random.uniform(*cfg.get("elastic_alpha", (1, 2)))
         sigma = random.uniform(*cfg.get("elastic_sigma", (6, 8)))
+        
+        # CORRECTED: Removed '* W' and '* H'
         dx = cv2.GaussianBlur(
             (np.random.rand(H, W) * 2 - 1).astype(np.float32), (0, 0), sigma
-        ) * alpha * W
+        ) * alpha
+        
         dy = cv2.GaussianBlur(
             (np.random.rand(H, W) * 2 - 1).astype(np.float32), (0, 0), sigma
-        ) * alpha * H
+        ) * alpha
+
         x, y = np.meshgrid(np.arange(W), np.arange(H))
         map_x = (x + dx).astype(np.float32)
         map_y = (y + dy).astype(np.float32)
@@ -795,7 +790,7 @@ def apply_universeg_example_augmentation(
     if random.random() < cfg.get("blur_p", 0.25):
         img = apply_gaussian_blur(
             img,
-            kernel_size=cfg.get("blur_kernel", 50),  # Larger kernel
+            kernel_size=cfg.get("blur_kernel", 50),  # <--- Change this fallback to 5!
             sigma_range=cfg.get("blur_sigma", (0.1, 1.1)),
         )
 
@@ -819,33 +814,23 @@ def apply_universeg_augmentation(
     target_mask: np.ndarray,
     context_imgs: List[np.ndarray],
     context_masks: List[np.ndarray],
-    task_config: Optional[Dict] = None,
-    example_config: Optional[Dict] = None,
+    full_config: Dict,  # Pass the entire augmentation dictionary here
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
-    """Apply full UniverSeg two-level augmentation pipeline.
+    
+    # 1. Apply Medical Specific Augs (Cropping & Mix) FIRST
+    target_img, target_mask, context_imgs, context_masks = apply_medical_specialty_augs(
+        target_img, target_mask, context_imgs, context_masks, full_config
+    )
 
-    1. Task-level: Same transform applied to all (target + context)
-    2. Example-level: Different transform per context image
+    task_config = full_config.get("task", {})
+    example_config = full_config.get("example", {})
 
-    Args:
-        target_img: Target image [H, W]
-        target_mask: Target mask [H, W]
-        context_imgs: List of context images
-        context_masks: List of context masks
-        task_config: Config for task-level augmentation
-        example_config: Config for example-level augmentation
-
-    Returns:
-        Augmented target_img, target_mask, context_imgs, context_masks
-    """
-    # Combine all images for task-level augmentation
+    # 2. Combine all for task-level augmentation
     all_imgs = [target_img] + list(context_imgs)
     all_masks = [target_mask] + list(context_masks)
 
-    # Apply task-level augmentation (same transform to all)
-    all_imgs, all_masks = apply_universeg_task_augmentation(
-        all_imgs, all_masks, task_config
-    )
+    # 3. Apply standard UniverSeg task-level
+    all_imgs, all_masks = apply_universeg_task_augmentation(all_imgs, all_masks, task_config)
 
     # Split back
     target_img = all_imgs[0]
@@ -853,17 +838,78 @@ def apply_universeg_augmentation(
     context_imgs = all_imgs[1:]
     context_masks = all_masks[1:]
 
-    # Apply example-level augmentation (different per context image)
+    # 4. Apply standard UniverSeg example-level
     if example_config and example_config.get("enabled", True):
-        augmented_ctx_imgs = []
-        augmented_ctx_masks = []
+        augmented_ctx_imgs, augmented_ctx_masks = [], []
         for ctx_img, ctx_mask in zip(context_imgs, context_masks):
-            aug_img, aug_mask = apply_universeg_example_augmentation(
-                ctx_img, ctx_mask, example_config
-            )
+            aug_img, aug_mask = apply_universeg_example_augmentation(ctx_img, ctx_mask, example_config)
             augmented_ctx_imgs.append(aug_img)
             augmented_ctx_masks.append(aug_mask)
         context_imgs = augmented_ctx_imgs
         context_masks = augmented_ctx_masks
+
+    return target_img, target_mask, context_imgs, context_masks
+
+
+def apply_medical_specialty_augs(
+    target_img: np.ndarray,
+    target_mask: np.ndarray,
+    context_imgs: List[np.ndarray],
+    context_masks: List[np.ndarray],
+    config: Dict,
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
+    """Applies ROI-centric crops and CarveMix before standard UniverSeg augs."""
+    
+    cfg = config.get("medical_specialty", {})
+    if not cfg.get("enabled", False):
+        return target_img, target_mask, context_imgs, context_masks
+
+    # 1. CarveMix: Use a random context image as the donor for the target
+    if len(context_imgs) > 0 and random.random() < cfg.get("carvemix_p", 0.0):
+        donor_idx = random.randint(0, len(context_imgs) - 1)
+        donor_img = context_imgs[donor_idx]
+        donor_mask = context_masks[donor_idx]
+
+        target_img, target_mask = carve_mix_2d(
+            target_img, 
+            target_mask, 
+            donor_img, 
+            donor_mask,
+            margin_range=cfg.get("carvemix_margin", (0.1, 0.5)),
+            harmonize=cfg.get("harmonize", True),
+            harmonize_sigma=cfg.get("harmonize_sigma", 5.0)
+        )
+
+    # 2. Foreground Random Crop: Apply to Target
+    if random.random() < cfg.get("crop_p", 0.0):
+        target_img, target_mask = foreground_random_crop(
+            target_img, 
+            target_mask,
+            min_crop_frac=cfg.get("min_crop_frac", 0.5),
+            max_crop_frac=cfg.get("max_crop_frac", 1.0)
+        )
+
+    # 3. Foreground Random Crop: Apply to Context Images independently
+    new_ctx_imgs, new_ctx_masks = [], []
+    for c_img, c_mask in zip(context_imgs, context_masks):
+        if random.random() < cfg.get("crop_p", 0.0):
+            c_img, c_mask = foreground_random_crop(
+                c_img, 
+                c_mask,
+                min_crop_frac=cfg.get("min_crop_frac", 0.5),
+                max_crop_frac=cfg.get("max_crop_frac", 1.0)
+            )
+        new_ctx_imgs.append(c_img)
+        new_ctx_masks.append(c_mask)
+
+    # 4. Resize back to target resolution (256x256)
+    img_size = config.get("img_size", 256)
+    
+    target_img = cv2.resize(target_img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+    # Always use INTER_NEAREST for masks to prevent creating floating point labels!
+    target_mask = cv2.resize(target_mask, (img_size, img_size), interpolation=cv2.INTER_NEAREST)
+    
+    context_imgs = [cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR) for img in new_ctx_imgs]
+    context_masks = [cv2.resize(mask, (img_size, img_size), interpolation=cv2.INTER_NEAREST) for mask in new_ctx_masks]
 
     return target_img, target_mask, context_imgs, context_masks

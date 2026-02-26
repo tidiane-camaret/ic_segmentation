@@ -13,6 +13,7 @@ model:
       input_size: "${preprocessing.image_size}"
       output_grid_size: 64
       freeze: true
+      skip_preprocess: true  # Skip quantile normalization (dataloader already normalizes to [0,1])
 
     levels:
       - resolution: 18

@@ -656,21 +656,20 @@ class CrossPatchAttention(nn.Module):
         # Final norm
         x = self.final_norm(x)
 
-        # Capture register tokens before removing
+        # Always capture register tokens (needed for learned alpha)
         register_tokens_out = None
-        if return_attn_weights and self.register_tokens is not None:
+        if self.register_tokens is not None:
             register_tokens_out = x[:, :self.num_registers].clone()
 
         # Remove registers
         if self.register_tokens is not None:
             x = x[:, self.num_registers:]
 
-        extras = None
-        if return_attn_weights:
-            extras = {
-                'attn_weights': all_attn_weights,  # List of [B, H, K, K] per layer
-                'register_tokens': register_tokens_out,  # [B, R, D]
-            }
+        # Always return extras dict with register_tokens
+        extras = {
+            'attn_weights': all_attn_weights if return_attn_weights else None,
+            'register_tokens': register_tokens_out,  # [B, R, D]
+        }
 
         return x, extras
 

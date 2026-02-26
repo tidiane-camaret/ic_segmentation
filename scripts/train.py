@@ -360,13 +360,14 @@ def main(cfg: DictConfig) -> None:
                     freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
                     output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
                     input_size=fe_cfg.get("input_size", 128) if fe_cfg else 128,
+                    skip_preprocess=fe_cfg.get("skip_preprocess", True) if fe_cfg else True,
                 )
                 if accelerator.is_main_process:
                     info = feature_extractor.get_feature_info()
                     print(
                         f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
                         f"dim={info['feature_dim']}, input={info['input_size']}x{info['input_size']}, "
-                        f"grid={info['output_grid_size']})"
+                        f"grid={info['output_grid_size']}, skip_preprocess={info['skip_preprocess']})"
                     )
             elif extractor_type == "icl_encoder":
                 from src.models.icl_encoder import ICLEncoder
@@ -438,13 +439,35 @@ def main(cfg: DictConfig) -> None:
     start_epoch = 0
     if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        ckpt_state_dict = checkpoint["model_state_dict"]
+        model_state_dict = model.state_dict()
+
+        # Check for feature extractor weights in checkpoint
+        ckpt_fe_keys = [k for k in ckpt_state_dict.keys() if k.startswith("feature_extractor.")]
+        model_fe_keys = [k for k in model_state_dict.keys() if k.startswith("feature_extractor.")]
+
+        if accelerator.is_main_process:
+            if ckpt_fe_keys:
+                print(f"Checkpoint contains {len(ckpt_fe_keys)} feature_extractor keys")
+            if model_fe_keys and not ckpt_fe_keys:
+                print("WARNING: Model has feature_extractor but checkpoint does not - using fresh weights")
+
+        # Load with strict=False but track what was loaded
+        missing, unexpected = model.load_state_dict(ckpt_state_dict, strict=False)
+
         if not reset_optimizer:
             start_epoch = checkpoint.get("epoch", 0) + 1
         if accelerator.is_main_process:
             print(
                 f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})"
             )
+            if missing:
+                fe_missing = [k for k in missing if k.startswith("feature_extractor.")]
+                other_missing = [k for k in missing if not k.startswith("feature_extractor.")]
+                if fe_missing:
+                    print(f"WARNING: {len(fe_missing)} feature_extractor keys missing from checkpoint")
+                if other_missing:
+                    print(f"Note: {len(other_missing)} other keys missing from checkpoint")
             if reset_optimizer:
                 print("reset_optimizer=true: Starting fresh optimizer/scheduler (epoch 0)")
     else:

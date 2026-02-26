@@ -254,6 +254,13 @@ class PatchICL(nn.Module):
         self.sampler_type = sampler_cfg.get('type', 'continuous')
         self.default_stride = sampler_cfg.get('stride', None)
 
+        # Context sampling mode: align with target sampling strategy
+        # - "foreground": Original behavior, sample from GT foreground (default)
+        # - "border": Sample from object borders (where GT is uncertain after downsampling)
+        # - "entropy": Sample from high-entropy regions of soft GT
+        self.context_sampling_mode = sampler_cfg.get('context_sampling', 'foreground')
+        self.context_border_weight = sampler_cfg.get('context_border_weight', 0.5)
+
         # Augmenter (shared)
         aug_cfg = sampler_cfg.get('augmentation', {})
         if aug_cfg.get('enabled', False):
@@ -307,6 +314,7 @@ class PatchICL(nn.Module):
         self.loss_weights = {
             'target_patch': weights_cfg.get('target_patch', 1.0),
             'target_aggreg': weights_cfg.get('target_aggreg', 1.0),
+            'target_combined': weights_cfg.get('target_combined', 0.0),  # Loss on combined pred (for alpha grad)
             'context_patch': weights_cfg.get('context_patch', 1.0),
             'context_aggreg': weights_cfg.get('context_aggreg', 1.0),
         }
@@ -350,8 +358,8 @@ class PatchICL(nn.Module):
 
         # Confidence loss config
         self.confidence_enabled = conf_cfg.get('enabled', False)
-        self.confidence_supervision_weight = conf_cfg.get('supervision_weight', 0.5)
-        self.confidence_boundary_weight = conf_cfg.get('boundary_weight', 0.1)
+        self.confidence_supervision_weight = conf_cfg.get('supervision_weight', 0.0)
+        self.confidence_boundary_weight = conf_cfg.get('boundary_weight', 0.0)
         self.confidence_boundary_width = conf_cfg.get('boundary_width', 2)
         self.use_confidence_weighted_seg = conf_cfg.get('weighted_seg', False)
 
@@ -364,14 +372,16 @@ class PatchICL(nn.Module):
                 border_width=self.confidence_boundary_width,
             )
 
-        # Initialize confidence-weighted segmentation loss if enabled
-        if self.use_confidence_weighted_seg:
-            from src.losses import ConfidenceWeightedDiceLoss
-            self.conf_weighted_seg_loss = ConfidenceWeightedDiceLoss()
-
         # Cascade confidence blending config
         cascade_cfg = config.get('cascade', {})
         self.confidence_blend = cascade_cfg.get('confidence_blend', False)
+        self.use_learned_alpha = cascade_cfg.get('learned_alpha', False)
+        self.conf_weighted_aggreg = cascade_cfg.get('conf_weighted_aggreg', False)
+
+        # Initialize confidence-weighted segmentation loss if enabled (for patch or aggreg)
+        if self.use_confidence_weighted_seg or self.conf_weighted_aggreg:
+            from src.losses import ConfidenceWeightedDiceLoss
+            self.conf_weighted_seg_loss = ConfidenceWeightedDiceLoss()
 
         # Backbone (shared across levels, with level embedding)
         backbone_cfg = config.get('backbone', {})
@@ -400,6 +410,29 @@ class PatchICL(nn.Module):
             use_context_mask=backbone_cfg.get('use_context_mask', False),
             predict_confidence=backbone_cfg.get('predict_confidence', False),
         )
+
+        # Alpha predictor for learned level combination (simple linear on pooled registers)
+        if self.use_learned_alpha:
+            embed_proj_dim = backbone_cfg.get('embed_proj_dim', 128)
+            self.alpha_head = nn.Linear(embed_proj_dim, 1)
+            # Initialize with positive bias to favor current level initially
+            nn.init.constant_(self.alpha_head.bias, 1.0)  # sigmoid(1) ≈ 0.73
+
+    def compute_alpha(self, register_tokens: torch.Tensor) -> torch.Tensor:
+        """Compute combination weight α from register tokens.
+
+        Args:
+            register_tokens: [B, num_registers, D] from backbone
+
+        Returns:
+            alpha: [B, 1, 1, 1] for broadcasting to spatial dimensions
+        """
+        if not self.use_learned_alpha or register_tokens is None:
+            return None
+        # Pool registers and project to scalar
+        pooled = register_tokens.mean(dim=1)  # [B, D]
+        alpha = torch.sigmoid(self.alpha_head(pooled))  # [B, 1]
+        return alpha.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
 
     @property
     def confidence_temperature(self) -> torch.Tensor:
@@ -493,6 +526,57 @@ class PatchICL(nn.Module):
             return mask
         return mask.max(dim=1, keepdim=True)[0]
 
+    def _compute_context_sampling_weights(
+        self,
+        context_mask: torch.Tensor,
+        mode: str = 'foreground',
+        border_weight: float = 0.5,
+    ) -> torch.Tensor:
+        """Compute sampling weights for context patches.
+
+        Aligns context sampling with target sampling strategy (e.g., borders).
+
+        Args:
+            context_mask: [B, 1, H, W] - soft GT mask (already downsampled with area mode)
+            mode: Sampling strategy:
+                - "foreground": Sample from foreground (original behavior)
+                - "border": Sample from object borders
+                - "entropy": Sample from high-entropy regions
+            border_weight: Blend factor for border mode (0=foreground only, 1=border only)
+
+        Returns:
+            sampling_weights: [B, 1, H, W] - weights for patch sampling
+        """
+        if mode == 'foreground':
+            return context_mask
+
+        # Soft mask has values in [0, 1], with ~0.5 at borders
+        soft_mask = context_mask.clamp(1e-6, 1 - 1e-6)
+
+        if mode == 'entropy':
+            # High entropy where probability is near 0.5 (borders)
+            entropy = -(soft_mask * soft_mask.log() + (1 - soft_mask) * (1 - soft_mask).log())
+            entropy = entropy / math.log(2)  # Normalize to [0, 1]
+            return entropy
+
+        elif mode == 'border':
+            # Border score: peaks at 0.5, falls off toward 0 and 1
+            # border_score = 1 - 2 * |mask - 0.5| = 1 at 0.5, 0 at 0 or 1
+            border_score = 1.0 - 2.0 * torch.abs(soft_mask - 0.5)
+
+            # Blend foreground and border weights
+            # Ensure we still sample from foreground regions (not background borders)
+            fg_mask = (soft_mask > 0.1).float()  # Only consider regions with some foreground
+            border_weights = border_score * fg_mask
+
+            # Blend: (1-α)*foreground + α*border
+            weights = (1 - border_weight) * soft_mask + border_weight * border_weights
+            return weights
+
+        else:
+            # Unknown mode, fallback to foreground
+            return context_mask
+
     def _create_coverage_mask(
         self,
         coords: torch.Tensor,
@@ -563,7 +647,7 @@ class PatchICL(nn.Module):
         context_out: torch.Tensor,
         context_weights: torch.Tensor,
         sampler: nn.Module,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[dict]] | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[list[dict]] | None, torch.Tensor, int]:
         """Select patches from all context images in a single batched sampler call."""
         B, k = context_in.shape[:2]
 
@@ -572,13 +656,11 @@ class PatchICL(nn.Module):
         ctx_out_flat = context_out.reshape(B * k, *context_out.shape[2:])
         ctx_w_flat = context_weights.reshape(B * k, *context_weights.shape[2:])
 
-        patches, labels, coords, _, aug_params, validity = sampler(
+        _, labels, coords, _, aug_params, validity, K_per = sampler(
             ctx_in_flat, ctx_out_flat, ctx_w_flat
         )
-        K_per = patches.shape[1]
 
         # Reshape [B*k, K_per, ...] -> [B, k*K_per, ...]
-        patches = patches.reshape(B, k * K_per, *patches.shape[2:])
         labels = labels.reshape(B, k * K_per, *labels.shape[2:])
         coords = coords.reshape(B, k * K_per, *coords.shape[2:])
         validity = validity.reshape(B, k * K_per, *validity.shape[2:])
@@ -596,7 +678,7 @@ class PatchICL(nn.Module):
                     batch_aug.append(single)
                 ctx_aug_params.append(batch_aug)
 
-        return patches, labels, coords, ctx_aug_params, validity
+        return labels, coords, ctx_aug_params, validity, K_per
 
     def _forward_level(
         self,
@@ -638,9 +720,8 @@ class PatchICL(nn.Module):
         labels_ds = self._downsample_mask(labels, resolution) if labels is not None else torch.zeros(
             B, self.num_mask_channels, resolution, resolution, device=device)
 
-        # Select target patches using sampling_weights
-        patches, patch_labels, coords, _, aug_params, target_validity = sampler(image_ds, labels_ds, sampling_weights, None)
-        K = patches.shape[1]
+        # Select target patches using sampling_weights (patches=None since extract_patches=False)
+        patches, patch_labels, coords, _, aug_params, target_validity, K = sampler(image_ds, labels_ds, sampling_weights, None)
         coord_scale = H / resolution
 
         # Extract mask prior patches for target patches (if available)
@@ -674,7 +755,7 @@ class PatchICL(nn.Module):
                 target_patch_features = self.augmenter.augment_features_only(target_patch_features, aug_params)
 
         # Process context
-        context_patches, context_patch_labels, context_coords = None, None, None
+        context_patch_labels, context_coords = None, None
         context_patch_logits, context_pred, context_out_ds = None, None, None
         context_aug_params = None
         context_validity = None
@@ -685,19 +766,25 @@ class PatchICL(nn.Module):
             context_out_flat = context_out.view(B * k, *context_out.shape[2:])
             context_in_ds = self._downsample(context_in_flat, resolution).view(B, k, -1, resolution, resolution)
             context_out_ds = self._downsample_mask(context_out_flat, resolution).view(B, k, context_out.shape[2], resolution, resolution)
-            context_weights = self._mask_to_weights(
+
+            # Compute context sampling weights (align with target sampling strategy)
+            context_mask_flat = self._mask_to_weights(
                 context_out_ds.view(B * k, *context_out_ds.shape[2:])
+            )
+            context_weights = self._compute_context_sampling_weights(
+                context_mask_flat,
+                mode=self.context_sampling_mode,
+                border_weight=self.context_border_weight,
             ).view(B, k, 1, resolution, resolution)
 
-            context_patches, context_patch_labels, context_coords, context_aug_params, context_validity = (
+            context_patch_labels, context_coords, context_aug_params, context_validity, K_per_ctx = (
                 self._select_context_patches(context_in_ds, context_out_ds, context_weights, sampler)
             )
-            K_ctx = context_patches.shape[1]
+            K_ctx = K_per_ctx * k
 
             # Extract context patch features (batched for efficiency)
             context_patch_features = None
             if context_features is not None:
-                K_per_ctx = K_ctx // k
                 # Reshape: [B, k, N, D] -> [B*k, N, D] and coords accordingly
                 ctx_feats_flat = context_features.view(B * k, *context_features.shape[2:])
                 # context_coords: [B, K_ctx] where K_ctx = k * K_per_ctx
@@ -833,11 +920,11 @@ class PatchICL(nn.Module):
 
         level_out = {
             'pred': pred,
-            'patches': patches,
+            'patches': patches,  # None (not extracted for efficiency)
             'patch_labels': patch_labels,
             'patch_logits': patch_logits,
             'coords': coords,
-            'context_patches': context_patches,
+            'context_patches': None,  # Not extracted for efficiency
             'context_patch_labels': context_patch_labels,
             'context_patch_logits': context_patch_logits,
             'context_coords': context_coords,
@@ -944,43 +1031,74 @@ class PatchICL(nn.Module):
 
             # Progressive refinement: blend current prediction with previous combined
             coords = level_out['coords']
+            register_tokens = level_out.get('register_tokens')
+
+            # Compute coverage mask once (reused for blending and level_out)
+            coverage = self._create_coverage_mask(coords, patch_size, (resolution, resolution))
+
             if combined_pred is not None:
-                # Create coverage mask for current level's patches
-                coverage = self._create_coverage_mask(coords, patch_size, (resolution, resolution))
-                # Upsample previous combined prediction to current resolution
+                # Upsample previous combined prediction and confidence to current resolution
+                # Detach to prevent level N+1 loss from affecting level N representations
+                prev_pred = combined_pred.detach() if self.detach_between_levels else combined_pred
                 combined_upsampled = F.interpolate(
-                    combined_pred, size=(resolution, resolution),
+                    prev_pred, size=(resolution, resolution),
                     mode='bilinear', align_corners=False
                 )
-
-                # Blend predictions
-                if self.confidence_blend and combined_conf is not None and aggregated_conf is not None:
-                    # Use relative confidence for blending in covered regions
-                    # Higher confidence prediction gets more weight
+                conf_upsampled = None
+                if combined_conf is not None:
+                    prev_conf = combined_conf.detach() if self.detach_between_levels else combined_conf
                     conf_upsampled = F.interpolate(
-                        combined_conf, size=(resolution, resolution),
+                        prev_conf, size=(resolution, resolution),
                         mode='bilinear', align_corners=False
                     )
-                    eps = 1e-6
+
+                eps = 1e-6
+
+                # Learned alpha combination (new approach)
+                if self.use_learned_alpha and aggregated_conf is not None and conf_upsampled is not None:
+                    # Compute α from current level's register tokens
+                    alpha = self.compute_alpha(register_tokens)
+                    if alpha is None:
+                        alpha = torch.tensor(0.5, device=pred.device)
+
+                    # Store alpha for logging
+                    level_out['alpha'] = alpha
+
+                    # Detach predictions, keep gradients for confidence
+                    pred_detached = pred.detach()
+                    prev_pred_detached = combined_upsampled.detach()
+
+                    # Confidence-weighted combination:
+                    # pred_comb = (α × pred_l × conf_l + (1-α) × pred_prev × conf_prev) / (α × conf_l + (1-α) × conf_prev)
+                    weighted_curr = alpha * pred_detached * aggregated_conf
+                    weighted_prev = (1 - alpha) * prev_pred_detached * conf_upsampled
+                    conf_weight_sum = alpha * aggregated_conf + (1 - alpha) * conf_upsampled + eps
+
+                    # In covered regions: use weighted combination; uncovered: use previous
+                    blended_pred = (weighted_curr + weighted_prev) / conf_weight_sum
+                    combined_pred = coverage * blended_pred + (1 - coverage) * combined_upsampled
+
+                    # Confidence combination: α × conf_l + (1-α) × conf_prev
+                    blended_conf = alpha * aggregated_conf + (1 - alpha) * conf_upsampled
+                    combined_conf = coverage * blended_conf + (1 - coverage) * conf_upsampled
+
+                # Legacy confidence blend (relative confidence weighting)
+                # Detach everything: blend is a heuristic, not an optimization target
+                elif self.confidence_blend and combined_conf is not None and aggregated_conf is not None:
                     # Relative weight: current_conf / (current_conf + prev_conf)
-                    relative_current = aggregated_conf / (aggregated_conf + conf_upsampled + eps)
-                    # Only blend in covered regions; uncovered regions use previous
+                    # Detach confidences to prevent blend from affecting confidence learning
+                    conf_curr = aggregated_conf.detach()
+                    conf_prev = conf_upsampled.detach()
+                    relative_current = conf_curr / (conf_curr + conf_prev + eps)
                     blend_weight = coverage * relative_current
                     combined_pred = blend_weight * pred + (1 - blend_weight) * combined_upsampled
-
-                    # Update combined confidence: max of current and previous in covered regions
                     combined_conf = coverage * torch.max(aggregated_conf, conf_upsampled) + (1 - coverage) * conf_upsampled
+
                 else:
                     # Standard coverage-based blending
                     combined_pred = coverage * pred + (1 - coverage) * combined_upsampled
-
-                    # Update combined confidence (if available)
                     if aggregated_conf is not None:
-                        if combined_conf is not None:
-                            conf_upsampled = F.interpolate(
-                                combined_conf, size=(resolution, resolution),
-                                mode='bilinear', align_corners=False
-                            )
+                        if conf_upsampled is not None:
                             combined_conf = coverage * aggregated_conf + (1 - coverage) * conf_upsampled
                         else:
                             combined_conf = aggregated_conf
@@ -988,8 +1106,12 @@ class PatchICL(nn.Module):
                 combined_pred = pred
                 combined_conf = aggregated_conf
 
+            # Store combined prediction for loss computation (provides gradient for alpha)
+            level_out['combined_pred'] = combined_pred
+            level_out['combined_conf'] = combined_conf
+
             level_out['refined_probs'] = refined_probs  # Probs used for sampling (after refinement)
-            level_out['coverage_mask'] = self._create_coverage_mask(coords, patch_size, (resolution, resolution))
+            level_out['coverage_mask'] = coverage  # Reuse coverage computed earlier
             level_outputs.append(level_out)
 
         # Final prediction from refined combined prediction
@@ -1058,6 +1180,7 @@ class PatchICL(nn.Module):
         # Accumulators for logging (averaged across levels)
         sum_target_patch = 0.0
         sum_target_aggreg = 0.0
+        sum_target_combined = 0.0
         sum_context_patch = 0.0
         sum_context_aggreg = 0.0
 
@@ -1092,13 +1215,50 @@ class PatchICL(nn.Module):
 
             # Target aggreg loss (area-interpolated targets for exact size match)
             pred = level_out['pred']
+            aggregated_conf = level_out.get('aggregated_conf')
             labels_ds = F.interpolate(
                 labels.float(), size=pred.shape[-2:], mode='area'
             )
-            target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
+
+            # Confidence-weighted aggreg loss: model penalized more where confident
+            if self.conf_weighted_aggreg and aggregated_conf is not None:
+                target_aggreg_loss = self.conf_weighted_seg_loss(pred, labels_ds, aggregated_conf)
+            else:
+                target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
+
             losses[f'level_{i}_target_aggreg_loss'] = target_aggreg_loss
             total_loss = total_loss + lw * self.loss_weights['target_aggreg'] * target_aggreg_loss
             sum_target_aggreg = sum_target_aggreg + target_aggreg_loss
+
+            # Combined prediction loss (provides gradient for alpha in learned combination)
+            # Only for levels > 0 where combination actually happens
+            combined_pred = level_out.get('combined_pred')
+            if i > 0 and self.use_learned_alpha and combined_pred is not None:
+                combined_loss_weight = self.loss_weights['target_combined']
+                if combined_loss_weight > 0:
+                    # Downsample GT to combined_pred resolution
+                    labels_combined = F.interpolate(
+                        labels.float(), size=combined_pred.shape[-2:], mode='area'
+                    )
+                    target_combined_loss = self.aggreg_criterion(combined_pred, labels_combined)
+                    losses[f'level_{i}_target_combined_loss'] = target_combined_loss
+                    total_loss = total_loss + lw * combined_loss_weight * target_combined_loss
+                    sum_target_combined = sum_target_combined + target_combined_loss
+
+            # Confidence supervision loss: teach confidence to correlate with correctness
+            if self.confidence_supervision_weight > 0 and conf_preds is not None:
+                # conf_preds: [B, K, 1, ps, ps], patch_logits: [B, K, C, ps, ps]
+                conf_target = 1.0 - torch.abs(torch.sigmoid(patch_logits.detach()) - patch_labels)
+                if conf_target.shape[2] > 1:  # Multi-channel: average
+                    conf_target = conf_target.mean(dim=2, keepdim=True)
+                conf_sup_loss = F.mse_loss(conf_preds, conf_target.detach())
+                losses[f'level_{i}_conf_supervision_loss'] = conf_sup_loss
+                total_loss = total_loss + lw * self.confidence_supervision_weight * conf_sup_loss
+
+            # Log alpha if using learned combination
+            alpha = level_out.get('alpha')
+            if alpha is not None:
+                losses[f'level_{i}_alpha'] = alpha.mean().detach()
 
             # Context patch loss
             ctx_patch_logits = level_out.get('context_patch_logits')
@@ -1191,6 +1351,7 @@ class PatchICL(nn.Module):
         n = self.num_levels
         losses['target_patch_loss'] = sum_target_patch / n
         losses['target_aggreg_loss'] = sum_target_aggreg / n
+        losses['target_combined_loss'] = sum_target_combined / max(n - 1, 1)  # Only levels > 0
         losses['context_patch_loss'] = sum_context_patch / n
         losses['context_aggreg_loss'] = sum_context_aggreg / n
         losses['target_loss'] = losses['target_patch_loss'] + losses['target_aggreg_loss']

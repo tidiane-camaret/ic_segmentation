@@ -21,12 +21,24 @@ model:
         sampling_method: "continuous"
         sampling_temperature: 0.1
         stride: 6
-        num_patches: 8
+        num_patches: 6
         pad_before: 1
         pad_after: 1
+      #- resolution: 66
+      #  patch_size: 8
+      #  sampling_method: "continuous"
+      #  sampling_temperature: 0.1
+      #  stride: 6
+      #  num_patches: 6
+      #  pad_before: 1
+      #  pad_after: 1
 
-    oracle_levels_train: [false, false]
-    oracle_levels_valid: [false, false]
+    oracle_levels_train: [false, false, false]
+    oracle_levels_valid: [false, false, false]
+
+    sampler:
+      context_sampling: "border"    # Align context with target: sample from borders
+      context_border_weight: 0.5    # Blend: 50% foreground + 50% border
 
     aggregator:
       type: "average"
@@ -66,19 +78,22 @@ model:
         default:
           target_patch: 1.0
           target_aggreg: 1.0
-          context_patch: 0.5
-          context_aggreg: 0.5
-      level_weights: [1.0, 1.0]
+          target_combined: 1.0  # Loss on combined pred (provides gradient for alpha)
+          context_patch: 1.0
+          context_aggreg: 1.0
+      level_weights: [1.0, 1.0, 1.0]
       confidence:
         method: "entropy"
         enabled: true
         temperature: 1.0
         learn_temperature: true
-        supervision_weight: 0
+        supervision_weight: 0.1  # Light supervision: conf correlates with correctness
         boundary_weight: 0
         boundary_width: 2
         weighted_seg: false
 
     cascade:
       detach_between_levels: true
-      confidence_blend: true
+      confidence_blend: false       # Disabled: using learned_alpha instead
+      learned_alpha: true           # Learn α from register tokens
+      conf_weighted_aggreg: true    # Aggreg loss weighted by confidence

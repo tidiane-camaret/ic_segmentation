@@ -1,0 +1,94 @@
+# @package _global_
+# UniverSeg-style augmentation config for TotalSegmentator
+# Task-level: aggressive (same transform to all, preserves context-target relationship)
+# Example-level: conservative (maintains matchability between context images)
+
+augmentation:
+  enabled: true
+  type: "universeg"
+  img_size: 256
+
+  medical_specialty:
+    enabled: true
+    crop_p: 0.5
+    min_crop_frac: 0.4
+    max_crop_frac: 0.9
+    carvemix_p: 0.0          # Disabled - creates unrealistic anatomy
+    carvemix_margin: [0.1, 0.4]
+    harmonize: true
+    harmonize_sigma: 5.0
+
+  # Task-level augmentations (applied consistently to target + all context)
+  # Can be aggressive since relationship is preserved
+  task:
+    flip_intensities_p: 0.5  # Helps generalization - consistent across all images
+    flip_labels_p: 0.0       # Never flip labels for segmentation
+    flip_horizontal_p: 0.5   # Rotation invariance
+    flip_vertical_p: 0.5
+
+    sobel_edge_p: 0.0        # Keep as segmentation task, not edge detection
+    sobel_threshold: 0.1
+
+    # Affine transforms - full rotation for invariance
+    affine_p: 0.5
+    rotation_range: [0, 360]
+    scale_range: [0.8, 1.15]
+    translate_max: 0.2
+
+    # Elastic deformation - mild at task level
+    elastic_p: 0.25
+    elastic_alpha: [1, 2]
+    elastic_sigma: [6, 8]
+
+    # Intensity transforms
+    brightness_contrast_p: 0.4
+    brightness_range: [-0.1, 0.1]
+    contrast_range: [0.8, 1.2]
+
+    # Blur and noise
+    blur_p: 0.4
+    blur_kernel: 5
+    blur_sigma: [0.1, 1.0]
+
+    noise_p: 0.4
+    noise_mean: [0, 0.03]
+    noise_var: [0, 0.03]
+
+    # Sharpness
+    sharpness_p: 0.4
+    sharpness_factor: 4.0
+
+  # Example-level augmentations (different per context image)
+  # Conservative - context images should remain matchable to target
+  example:
+    enabled: true
+
+    # Mild affine - don't distort context too much
+    affine_p: 0.3
+    rotation_range: [-15, 15]
+    scale_range: [0.9, 1.1]
+    translate_max: 0.1
+
+    # Elastic - moderate, not too aggressive
+    elastic_p: 0.5
+    elastic_alpha: [0.5, 1.5]
+    elastic_sigma: [7, 8]
+
+    # Mild intensity variation
+    brightness_contrast_p: 0.2
+    brightness_range: [-0.05, 0.05]
+    contrast_range: [0.85, 1.15]
+
+    # Light blur
+    blur_p: 0.2
+    blur_kernel: 3
+    blur_sigma: [0.1, 0.6]
+
+    # Light noise
+    noise_p: 0.2
+    noise_mean: [0, 0.02]
+    noise_var: [0, 0.02]
+
+    # Light sharpness
+    sharpness_p: 0.2
+    sharpness_factor: 3.0

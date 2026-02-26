@@ -25,7 +25,9 @@
       "Bash(timeout 30 bash:*)",
       "Bash(find:*)",
       "WebFetch(domain:encord.com)",
-      "Bash(uv run accelerate launch:*)"
+      "Bash(uv run accelerate launch:*)",
+      "Bash(du)",
+      "Bash(ls $folder:*)"
     ],
     "deny": [
       "Read(./old/**)"
