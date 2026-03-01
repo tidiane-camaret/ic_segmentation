@@ -26,7 +26,8 @@ def _get_image_size(cfg) -> tuple[int, int]:
 def main(cfg: DictConfig) -> None:
     """Main training function."""
     # Initialize accelerator with optional mixed precision
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    method = cfg.get("method", "patch_icl")
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=(method == "universeg"))
     mixed_precision = cfg.training.get(
         "mixed_precision", None
     )  # "fp16", "bf16", or None
@@ -258,7 +259,6 @@ def main(cfg: DictConfig) -> None:
         )
 
     # Model selection based on method config
-    method = cfg.get("method", "patch_icl")
 
     if method == "universeg":
         # UniverSeg baseline model

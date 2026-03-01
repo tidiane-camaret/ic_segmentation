@@ -64,7 +64,6 @@ class UniverSegBaseline(nn.Module):
 
         return {
             "total_loss": seg_loss,
-            "seg_loss": seg_loss,
         }
 
     def _resize_to_model(self, x: torch.Tensor) -> torch.Tensor:
