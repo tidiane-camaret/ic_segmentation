@@ -12,13 +12,15 @@ model:
   patch_icl:
     feature_extractor:
       output_grid_size: 64
-      freeze: false
+      freeze: true
     levels:
-      - resolution: 18
+      - resolution: 12
         patch_size: 8
         sampling_method: "sliding_window"
         stride: 6
-        num_patches: 9
+        # context_stride defaults to stride (6) → 3x3=9 patches, same as target
+        num_patches: 4
+        num_context_patches: 4
         pad_before: 1
         pad_after: 1
       - resolution: 36
@@ -27,11 +29,22 @@ model:
         sampling_temperature: 0.1
         stride: 6
         num_patches: 6
+        num_context_patches: 2  # Fewer patches for context (default: num_patches)
         pad_before: 1
         pad_after: 1
 
     oracle_levels_train: [false, true]
     oracle_levels_valid: [false, false]
+
+    # Scheduled sampling: gradually transition from oracle to model predictions
+    # Reduces train/val distribution mismatch (exposure bias)
+    oracle_scheduling:
+      enabled: true
+      schedule: "linear"        # linear, exponential, inverse_sigmoid
+      start_prob: 1.0           # Start with full oracle
+      end_prob: 0.2             # End with 30% oracle (keep some GT signal)
+      warmup_epochs: 1         # Full oracle for first 10 epochs
+      decay_epochs: 5          # Decay over 50 epochs
 
     sampler:
       context_sampling: "border"    # Align context with target: sample from borders
@@ -59,7 +72,7 @@ model:
       target_self_attention: true
       dropout: 0.1
       append_zero_attn: true
-      use_mask_prior: true
+      use_mask_prior: false
       use_context_mask: true
       mask_fusion_type: "concat"
       predict_confidence: false
@@ -91,5 +104,5 @@ model:
     cascade:
       detach_between_levels: true
       confidence_blend: true       # Blends levels by confidence (no-op with 1 level)
-      learned_alpha: false           # Learn α from register tokens
+      learned_alpha: true           # Learn α from register tokens
       conf_weighted_aggreg: false    # Aggreg loss weighted by confidence

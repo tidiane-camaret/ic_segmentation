@@ -64,7 +64,13 @@ def _save_sample_images(
     """Save sample images with patches to disk.
 
     Layout: One row per level with columns:
-    [Ctx1, Ctx2, Target, Pred, Conf, Pred×Conf, Binary, Combined Conf]
+    [Ctx1, Ctx2, Target, Pred, Conf, Level Pred+GT, Combined+GT, Next SampW]
+
+    - Pred: Raw level prediction probabilities
+    - Conf: Level confidence map
+    - Level Pred+GT: Binary level prediction with GT contour (at level resolution)
+    - Combined+GT: Combined prediction (blended with previous levels) with GT contour
+    - Next SampW: Sampling weights for next level (1-conf or sigmoid(combined))
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
@@ -136,8 +142,8 @@ def _save_sample_images(
         n_levels = len(levels_info)
         n_ctx = min(ctx_in.shape[0] if ctx_in is not None else 0, max_context)
 
-        # Columns: [Ctx1, Ctx2, Target, Pred, Conf, Pred×Conf, Binary, Sampling Weights]
-        n_cols = max_context + 6  # 2 ctx + target + pred + conf + pred×conf + binary + sampling weights
+        # Columns: [Ctx1, Ctx2, Target, Pred, Conf, Level Pred+GT, Combined+GT, Next SampW]
+        n_cols = max_context + 6
         n_rows = n_levels
 
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
@@ -153,6 +159,8 @@ def _save_sample_images(
             l_pred_probs = level_info.get("pred_probs")
             l_refined_probs = level_info.get("refined_probs")
             l_aggregated_conf = level_info.get("aggregated_conf")
+            l_combined_pred = level_info.get("combined_pred")
+            l_combined_conf = level_info.get("combined_conf")
 
             col_idx = 0
 
@@ -189,7 +197,7 @@ def _save_sample_images(
             row[col_idx].axis("off")
             col_idx += 1
 
-            # --- Level prediction map ---
+            # --- Level prediction map (raw) ---
             if l_pred_probs is not None:
                 pp = l_pred_probs.squeeze().numpy()
                 im = row[col_idx].imshow(pp, cmap="hot", vmin=0, vmax=1)
@@ -211,24 +219,7 @@ def _save_sample_images(
             row[col_idx].axis("off")
             col_idx += 1
 
-            # --- Pred × Conf ---
-            if l_pred_probs is not None and l_aggregated_conf is not None:
-                pp = l_pred_probs.squeeze().numpy()
-                conf_img = l_aggregated_conf.squeeze().numpy()
-                if conf_img.shape != pp.shape:
-                    conf_t = torch.from_numpy(conf_img).unsqueeze(0).unsqueeze(0)
-                    conf_t = F.interpolate(conf_t, size=pp.shape, mode="bilinear", align_corners=False)
-                    conf_img = conf_t.squeeze().numpy()
-                weighted = pp * conf_img
-                im = row[col_idx].imshow(weighted, cmap="hot", vmin=0, vmax=1)
-                row[col_idx].set_title("Pred×Conf")
-                fig.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
-            else:
-                row[col_idx].set_title("Pred×Conf N/A")
-            row[col_idx].axis("off")
-            col_idx += 1
-
-            # --- Binary prediction with dice ---
+            # --- Level Pred+GT: Binary level prediction with GT contour ---
             if l_pred_probs is not None:
                 pp = l_pred_probs.squeeze()
                 # Get GT at prediction resolution
@@ -242,21 +233,73 @@ def _save_sample_images(
                 inter = (pred_mask * gt_binary).sum()
                 union_val = pred_mask.sum() + gt_binary.sum()
                 level_dice = (2 * inter + 1e-6) / (union_val + 1e-6)
-                row[col_idx].imshow(pred_mask, cmap="gray")
-                row[col_idx].set_title(f"Bin (d={level_dice:.2f})")
+                # Show prediction with GT contour overlay
+                row[col_idx].imshow(pp_np, cmap="hot", vmin=0, vmax=1)
+                row[col_idx].contour(gt_binary, colors="cyan", linewidths=1.5, linestyles="--")
+                row[col_idx].set_title(f"L{li} Pred+GT (d={level_dice:.2f})")
             else:
-                row[col_idx].set_title("Bin N/A")
+                row[col_idx].set_title("L Pred+GT N/A")
             row[col_idx].axis("off")
             col_idx += 1
 
-            # --- Sampling weights (refined probs / 1-conf for next level) ---
-            if l_refined_probs is not None:
-                rp = l_refined_probs.squeeze().numpy()
-                im = row[col_idx].imshow(rp, cmap="hot", vmin=0, vmax=1)
-                row[col_idx].set_title(f"SampW ({rp.shape[0]})")
+            # --- Combined+GT: Combined prediction with GT contour ---
+            if l_combined_pred is not None:
+                cp = l_combined_pred.squeeze().numpy()
+                # Get GT at combined prediction resolution
+                gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
+                if cp.shape[0] != gt.shape[0]:
+                    gt_t = F.interpolate(gt_t, size=cp.shape[-2:], mode='area')
+                gt_ds = gt_t.squeeze().numpy()
+                gt_binary = (gt_ds > GT_AREA_THRESHOLD).astype(float)
+                pred_mask = (cp > PRED_THRESHOLD).astype(float)
+                inter = (pred_mask * gt_binary).sum()
+                union_val = pred_mask.sum() + gt_binary.sum()
+                combined_dice = (2 * inter + 1e-6) / (union_val + 1e-6)
+                # Show combined prediction with GT contour
+                row[col_idx].imshow(cp, cmap="hot", vmin=0, vmax=1)
+                row[col_idx].contour(gt_binary, colors="cyan", linewidths=1.5, linestyles="--")
+                row[col_idx].set_title(f"Comb+GT (d={combined_dice:.2f})")
+            elif l_pred_probs is not None:
+                # Fallback to level pred if no combined (level 0)
+                pp = l_pred_probs.squeeze().numpy()
+                gt_t = torch.from_numpy(gt).unsqueeze(0).unsqueeze(0).float()
+                if pp.shape[0] != gt.shape[0]:
+                    gt_t = F.interpolate(gt_t, size=pp.shape[-2:], mode='area')
+                gt_ds = gt_t.squeeze().numpy()
+                gt_binary = (gt_ds > GT_AREA_THRESHOLD).astype(float)
+                row[col_idx].imshow(pp, cmap="hot", vmin=0, vmax=1)
+                row[col_idx].contour(gt_binary, colors="cyan", linewidths=1.5, linestyles="--")
+                row[col_idx].set_title("Comb=Pred (L0)")
+            else:
+                row[col_idx].set_title("Comb+GT N/A")
+            row[col_idx].axis("off")
+            col_idx += 1
+
+            # --- Next SampW: Sampling weights for next level ---
+            # At level i, next level uses: 1-combined_conf (if available) or refined_probs
+            # refined_probs at level i was used TO SAMPLE level i (from level i-1 output)
+            # For viz, show what will guide level i+1: 1-combined_conf
+            next_samp_w = None
+            samp_w_label = "Next SampW N/A"
+            if l_combined_conf is not None:
+                # Next level samples from LOW confidence regions
+                next_samp_w = 1.0 - l_combined_conf.squeeze().numpy()
+                samp_w_label = f"1-Conf ({next_samp_w.shape[0]})"
+            elif l_combined_pred is not None:
+                # Fallback: use combined prediction probabilities
+                next_samp_w = l_combined_pred.squeeze().numpy()
+                samp_w_label = f"CombP ({next_samp_w.shape[0]})"
+            elif l_refined_probs is not None:
+                # Show what was used to sample THIS level (for debugging)
+                next_samp_w = l_refined_probs.squeeze().numpy()
+                samp_w_label = f"InSampW ({next_samp_w.shape[0]})"
+
+            if next_samp_w is not None:
+                im = row[col_idx].imshow(next_samp_w, cmap="hot", vmin=0, vmax=1)
+                row[col_idx].set_title(samp_w_label)
                 fig.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
             else:
-                row[col_idx].set_title("SampW N/A")
+                row[col_idx].set_title(samp_w_label)
             row[col_idx].axis("off")
 
         fig.suptitle(f"{label_id} (dice={dice:.3f})", fontsize=12, y=1.01)
@@ -284,8 +327,8 @@ def _save_sample_images_final(
 ) -> None:
     """Save final prediction images upsampled to input resolution.
 
-    Layout: [Ctx1, Ctx2, Target+GT, Pred Probs, Binary Pred]
-    Simple view showing final output at full resolution.
+    Layout: [Ctx1, Ctx2, Target+GT, Combined Probs, Binary Pred]
+    Shows the COMBINED prediction (after multi-level blending) at full resolution.
     """
     import matplotlib.pyplot as plt
 
@@ -307,10 +350,18 @@ def _save_sample_images_final(
         dice = sample["dice"]
         ctx_in = sample.get("context_in")
         ctx_out = sample.get("context_out")
-        pred_probs = sample.get("pred_probs")  # Already at some resolution
+
+        # Get combined prediction from last level (the actual model output)
+        # This is what gets upsampled to final_pred in the model
+        levels_info = sample.get("levels", [])
+        if levels_info and levels_info[-1].get("combined_pred") is not None:
+            final_probs = levels_info[-1]["combined_pred"]
+        else:
+            # Fallback to pred_probs (raw last level pred, less accurate)
+            final_probs = sample.get("pred_probs")
 
         n_ctx = min(ctx_in.shape[0] if ctx_in is not None else 0, max_context)
-        n_cols = max_context + 3  # ctx1, ctx2, target+gt, pred_probs, binary
+        n_cols = max_context + 3  # ctx1, ctx2, target+gt, combined_probs, binary
 
         fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
 
@@ -338,9 +389,9 @@ def _save_sample_images_final(
         axes[col_idx].axis("off")
         col_idx += 1
 
-        # Prediction probs upsampled to input resolution
-        if pred_probs is not None:
-            pp = pred_probs.squeeze()
+        # Combined prediction probs upsampled to input resolution
+        if final_probs is not None:
+            pp = final_probs.squeeze()
             # Upsample to input resolution if needed
             if pp.shape[0] != img.shape[0] or pp.shape[1] != img.shape[1]:
                 pp_t = torch.from_numpy(pp.numpy() if hasattr(pp, "numpy") else pp).unsqueeze(0).unsqueeze(0).float()
@@ -352,16 +403,16 @@ def _save_sample_images_final(
             # Show prediction with image underlay
             axes[col_idx].imshow(img, cmap="gray")
             im = axes[col_idx].imshow(pp_up, cmap="hot", alpha=0.6, vmin=0, vmax=1)
-            axes[col_idx].set_title("Pred Probs")
+            axes[col_idx].set_title("Combined Probs")
             fig.colorbar(im, ax=axes[col_idx], fraction=0.046, pad=0.04)
         else:
             axes[col_idx].set_title("Pred N/A")
         axes[col_idx].axis("off")
         col_idx += 1
 
-        # Binary prediction with GT contour
-        if pred_probs is not None:
-            pp = pred_probs.squeeze()
+        # Binary prediction with GT contour - compute dice on displayed prediction
+        if final_probs is not None:
+            pp = final_probs.squeeze()
             if pp.shape[0] != img.shape[0] or pp.shape[1] != img.shape[1]:
                 pp_t = torch.from_numpy(pp.numpy() if hasattr(pp, "numpy") else pp).unsqueeze(0).unsqueeze(0).float()
                 pp_t = F.interpolate(pp_t, size=img.shape[:2], mode="bilinear", align_corners=False)
@@ -370,16 +421,25 @@ def _save_sample_images_final(
                 pp_up = pp.numpy() if hasattr(pp, "numpy") else pp
 
             pred_binary = (pp_up > PRED_THRESHOLD).astype(float)
+            gt_binary = (gt > GT_AREA_THRESHOLD).astype(float)
+
+            # Compute dice on displayed prediction for consistency
+            inter = (pred_binary * gt_binary).sum()
+            union_val = pred_binary.sum() + gt_binary.sum()
+            display_dice = (2 * inter + 1e-6) / (union_val + 1e-6)
+
             axes[col_idx].imshow(img, cmap="gray")
             axes[col_idx].imshow(pred_binary, cmap="Greens", alpha=0.4)
             axes[col_idx].contour(gt, colors="yellow", linewidths=1, linestyles="--")
             axes[col_idx].contour(pred_binary, colors="lime", linewidths=1)
-            axes[col_idx].set_title(f"Binary (dice={dice:.3f})")
+            axes[col_idx].set_title(f"Binary (dice={display_dice:.3f})")
         else:
+            display_dice = dice  # Fallback to original dice
             axes[col_idx].set_title("Binary N/A")
         axes[col_idx].axis("off")
 
-        fig.suptitle(f"{label_id} (dice={dice:.3f})", fontsize=12, y=1.02)
+        # Use computed display_dice for consistency with what's shown
+        fig.suptitle(f"{label_id} (dice={display_dice:.3f})", fontsize=12, y=1.02)
         fig.tight_layout()
         safe_label = label_id.replace("/", "_")
         save_path = epoch_dir / f"{safe_label}.png"
@@ -387,7 +447,7 @@ def _save_sample_images_final(
         plt.close(fig)
 
         if wandb_available:
-            wandb_img = wandb.Image(str(save_path), caption=f"{label_id} (dice={dice:.3f})")
+            wandb_img = wandb.Image(str(save_path), caption=f"{label_id} (dice={display_dice:.3f})")
             wandb_images.append(wandb_img)
 
     if wandb_images and wandb_available and wandb.run is not None:
@@ -464,6 +524,13 @@ def _collect_sample_for_viz(
         l_aggregated_conf = level_out.get("aggregated_conf")
         if l_aggregated_conf is not None:
             l_aggregated_conf = l_aggregated_conf[i].detach().cpu()
+        # Combined prediction (blended with previous levels)
+        l_combined_pred = level_out.get("combined_pred")
+        if l_combined_pred is not None:
+            l_combined_pred = torch.sigmoid(l_combined_pred[i]).detach().cpu()
+        l_combined_conf = level_out.get("combined_conf")
+        if l_combined_conf is not None:
+            l_combined_conf = l_combined_conf[i].detach().cpu()
         levels.append(
             {
                 "target_coords": l_coords,
@@ -473,6 +540,8 @@ def _collect_sample_for_viz(
                 "pred_probs": l_pred_probs,
                 "refined_probs": l_refined,
                 "aggregated_conf": l_aggregated_conf,
+                "combined_pred": l_combined_pred,
+                "combined_conf": l_combined_conf,
             }
         )
 

@@ -27,7 +27,8 @@
       "WebFetch(domain:encord.com)",
       "Bash(uv run accelerate launch:*)",
       "Bash(du)",
-      "Bash(ls $folder:*)"
+      "Bash(ls $folder:*)",
+      "WebFetch(domain:openaccess.thecvf.com)"
     ],
     "deny": [
       "Read(./old/**)"

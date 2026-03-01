@@ -208,6 +208,51 @@ def apply_rope_2d(
     return torch.cat([x_rotated, y_rotated], dim=-1).to(orig_dtype)
 
 
+class ResolutionConditionedNorm(nn.Module):
+    """GroupNorm with scale/shift predicted from continuous resolution embedding.
+
+    Implements FiLM (Feature-wise Linear Modulation):
+        out = γ(resolution) × GroupNorm(x) + β(resolution)
+
+    This allows the normalization to adapt to any resolution, enabling:
+    - Generalization to unseen resolutions at test time
+    - Partial gradient isolation between resolutions (different γ/β paths)
+    - Smooth interpolation in resolution space
+    """
+
+    def __init__(self, num_channels: int, scale_embed_dim: int, num_groups: int = 8):
+        super().__init__()
+        # GroupNorm without learnable affine params (we predict them)
+        self.norm = nn.GroupNorm(num_groups, num_channels, affine=False)
+
+        # Predict gamma/beta from resolution embedding
+        self.gamma_proj = nn.Linear(scale_embed_dim, num_channels)
+        self.beta_proj = nn.Linear(scale_embed_dim, num_channels)
+
+        # Initialize to identity transform (gamma=1, beta=0)
+        nn.init.ones_(self.gamma_proj.bias)
+        nn.init.zeros_(self.gamma_proj.weight)
+        nn.init.zeros_(self.beta_proj.weight)
+        nn.init.zeros_(self.beta_proj.bias)
+
+    def forward(self, x: torch.Tensor, scale_embed: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B*K, C, H, W] - features to normalize
+            scale_embed: [scale_embed_dim] - continuous resolution embedding
+
+        Returns:
+            Normalized and modulated features [B*K, C, H, W]
+        """
+        x = self.norm(x)
+
+        # Predict per-channel scale and shift from resolution
+        gamma = self.gamma_proj(scale_embed).view(1, -1, 1, 1)  # [1, C, 1, 1]
+        beta = self.beta_proj(scale_embed).view(1, -1, 1, 1)
+
+        return gamma * x + beta
+
+
 class SimpleCNNEncoder(nn.Module):
     """
     CNN encoder that processes feature patches through spatial convolutions.
@@ -215,8 +260,9 @@ class SimpleCNNEncoder(nn.Module):
     Takes [B, K, tokens, D] features (tokens = feature_grid_size^2) and produces:
     - encoded: [B, K, embed_dim] - pooled representation for attention
     - skips: dict of intermediate features at 16x16, 8x8, 4x4, 2x2 scales
-    
+
     Supports feature_grid_size of 8 or 16.
+    Uses ResolutionConditionedNorm for resolution-agnostic multi-scale training.
     """
 
     def __init__(
@@ -224,73 +270,58 @@ class SimpleCNNEncoder(nn.Module):
         input_dim: int = 1024,
         embed_dim: int = 128,
         feature_grid_size: int = 16,
+        scale_embed_dim: int | None = None,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
         self.feature_grid_size = feature_grid_size
+        # Default scale_embed_dim to embed_dim for backward compatibility
+        self.scale_embed_dim = scale_embed_dim if scale_embed_dim is not None else embed_dim
 
         D = embed_dim
 
         # Project input features to working dimension
         self.input_proj = nn.Linear(input_dim, D)
 
-        # Encoder levels with skip connections
+        # Encoder levels with resolution-conditioned normalization
         if feature_grid_size == 16:
             # Level 0: 16x16 → 16x16 (preserve resolution)
-            self.enc0 = nn.Sequential(
-                nn.Conv2d(D, D, 3, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
+            self.enc0_conv = nn.Conv2d(D, D, 3, padding=1)
+            self.enc0_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
             # Level 1: 16x16 → 8x8
-            self.enc1 = nn.Sequential(
-                nn.Conv2d(D, D, 3, stride=2, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
+            self.enc1_conv = nn.Conv2d(D, D, 3, stride=2, padding=1)
+            self.enc1_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
             # Level 2: 8x8 → 4x4
-            self.enc2 = nn.Sequential(
-                nn.Conv2d(D, D, 3, stride=2, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
+            self.enc2_conv = nn.Conv2d(D, D, 3, stride=2, padding=1)
+            self.enc2_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
             # Level 3: 4x4 → 2x2
-            self.enc3 = nn.Sequential(
-                nn.Conv2d(D, D, 3, stride=2, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
+            self.enc3_conv = nn.Conv2d(D, D, 3, stride=2, padding=1)
+            self.enc3_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
         else:  # feature_grid_size == 8
             # Level 0: 8x8 → 8x8 (preserve resolution)
-            self.enc0 = nn.Sequential(
-                nn.Conv2d(D, D, 3, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
+            self.enc0_conv = nn.Conv2d(D, D, 3, padding=1)
+            self.enc0_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
             # Level 1: 8x8 → 4x4
-            self.enc1 = nn.Sequential(
-                nn.Conv2d(D, D, 3, stride=2, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
+            self.enc1_conv = nn.Conv2d(D, D, 3, stride=2, padding=1)
+            self.enc1_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
             # Level 2: 4x4 → 2x2
-            self.enc2 = nn.Sequential(
-                nn.Conv2d(D, D, 3, stride=2, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
-            self.enc3 = None  # Not used for 8x8
+            self.enc2_conv = nn.Conv2d(D, D, 3, stride=2, padding=1)
+            self.enc2_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
+            self.enc3_conv = None
+            self.enc3_norm = None
 
         # Final pooling to [B*K, D, 1, 1]
         self.pool = nn.AdaptiveAvgPool2d(1)
 
     def forward(
-        self, features: torch.Tensor
+        self, features: torch.Tensor, scale_embed: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Args:
             features: [B, K, tokens, D_in] - patch features (tokens = h*w)
+            scale_embed: [scale_embed_dim] - continuous resolution embedding.
+                If None, uses zeros (backward compatibility, not recommended).
 
         Returns:
             encoded: [B, K, embed_dim] - pooled representation
@@ -299,14 +330,11 @@ class SimpleCNNEncoder(nn.Module):
         B, K, NF, E = features.shape
         D = self.embed_dim
         h = w = self.feature_grid_size
-        
-        """
-        if NF != h * w:
-            raise ValueError(
-                f"Expected {h*w} tokens (feature_grid_size={h}), got {NF}. "
-                f"Check that patch_feature_grid_size matches the actual feature extraction."
-            )
-        """
+
+        # Default scale_embed for backward compatibility
+        if scale_embed is None:
+            scale_embed = torch.zeros(self.scale_embed_dim, device=features.device)
+
         # Project and reshape to spatial: [B*K, D, h, w]
         x = self.input_proj(features.reshape(-1, E))  # [B*K*NF, D]
         x = x.view(B * K, NF, D).permute(0, 2, 1)  # [B*K, D, NF]
@@ -314,10 +342,17 @@ class SimpleCNNEncoder(nn.Module):
 
         if self.feature_grid_size == 16:
             # Encode with skip connections: 16→16→8→4→2
-            skip_16x16 = self.enc0(x)      # [B*K, D, 16, 16]
-            skip_8x8 = self.enc1(skip_16x16)  # [B*K, D, 8, 8]
-            skip_4x4 = self.enc2(skip_8x8)    # [B*K, D, 4, 4]
-            skip_2x2 = self.enc3(skip_4x4)    # [B*K, D, 2, 2]
+            x = self.enc0_conv(x)
+            skip_16x16 = F.gelu(self.enc0_norm(x, scale_embed))
+
+            x = self.enc1_conv(skip_16x16)
+            skip_8x8 = F.gelu(self.enc1_norm(x, scale_embed))
+
+            x = self.enc2_conv(skip_8x8)
+            skip_4x4 = F.gelu(self.enc2_norm(x, scale_embed))
+
+            x = self.enc3_conv(skip_4x4)
+            skip_2x2 = F.gelu(self.enc3_norm(x, scale_embed))
 
             # Pool to [B, K, D]
             encoded = self.pool(skip_2x2).view(B, K, D)
@@ -330,9 +365,14 @@ class SimpleCNNEncoder(nn.Module):
             }
         else:  # 8x8
             # Encode with skip connections: 8→8→4→2
-            skip_8x8 = self.enc0(x)        # [B*K, D, 8, 8]
-            skip_4x4 = self.enc1(skip_8x8)    # [B*K, D, 4, 4]
-            skip_2x2 = self.enc2(skip_4x4)    # [B*K, D, 2, 2]
+            x = self.enc0_conv(x)
+            skip_8x8 = F.gelu(self.enc0_norm(x, scale_embed))
+
+            x = self.enc1_conv(skip_8x8)
+            skip_4x4 = F.gelu(self.enc1_norm(x, scale_embed))
+
+            x = self.enc2_conv(skip_4x4)
+            skip_2x2 = F.gelu(self.enc2_norm(x, scale_embed))
 
             # Pool to [B, K, D]
             encoded = self.pool(skip_2x2).view(B, K, D)
@@ -683,6 +723,7 @@ class SimpleCNNDecoder(nn.Module):
     Uses bilinear interpolation for final upsampling to handle any patch_size.
 
     Supports feature_grid_size of 8 or 16.
+    Uses ResolutionConditionedNorm for resolution-agnostic multi-scale training.
     """
 
     def __init__(
@@ -693,6 +734,7 @@ class SimpleCNNDecoder(nn.Module):
         feature_grid_size: int = 16,
         use_skip_connections: bool = True,
         predict_confidence: bool = False,
+        scale_embed_dim: int | None = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -701,45 +743,35 @@ class SimpleCNNDecoder(nn.Module):
         self.feature_grid_size = feature_grid_size
         self.use_skip_connections = use_skip_connections
         self.predict_confidence = predict_confidence
+        self.scale_embed_dim = scale_embed_dim if scale_embed_dim is not None else embed_dim
 
         D = embed_dim
         fuse_ch_in = D * 2 if self.use_skip_connections else D
 
         # 1x1 → 2x2, fuse with skip_2x2
         self.up1 = nn.ConvTranspose2d(D, D, 2, stride=2)
-        self.fuse1 = nn.Sequential(
-            nn.Conv2d(fuse_ch_in, D, 3, padding=1),
-            nn.BatchNorm2d(D),
-            nn.GELU(),
-        )
+        self.fuse1_conv = nn.Conv2d(fuse_ch_in, D, 3, padding=1)
+        self.fuse1_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
 
         # 2x2 → 4x4, fuse with skip_4x4
         self.up2 = nn.ConvTranspose2d(D, D, 2, stride=2)
-        self.fuse2 = nn.Sequential(
-            nn.Conv2d(fuse_ch_in, D, 3, padding=1),
-            nn.BatchNorm2d(D),
-            nn.GELU(),
-        )
+        self.fuse2_conv = nn.Conv2d(fuse_ch_in, D, 3, padding=1)
+        self.fuse2_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
 
         # 4x4 → 8x8, fuse with skip_8x8
         self.up3 = nn.ConvTranspose2d(D, D, 2, stride=2)
-        self.fuse3 = nn.Sequential(
-            nn.Conv2d(fuse_ch_in, D, 3, padding=1),
-            nn.BatchNorm2d(D),
-            nn.GELU(),
-        )
+        self.fuse3_conv = nn.Conv2d(fuse_ch_in, D, 3, padding=1)
+        self.fuse3_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
 
         if feature_grid_size == 16:
             # 8x8 → 16x16, fuse with skip_16x16
             self.up4 = nn.ConvTranspose2d(D, D, 2, stride=2)
-            self.fuse4 = nn.Sequential(
-                nn.Conv2d(fuse_ch_in, D, 3, padding=1),
-                nn.BatchNorm2d(D),
-                nn.GELU(),
-            )
+            self.fuse4_conv = nn.Conv2d(fuse_ch_in, D, 3, padding=1)
+            self.fuse4_norm = ResolutionConditionedNorm(D, self.scale_embed_dim)
         else:
             self.up4 = None
-            self.fuse4 = None
+            self.fuse4_conv = None
+            self.fuse4_norm = None
 
         # Segmentation head
         self.seg_head = nn.Sequential(
@@ -760,12 +792,14 @@ class SimpleCNNDecoder(nn.Module):
         self,
         encoded: torch.Tensor,
         skips: dict[str, torch.Tensor],
+        scale_embed: torch.Tensor,
     ) -> torch.Tensor:
         """Shared decoder trunk that produces features at feature_grid_size resolution.
 
         Args:
             encoded: [B*K, D, 1, 1] - attention output reshaped
             skips: dict with skip tensors from encoder
+            scale_embed: [scale_embed_dim] - continuous resolution embedding
 
         Returns:
             [B*K, D, feature_grid_size, feature_grid_size] - decoded features
@@ -779,21 +813,24 @@ class SimpleCNNDecoder(nn.Module):
         if self.use_skip_connections:
             skip_2x2 = skips['skip_2x2'].view(B_K, D, 2, 2)
             x = torch.cat([x, skip_2x2], dim=1)
-        x = self.fuse1(x)
+        x = self.fuse1_conv(x)
+        x = F.gelu(self.fuse1_norm(x, scale_embed))
 
         # 2x2 → 4x4 + skip
         x = self.up2(x)
         if self.use_skip_connections:
             skip_4x4 = skips['skip_4x4'].view(B_K, D, 4, 4)
             x = torch.cat([x, skip_4x4], dim=1)
-        x = self.fuse2(x)
+        x = self.fuse2_conv(x)
+        x = F.gelu(self.fuse2_norm(x, scale_embed))
 
         # 4x4 → 8x8 + skip
         x = self.up3(x)
         if self.use_skip_connections:
             skip_8x8 = skips['skip_8x8'].view(B_K, D, 8, 8)
             x = torch.cat([x, skip_8x8], dim=1)
-        x = self.fuse3(x)
+        x = self.fuse3_conv(x)
+        x = F.gelu(self.fuse3_norm(x, scale_embed))
 
         if self.feature_grid_size == 16:
             # 8x8 → 16x16 + skip
@@ -801,7 +838,8 @@ class SimpleCNNDecoder(nn.Module):
             if self.use_skip_connections:
                 skip_16x16 = skips['skip_16x16'].view(B_K, D, 16, 16)
                 x = torch.cat([x, skip_16x16], dim=1)
-            x = self.fuse4(x)
+            x = self.fuse4_conv(x)
+            x = F.gelu(self.fuse4_norm(x, scale_embed))
 
         return x  # [B*K, D, h, h]
 
@@ -809,11 +847,14 @@ class SimpleCNNDecoder(nn.Module):
         self,
         encoded: torch.Tensor,
         skips: dict[str, torch.Tensor],
+        scale_embed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             encoded: [B, K, D] - attention output
             skips: dict with skip tensors from encoder
+            scale_embed: [scale_embed_dim] - continuous resolution embedding.
+                If None, uses zeros (backward compatibility, not recommended).
 
         Returns:
             seg_pred: [B, K, num_classes, patch_size, patch_size]
@@ -822,14 +863,18 @@ class SimpleCNNDecoder(nn.Module):
         B, K, D = encoded.shape
         h = self.feature_grid_size
 
+        # Default scale_embed for backward compatibility
+        if scale_embed is None:
+            scale_embed = torch.zeros(self.scale_embed_dim, device=encoded.device)
+
         # Reshape encoded to [B*K, D, 1, 1] (use contiguous for after attention)
         x = encoded.contiguous().view(B * K, D, 1, 1)
 
         # Make skips contiguous for the trunk
         skips_contiguous = {k: v.contiguous() for k, v in skips.items()}
 
-        # Shared decoder trunk
-        features = self._decode_trunk(x, skips_contiguous)  # [B*K, D, h, h]
+        # Shared decoder trunk with resolution conditioning
+        features = self._decode_trunk(x, skips_contiguous, scale_embed)  # [B*K, D, h, h]
 
         # Segmentation head
         seg_pred = self.seg_head(features)  # [B*K, num_classes, h, h]
@@ -935,6 +980,7 @@ class SimpleBackbone(nn.Module):
             input_dim=input_dim,
             embed_dim=embed_dim,
             feature_grid_size=feature_grid_size,
+            scale_embed_dim=embed_dim,  # Match scale_encoder output
         )
 
         self.attention = CrossPatchAttention(
@@ -958,6 +1004,7 @@ class SimpleBackbone(nn.Module):
             feature_grid_size=feature_grid_size,
             use_skip_connections=decoder_use_skip_connections,
             predict_confidence=predict_confidence,
+            scale_embed_dim=embed_dim,  # Match scale_encoder output
         )
 
         # Mask encoder and fusion (shared for target prior and context masks)
@@ -1018,14 +1065,16 @@ class SimpleBackbone(nn.Module):
             is_context = torch.ones(B, K, dtype=torch.bool, device=device)
             is_context[:, 0] = False
 
-        # Encode
-        encoded, skips = self.encoder(img_patches)
-
-        # Add continuous scale embedding (resolution-agnostic)
+        # Compute continuous scale embedding (resolution-agnostic)
         if resolution is None:
             resolution = float(self.patch_size * (2 ** level_idx))
-        scale_embed = self.scale_encoder(resolution, device=device).view(1, 1, -1)
-        encoded = encoded + scale_embed
+        scale_embed = self.scale_encoder(resolution, device=device)  # [embed_dim]
+
+        # Encode with resolution conditioning
+        encoded, skips = self.encoder(img_patches, scale_embed)
+
+        # Also add scale embedding to encoded features (additive, as before)
+        encoded = encoded + scale_embed.view(1, 1, -1)
 
         # Fuse mask prior into target patch embeddings (before attention)
         K_target = num_target_patches if num_target_patches is not None else K
@@ -1065,8 +1114,8 @@ class SimpleBackbone(nn.Module):
             num_target_patches=num_target_patches,
         )
 
-        # Decode
-        seg_pred, conf_pred = self.decoder(attended, skips)
+        # Decode with resolution conditioning
+        seg_pred, conf_pred = self.decoder(attended, skips, scale_embed)
 
         result = {
             'mask_patch_logit_preds': seg_pred,

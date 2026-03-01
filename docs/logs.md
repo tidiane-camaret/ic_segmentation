@@ -4,6 +4,126 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-02-26: Scheduled Oracle Sampling
+
+**Goal:** Reduce train/val distribution mismatch caused by oracle sampling during training.
+
+### Problem
+
+| Phase | Level 1 Sampling | Distribution |
+|-------|------------------|--------------|
+| Train | Oracle (GT foreground) | Easy patches, always correct regions |
+| Val | Model predictions | Harder, includes errors and uncertain regions |
+
+This is "exposure bias" — the model never learns to recover from its own mistakes.
+
+### Solution: Scheduled Sampling
+
+Gradually transition from oracle (GT-guided) to model predictions during training:
+
+```
+Epoch 0-10:  100% oracle (warmup)
+Epoch 10-60: Linear decay from 100% → 30%
+Epoch 60+:   30% oracle (maintain some GT signal)
+```
+
+Per-sample stochastic mixing ensures the model sees both oracle and self-generated distributions.
+
+### Config
+
+```yaml
+oracle_scheduling:
+  enabled: true
+  schedule: "linear"        # linear, exponential, inverse_sigmoid
+  start_prob: 1.0           # Start with full oracle
+  end_prob: 0.3             # End with 30% oracle
+  warmup_epochs: 10         # Full oracle during warmup
+  decay_epochs: 50          # Decay period
+```
+
+### Implementation
+
+Added to `patch_icl.py`:
+- `_get_oracle_probability(level_idx)`: Computes oracle prob based on epoch and schedule
+- Modified sampling weight computation to stochastically mix oracle and model weights
+- Logging: `level_{i}_oracle_prob` tracked during training
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl_v2/patch_icl.py` | Added `oracle_scheduling` config, `_get_oracle_probability()`, modified forward sampling logic |
+| `configs/experiment/103_2_lvls.yaml` | Added `oracle_scheduling` config block |
+
+---
+
+## 2026-02-26: Resolution-Conditioned Normalization (FiLM)
+
+**Goal:** Prevent gradient interference between levels in multi-level training while maintaining resolution-agnostic architecture.
+
+### Problem
+
+When training with multiple levels (e.g., level 0 at 18×18, level 1 at 36×36), shared backbone weights receive conflicting gradients:
+- Level 0 (uniform sampling) → learns general features
+- Level 1 (oracle sampling) → learns foreground-specific features
+- Both update the same BatchNorm statistics → interference
+
+Even with `detach_between_levels: true`, gradients from both levels flow through the shared encoder/decoder.
+
+### Solution: FiLM-style Resolution Conditioning
+
+Replaced `BatchNorm2d` with `ResolutionConditionedNorm` — GroupNorm with scale (γ) and shift (β) predicted from continuous resolution embedding:
+
+```
+out = γ(resolution) × GroupNorm(x) + β(resolution)
+```
+
+**Key properties:**
+- **Resolution-agnostic**: Works with any resolution (continuous embedding, not discrete)
+- **Partial gradient isolation**: Different resolutions → different γ/β paths
+- **Generalizes to unseen resolutions**: Can test on resolutions not seen during training
+- **No fixed level count**: Architecture doesn't hardcode number of levels
+
+### Implementation
+
+New class `ResolutionConditionedNorm` in `simple_backbone.py`:
+```python
+class ResolutionConditionedNorm(nn.Module):
+    def __init__(self, num_channels, scale_embed_dim, num_groups=8):
+        self.norm = nn.GroupNorm(num_groups, num_channels, affine=False)
+        self.gamma_proj = nn.Linear(scale_embed_dim, num_channels)
+        self.beta_proj = nn.Linear(scale_embed_dim, num_channels)
+
+    def forward(self, x, scale_embed):
+        x = self.norm(x)
+        gamma = self.gamma_proj(scale_embed).view(1, -1, 1, 1)
+        beta = self.beta_proj(scale_embed).view(1, -1, 1, 1)
+        return gamma * x + beta
+```
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/models/simple_backbone.py` | Added `ResolutionConditionedNorm`, updated `SimpleCNNEncoder` and `SimpleCNNDecoder` to use it, pass `scale_embed` through `SimpleBackbone.forward()` |
+
+### Parameter Overhead
+
+FiLM projector params account for ~9% of backbone:
+- FiLM params: ~200K
+- Total backbone: ~2.2M
+
+### Usage
+
+No config changes needed — automatically uses resolution passed to backbone:
+
+```python
+# In PatchICL._forward_level():
+backbone_out = self.backbone(..., resolution=level_cfg['resolution'])
+```
+
+---
+
 ## 2026-02-23: Generalization Improvements
 
 **Goal:** Address train/val gap and improve generalization for in-context segmentation.

@@ -1,0 +1,208 @@
+\begin{abstract}
+In-context learning (ICL) enables medical image segmentation models to adapt to new anatomical structures from limited examples, reducing the clinical annotation burden. However, standard ICL methods typically rely on dense, global cross-attention, which scales poorly with image resolution. While recent approaches have introduced localized attention mechanisms, they often lack explicit supervision on the selection process, leading to redundant computation in non-informative regions. We propose a hierarchical framework that combines explicit patch selection with multi-level supervision. By supervising the model at both the patch and global levels, our approach learns to actively identify and attend only to the most informative anatomical regions. Evaluated on TotalSegmentator, our method achieves competitive in-domain CT segmentation accuracy while significantly reducing computational overhead for high-resolution volumes compared to full-context baselines.
+
+\keywords{In-Context Learning  \and Medical Image Segmentation}
+% Authors must provide keywords and are not allowed to remove this Keyword section.
+
+\end{abstract}
+
+\section{Related Work}
+
+\textbf{Global In-Context Learning.}
+
+Early adaptations of ICL for segmentation, such as UniverSeg \cite{butoiUniverSegUniversalMedical2023}, utilize encoder-decoder architectures with dense cross-attention (CrossBlock) to fuse target and context features. Similarly, Iris \cite{gaoShowSegmentUniversal2025} encodes context pairs into global task embeddings.
+
+\textit{Limitation:} These methods require processing the full resolution of both target and context images to compute attention maps, resulting in quadratic complexity $\mathcal{O}((HW)^2)$ that prohibits scaling to large inputs.
+
+\textbf{Selective Attention and Retrieval.}
+
+To address scalability, recent works have moved toward selective processing. Tyche \cite{rakicTycheStochasticInContext2025} introduces stochasticity to explore multiple potential masks, effectively attending to different "modes" of the output distribution. Other approaches, such as EICSeg \cite{xieEICSegUniversalMedical2026}, employ retrieval mechanisms to align features before processing.
+
+\textit{Limitation:} While these methods focus attention on specific zones or features, this selection is often implicit : learned solely through the final segmentation loss without direct supervision on what to select. Consequently, they often still require encoding the entire image volume before the attention mechanism can discard irrelevant regions.
+
+\textbf{Patch-based and Efficient Approaches.}
+
+Direct patch-based methods like Medverse \cite{huMedverseUniversalModel2025a} use sliding window inference to handle high resolutions, while Patchwork \cite{reisertDeepNeuralPatchworks2022a} employs a hierarchical stacking strategy to iteratively sample uncertain regions.
+
+\textit{Limitation:} Pure sliding windows treat patches independently, severing global context.
+
+
+\textbf{Our Approach:} Unlike implicit attention methods, we employ explicit patch selection trained via multi-level supervision. This allows our model to discard uninformative background regions before heavy processing, retaining global context efficiency without the computational cost of full-volume attention.
+
+\section{Method}
+
+\noindent \textbf{Input:} Target image $I^t \in \mathbb{R}^{H \times W}$ and context set $\{(I^c_i, L^c_i)\}_{i=1}^{N_c}$ of image/label mask pairs.
+
+\subsection{Hierarchical Cascaded Architecture}
+We propose a two-level cascaded framework that progressively refines segmentation masks by transitioning from global context to local detail. Images are first encoded into a dense feature grid $F \in \mathbb{R}^{64 \times 64 \times D}$ using a frozen feature extractor.
+
+\paragraph{Level 0: Coarse Global Context.}
+The first level operates at a $12 \times 12$ resolution. It utilizes a sliding window strategy to sample $K_0=4$ patches of size $8 \times 8$, providing a coarse global overview of the anatomical structures.
+
+\paragraph{Level 1: Fine Local Refinement.}
+The second level operates at a $36 \times 36$ resolution. It samples $K_1=6$ patches using a continuous sampling strategy. During inference, these patches are selectively sampled from regions of interest identified by the Level 0 predictions, allowing the model to focus its computational budget on relevant anatomical boundaries.
+
+\subsection{Border-Aligned Context Sampling}
+To ensure the context set provides high-signal guidance, we employ a border-aligned sampling strategy for context images. Sampling weights are computed as a 50/50 blend of foreground probability and boundary scores. This ensures that the transformer cross-attention mechanism prioritizes patches containing critical transition zones between organs and background.
+
+\subsection{Confidence-Driven Level Fusion}
+Predictions from the hierarchy are merged via a learned alpha-blending mechanism. A projection head operating on register tokens predicts a global factor $\alpha \in [0, 1]$, which determines the contribution of the Level 1 refinement relative to the upsampled Level 0 prediction. The fusion is further modulated by per-pixel confidence maps derived from the entropy of the prediction logits:
+\begin{equation}
+    \hat{L}_{combined} = \alpha \cdot \hat{L}_{L1} + (1 - \alpha) \cdot \text{up}(\hat{L}_{L0})
+\end{equation}
+
+\subsection{Scheduled Oracle Sampling}
+To mitigate exposure bias, we utilize scheduled oracle sampling during training. The probability of using ground truth labels to guide Level 1 sampling decays linearly from 1.0 to 0.2 over the first few epochs. This strategy allows the model to initially learn from "perfect" guidance before gradually adapting to the noisy intermediate predictions it will encounter during inference.
+
+\subsection{Multi-level Supervision}
+The framework is supervised using a Soft Dice loss applied at both the individual patch level and the aggregated global level. We apply level-specific loss weighting ($w_0=1.0, w_1=0.5$) to prioritize the formation of a robust coarse prediction as the foundation for refinement.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth,keepaspectratio]{imgs/figures/architecture.pdf}
+\caption{Cascaded PatchICL Architecture with two levels of refinement.}
+\label{fig:architecture}
+\end{figure}
+
+\section{Experiments}
+
+\textbf{Training:} TotalSegmentator CT \cite{wasserthalTotalSegmentatorRobustSegmentation2023} (training cases, training labels) (See Table \ref{tab:label_splits})
+
+\textbf{Evaluation:}
+\begin{itemize}
+    \item TotalSegmentator CT (validation cases, validation labels)
+    \item TotalSegmentator MRI \cite{dantonoliTotalSegmentatorMRIRobust2025} (all cases, all labels)
+\end{itemize}
+
+
+
+
+\section{Results}
+\subsection{In-domain}
+Baseline : Universeg \cite{butoiUniverSegUniversalMedical2023}  
+
+Parameters : $p=8$ ...
+
+\begin{table}[t]
+\centering
+\caption{Dice scores on TotalSegmentator CT validation set (mean $\pm$ std). Best results per category in \textbf{bold}.}\label{tab:dice_totalseg_ct}
+\begin{tabular}{lcc}
+\toprule
+Category & \textbf{PatchICL} & UniverSeg \\
+\midrule
+Organs (Abd./Pelvis)          & 0.268 $\pm$ 0.313 & \textbf{0.309 $\pm$ 0.335} \\
+Organs (Thorax/Head/Spine)    & 0.291 $\pm$ 0.293 & \textbf{0.320 $\pm$ 0.332} \\
+Bones (Spine)                 & \textbf{0.383 $\pm$ 0.338} & 0.243 $\pm$ 0.277 \\
+Bones (Ribs/Sternum)          & \textbf{0.246 $\pm$ 0.327} & 0.095 $\pm$ 0.186 \\
+Bones (Limbs/Shoulder/Pelvis) & \textbf{0.554 $\pm$ 0.352} & 0.395 $\pm$ 0.350 \\
+Muscles                       & 0.331 $\pm$ 0.337 & \textbf{0.396 $\pm$ 0.328} \\
+Vessels                       & 0.120 $\pm$ 0.207 & \textbf{0.153 $\pm$ 0.227} \\
+\midrule
+\textbf{Overall}              & \textbf{0.297 $\pm$ 0.330} & 0.242 $\pm$ 0.303 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Out-of-domain labels}
+
+
+\begin{table}[t]
+\centering
+\caption{Dice scores on TotalSegmentator MRI validation set (mean $\pm$ std). Best results per category in \textbf{bold}.}\label{tab:dice_totalseg_mri}
+\begin{tabular}{lcc}
+\toprule
+Category & PatchICL & \textbf{UniverSeg} \\
+\midrule
+Organs (Abd./Pelvis)          & 0.107 $\pm$ 0.205 & \textbf{0.172 $\pm$ 0.248} \\
+Organs (Thorax/Head/Spine)    & 0.056 $\pm$ 0.133 & \textbf{0.156 $\pm$ 0.231} \\
+Bones (Spine)                 & 0.129 $\pm$ 0.188 & \textbf{0.136 $\pm$ 0.210} \\
+Bones (Limbs/Shoulder/Pelvis) & \textbf{0.068 $\pm$ 0.145} & 0.062 $\pm$ 0.123 \\
+Muscles                       & \textbf{0.073 $\pm$ 0.166} & 0.064 $\pm$ 0.136 \\
+\midrule
+\textbf{Overall}              & 0.082 $\pm$ 0.175 & \textbf{0.117 $\pm$ 0.206} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Generalization to unseen dimensions}
+Accuracy and flops
+\subsubsection{Input image size}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{imgs/figures/universeg_input_size_bar.pdf}
+\caption{Accuracy and compute by input image size}
+\label{fig:dice_flops_per_input_size}
+\end{figure}
+
+\subsubsection{Number of context pairs}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{imgs/figures/universeg_context_size_bar.pdf}
+\caption{Accuracy and compute by number of context pairs}
+\label{fig:dice_flops_per_nb_context}
+\end{figure}
+
+
+\subsection{Explainability}
+\paragraph{Attention}
+
+\begin{itemize}
+    \item Do register tokens correlate with label id, label size, target-context distance ? 
+    \item Do empty patches attend to zeroAttn ? 
+\end{itemize}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{imgs/figures/reg_tokens_label.png}
+\caption{2D UMAP projection of register tokens labeled by class (TotalSegmentator, validation set)}
+\label{fig:reg_tokens_label}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{imgs/figures/reg_tokens_category.png}
+\caption{2D UMAP projection of register tokens labeled by category (TotalSegmentator, validation set)}
+\label{fig:reg_tokens_category}
+\end{figure}
+
+\paragraph{Explicit Sampling and Aggregation strategies}
+
+Since we operate on every level explicitly, we can explore multiple sampling and aggregation strategies.
+
+\begin{itemize}
+    \item best sampling strategy ? Sample at highest probs ? Or most uncertain is better ? 
+    \item best aggregation strategy ? replace previous probs everywhere ? Or only when certain ? 
+\end{itemize}
+ 
+
+\bibliographystyle{splncs04}
+\bibliography{ref}
+
+\newpage
+
+\begin{table}[t]
+\centering
+\caption{Train/validation label split across 100 TotalSegmentator classes. Labels are split 50/50 while maintaining anatomical diversity in both sets.}\label{tab:label_splits}
+\small
+\begin{tabular}{|p{3.2cm}|p{5.5cm}|p{5.5cm}|}
+\toprule
+\textbf{Category} & \textbf{Training (50)} & \textbf{Validation (50)} \\
+\midrule
+Organs (Abd./Pelvis) & Duodenum, esophagus, R.~kidney & Colon, gallbladder, L.~kidney, liver, pancreas, prostate, small bowel, spleen, stomach, urinary bladder \\
+\midrule
+Organs (Thorax/ Head/Spine) & Brain, heart, L.~lung (upper), R.~lung (middle) & L.~lung (lower), R.~lung (lower), R.~lung (upper), spinal cord, thyroid gland, trachea \\
+\midrule
+Bones (Spine) & L1, L2, L4, L5, T2, T4, T7, T9, T10, T12 & C7, T1, T3, T5, T6, T8, T11, L3, S1, sacrum \\
+\midrule
+Bones (Ribs/ Sternum) & Sternum, L.~ribs 1--4, 7; R.~ribs 5--10 & Costal cart., L.~ribs 5, 6, 8--11; R.~ribs 1--4, 11 \\
+\midrule
+Bones (Limbs/ Shoulder/Pelvis) & Skull, L.~femur, L.~humerus, L.~scapula, R.~clavicula, R.~hip, R.~scapula & L.~clavicula, L.~hip, R.~femur, R.~humerus \\
+\midrule
+Muscles & L.~autochthon, R.~autochthon, L.~glut.~max., L.~glut.~med., L.~glut.~min., R.~glut.~min. & L.~iliopsoas, R.~iliopsoas, R.~glut.~max., R.~glut.~med. \\
+\midrule
+Vessels & IVC, SVC, L.~brachioceph.~v., L.~iliac~v., R.~iliac~v., L.~subclavian~a., R.~iliac~a., portal/splenic~v. & Aorta, L.~iliac~a., pulmonary~v., R.~subclavian~a. \\
+\bottomrule
+\end{tabular}
+\end{table}

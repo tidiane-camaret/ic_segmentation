@@ -7,6 +7,7 @@ to guide patch sampling at finer levels.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -237,6 +238,16 @@ class PatchICL(nn.Module):
         while len(self.oracle_valid) < self.num_levels:
             self.oracle_valid.append(False)
 
+        # Oracle scheduling config (reduces train/val distribution mismatch)
+        # Gradually transitions from oracle (GT) to model predictions during training
+        oracle_sched_cfg = config.get('oracle_scheduling', {})
+        self.oracle_sched_enabled = oracle_sched_cfg.get('enabled', False)
+        self.oracle_sched_schedule = oracle_sched_cfg.get('schedule', 'linear')  # linear, exponential, inverse_sigmoid
+        self.oracle_sched_start = oracle_sched_cfg.get('start_prob', 1.0)
+        self.oracle_sched_end = oracle_sched_cfg.get('end_prob', 0.3)
+        self.oracle_sched_warmup = oracle_sched_cfg.get('warmup_epochs', 10)
+        self.oracle_sched_decay = oracle_sched_cfg.get('decay_epochs', 50)
+
         # Cascade config
         cascade_cfg = config.get('cascade', {})
         self.detach_between_levels = cascade_cfg.get('detach_between_levels', True)
@@ -275,16 +286,36 @@ class PatchICL(nn.Module):
 
         # Per-level samplers (each level can override sampling_method)
         self.samplers = nn.ModuleList()
+        self.context_samplers = nn.ModuleList()  # Separate samplers for context (fewer patches)
         for level_cfg in levels_cfg:
             level_sampler_type = level_cfg.get('sampling_method', self.sampler_type)
             level_stride = level_cfg.get('stride', self.default_stride)
+            num_patches = level_cfg['num_patches']
+            num_patches_val = level_cfg.get('num_patches_val', num_patches)
+            # Target sampler
             self.samplers.append(create_sampler(
                 sampler_type=level_sampler_type,
                 patch_size=level_cfg['patch_size'],
-                num_patches=level_cfg['num_patches'],
-                num_patches_val=level_cfg.get('num_patches_val', level_cfg['num_patches']),
+                num_patches=num_patches,
+                num_patches_val=num_patches_val,
                 temperature=level_cfg.get('sampling_temperature', 0.3),
                 stride=level_stride,
+                augmenter=self.augmenter,
+                pad_before=level_cfg.get('pad_before'),
+                pad_after=level_cfg.get('pad_after'),
+            ))
+            # Context sampler (uses num_context_patches if specified, else same as target)
+            # For sliding_window: context_stride controls patch count (stride takes precedence)
+            num_context_patches = level_cfg.get('num_context_patches', num_patches)
+            num_context_patches_val = level_cfg.get('num_context_patches_val', num_context_patches)
+            context_stride = level_cfg.get('context_stride', level_stride)
+            self.context_samplers.append(create_sampler(
+                sampler_type=level_sampler_type,
+                patch_size=level_cfg['patch_size'],
+                num_patches=num_context_patches,
+                num_patches_val=num_context_patches_val,
+                temperature=level_cfg.get('sampling_temperature', 0.3),
+                stride=context_stride,
                 augmenter=self.augmenter,
                 pad_before=level_cfg.get('pad_before'),
                 pad_after=level_cfg.get('pad_after'),
@@ -460,6 +491,51 @@ class PatchICL(nn.Module):
         # Linear interpolation from start to end
         return self.sampling_temp_start + progress * (self.sampling_temp_end - self.sampling_temp_start)
 
+    def _get_oracle_probability(self, level_idx: int) -> float:
+        """Compute oracle sampling probability with scheduled decay.
+
+        Implements scheduled sampling to reduce train/val distribution mismatch.
+        Gradually transitions from oracle (GT-guided) to model predictions.
+
+        Args:
+            level_idx: Level index (scheduling only applies to oracle-enabled levels)
+
+        Returns:
+            Probability of using oracle sampling (0.0 to 1.0)
+        """
+        # Only apply scheduling to levels with oracle_train=True
+        if not self.oracle_train[level_idx]:
+            return 0.0
+
+        # If scheduling disabled, return 1.0 (full oracle)
+        if not self.oracle_sched_enabled:
+            return 1.0
+
+        # Warmup period: full oracle
+        if self._current_epoch < self.oracle_sched_warmup:
+            return self.oracle_sched_start
+
+        # Compute progress through decay period
+        decay_progress = min(1.0, (self._current_epoch - self.oracle_sched_warmup) / max(1, self.oracle_sched_decay))
+
+        start = self.oracle_sched_start
+        end = self.oracle_sched_end
+
+        if self.oracle_sched_schedule == 'linear':
+            return start + decay_progress * (end - start)
+        elif self.oracle_sched_schedule == 'exponential':
+            # Exponential decay: start * (end/start)^progress
+            if end <= 0 or start <= 0:
+                return end
+            return start * (end / start) ** decay_progress
+        elif self.oracle_sched_schedule == 'inverse_sigmoid':
+            # Inverse sigmoid: smooth S-curve transition
+            k = 5.0  # Controls steepness
+            sigmoid_val = k / (k + math.exp(decay_progress * 2 * k - k))
+            return end + (start - end) * sigmoid_val
+        else:
+            return end
+
     def _apply_sampling_robustness(
         self,
         sampling_weights: torch.Tensor,
@@ -511,14 +587,52 @@ class PatchICL(nn.Module):
             return x
         return F.interpolate(x, size=(resolution, resolution), mode='bilinear', align_corners=False)
 
-    def _downsample_mask(self, mask: torch.Tensor, resolution: int) -> torch.Tensor:
-        """Downsample mask using area interpolation (soft area-fraction targets)."""
+    def _downsample_mask(
+        self,
+        mask: torch.Tensor,
+        resolution: int,
+        warn_if_empty: bool = True,
+        min_value: float = 0.3,
+    ) -> torch.Tensor:
+        """Downsample mask with hybrid approach: soft area fractions + small object preservation.
+
+        Uses area interpolation for soft targets, but ensures small objects get a minimum
+        value via max pooling. This prevents tiny labels from vanishing at coarse resolutions.
+
+        Args:
+            mask: [B, C, H, W] input mask
+            resolution: target resolution
+            min_value: minimum value for pixels where max pooling detects foreground
+        """
         if mask.shape[-1] == resolution and mask.shape[-2] == resolution:
             return mask
+
+        mask_float = mask.float()
+
+        # Area interpolation: soft area fractions (but small objects get diluted)
         if mask.shape[1] > 1:  # Multi-channel (RGB)
-            return F.interpolate(mask.float(), size=(resolution, resolution), mode='bilinear', align_corners=False)
-        # Use area interpolation for exact output size (avg_pool2d doesn't guarantee exact resolution)
-        return F.interpolate(mask.float(), size=(resolution, resolution), mode='area')
+            area_pooled = F.interpolate(mask_float, size=(resolution, resolution), mode='bilinear', align_corners=False)
+        else:
+            area_pooled = F.interpolate(mask_float, size=(resolution, resolution), mode='area')
+
+        # Max pooling: preserves presence of small objects (binary-ish)
+        max_pooled = F.adaptive_max_pool2d(mask_float, (resolution, resolution))
+
+        # Hybrid: use area value, but ensure minimum where max detects foreground
+        # This keeps soft boundaries for large objects while preserving small ones
+        result = torch.maximum(area_pooled, max_pooled * min_value)
+
+        # Fast warning: check if any sample has zero GT (truly empty labels)
+        if warn_if_empty and self.training:
+            per_sample_max = result.view(result.shape[0], -1).max(dim=1).values
+            num_empty = (per_sample_max < 1e-6).sum().item()
+            if num_empty > 0:
+                warnings.warn(
+                    f"GT mask is zero after downscaling to {resolution}x{resolution} "
+                    f"({num_empty}/{result.shape[0]} samples). Labels may be empty.",
+                    stacklevel=3
+                )
+        return result
 
     def _mask_to_weights(self, mask: torch.Tensor) -> torch.Tensor:
         """Convert multi-channel mask to single-channel weights for sampling."""
@@ -710,6 +824,7 @@ class PatchICL(nn.Module):
         resolution = level_cfg['resolution']
         patch_size = level_cfg['patch_size']
         sampler = self.samplers[level_idx]
+        context_sampler = self.context_samplers[level_idx]
         aggregator = self.aggregators[level_idx]
 
         B = image.shape[0]
@@ -778,7 +893,7 @@ class PatchICL(nn.Module):
             ).view(B, k, 1, resolution, resolution)
 
             context_patch_labels, context_coords, context_aug_params, context_validity, K_per_ctx = (
-                self._select_context_patches(context_in_ds, context_out_ds, context_weights, sampler)
+                self._select_context_patches(context_in_ds, context_out_ds, context_weights, context_sampler)
             )
             K_ctx = K_per_ctx * k
 
@@ -849,6 +964,7 @@ class PatchICL(nn.Module):
             backbone_out = self.backbone(
                 img_patches=img_patches, coords=all_coords, ctx_id_labels=ctx_id_labels,
                 return_attn_weights=return_attn_weights, level_idx=level_idx,
+                resolution=float(resolution),  # Pass actual resolution for FiLM conditioning
                 num_target_patches=K,
                 mask_prior_patches=mask_prior_patches,
                 context_mask_patches=context_mask_patches,
@@ -892,6 +1008,7 @@ class PatchICL(nn.Module):
                 img_patches=target_patch_features, coords=coords.float() * coord_scale,
                 ctx_id_labels=ctx_id_labels, return_attn_weights=return_attn_weights,
                 level_idx=level_idx,
+                resolution=float(resolution),  # Pass actual resolution for FiLM conditioning
                 mask_prior_patches=mask_prior_patches,
             )
             patch_logits = backbone_out['mask_patch_logit_preds']
@@ -977,19 +1094,27 @@ class PatchICL(nn.Module):
             patch_size = level_cfg['patch_size']
 
             # Determine sampling weights for this level (guides where patches are sampled)
-            use_oracle = self.oracle_train[i] if training else self.oracle_valid[i]
-            if use_oracle and labels is not None:
+            # Supports scheduled sampling: gradual transition from oracle to model predictions
+            if training:
+                oracle_prob = self._get_oracle_probability(i)
+            else:
+                oracle_prob = 1.0 if self.oracle_valid[i] else 0.0
+
+            # Compute oracle weights (from GT labels)
+            oracle_weights = None
+            if labels is not None:
                 labels_ds = self._downsample_mask(labels, resolution)
-                sampling_weights = self._mask_to_weights(labels_ds)
-                refined_probs = None
-            elif combined_pred is not None:
-                # Use previous level outputs for sampling weights
+                oracle_weights = self._mask_to_weights(labels_ds)
+
+            # Compute model weights (from previous level predictions)
+            model_weights = None
+            if combined_pred is not None:
                 if combined_conf is not None:
                     # Sample from LOW confidence regions (where model is uncertain)
                     conf_weights = 1.0 - combined_conf
                     if self.detach_between_levels:
                         conf_weights = conf_weights.detach()
-                    sampling_weights = F.interpolate(
+                    model_weights = F.interpolate(
                         conf_weights, size=(resolution, resolution),
                         mode='bilinear', align_corners=False
                     )
@@ -998,14 +1123,31 @@ class PatchICL(nn.Module):
                     combined_prob = torch.sigmoid(combined_pred)
                     if self.detach_between_levels:
                         combined_prob = combined_prob.detach()
-                    sampling_weights = F.interpolate(
+                    model_weights = F.interpolate(
                         combined_prob, size=(resolution, resolution),
                         mode='bilinear', align_corners=False
                     )
-                refined_probs = sampling_weights.clone()
+
+            # Mix oracle and model weights based on scheduled probability
+            refined_probs = None
+            if oracle_prob >= 1.0 and oracle_weights is not None:
+                # Full oracle mode
+                sampling_weights = oracle_weights
+            elif oracle_prob <= 0.0 or oracle_weights is None:
+                # Full model mode (or no oracle available)
+                if model_weights is not None:
+                    sampling_weights = model_weights
+                    refined_probs = sampling_weights.clone()
+                else:
+                    sampling_weights = torch.ones(B, 1, resolution, resolution, device=device)
             else:
-                sampling_weights = torch.ones(B, 1, resolution, resolution, device=device)
-                refined_probs = None
+                # Scheduled sampling: stochastic mix per sample
+                if model_weights is None:
+                    model_weights = torch.ones(B, 1, resolution, resolution, device=device)
+                # Per-sample decision: use oracle or model weights
+                use_oracle_mask = torch.rand(B, 1, 1, 1, device=device) < oracle_prob
+                sampling_weights = torch.where(use_oracle_mask, oracle_weights, model_weights)
+                refined_probs = model_weights.clone()  # Track model weights for logging
 
             # Apply sampling robustness (dropout + temperature annealing)
             sampling_weights = self._apply_sampling_robustness(sampling_weights, training)
@@ -1346,6 +1488,12 @@ class PatchICL(nn.Module):
         # Log learned temperature if applicable
         if self.confidence_method == 'entropy':
             losses['confidence_temperature'] = self.confidence_temperature.detach()
+
+        # Log oracle scheduling probabilities if enabled
+        if self.oracle_sched_enabled:
+            for i in range(self.num_levels):
+                if self.oracle_train[i]:
+                    losses[f'level_{i}_oracle_prob'] = self._get_oracle_probability(i)
 
         # Aggregated losses for logging (mean across levels)
         n = self.num_levels
