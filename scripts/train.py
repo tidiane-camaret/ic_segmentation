@@ -138,10 +138,16 @@ def main(cfg: DictConfig) -> None:
         )
 
     else:
-        # TotalSeg2D dataloader
-        from src.dataloaders.totalseg2d_dataloader_fast import (
-            get_dataloader as get_totalseg2d_dataloader,
-        )
+        # TotalSeg2D dataloader - select based on dataloader_type config
+        dataloader_type = cfg.get("dataloader_type", "fast")  # "fast" or "shared"
+        if dataloader_type == "shared":
+            from src.dataloaders.totalseg2d_shared_dataloader import (
+                get_dataloader as get_totalseg2d_dataloader,
+            )
+        else:
+            from src.dataloaders.totalseg2d_dataloader_fast import (
+                get_dataloader as get_totalseg2d_dataloader,
+            )
 
         train_labels = (
             cfg.train_label_ids
@@ -210,53 +216,108 @@ def main(cfg: DictConfig) -> None:
             else:
                 print("Augmentation disabled")
 
-        train_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.dataset,
-            stats_path=cfg.paths.dataset_stats,
+        # Shared dataloader specific config
+        same_case_context = cfg.get("same_case_context", False)
+        min_coverage = cfg.get("min_coverage", 100)
+        min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
+
+        # Resolve paths based on dataloader type
+        if dataloader_type == "shared":
+            # Use shared format paths: {base_dataset}_2d_shared/
+            # Derive from DATA_DIR and base dataset name (strip any 2d suffix)
+            data_dir = Path(cfg.paths.DATA_DIR)
+            base_dataset = cfg.get("base_dataset", "totalseg")  # e.g., "totalseg" or "totalsegmri"
+            shared_dir = data_dir / f"{base_dataset}_2d_shared"
+            root_dir = str(shared_dir)
+            stats_path = str(shared_dir / "stats.pkl")
+            if accelerator.is_main_process:
+                print(f"Shared dataloader root: {root_dir}")
+                print(f"Shared dataloader: same_case_context={same_case_context}, "
+                      f"min_coverage={min_coverage}, min_coverage_ratio={min_coverage_ratio}")
+        else:
+            root_dir = cfg.paths.dataset
+            stats_path = cfg.paths.dataset_stats
+
+        # Build train dataloader kwargs based on type
+        train_kwargs = dict(
+            root_dir=root_dir,
+            stats_path=stats_path,
             label_id_list=train_labels,
             context_size=cfg.context_size,
             batch_size=cfg.train_batch_size,
             image_size=_get_image_size(cfg),
-            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-            bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
             split=train_split,
             shuffle=True,
-            max_ds_len=max_ds_len_train,
-            random_coloring_nb=cfg.get("random_coloring_nb", 0),
-            # Legacy augmentation params
-            augment=use_image_augmentation,
-            augment_config=augment_config,
-            carve_mix=use_carve_mix,
-            carve_mix_config=carve_mix_config,
-            advanced_augmentation=use_adv_aug,
-            advanced_augmentation_config=adv_aug_config,
-            # Unified augmentation config (takes precedence)
-            augmentation_config=augmentation_config,
             max_labels=cfg.get("max_labels", None),
             max_cases=max_cases_train,
-            class_balanced=cfg.get("class_balanced", False),
-            slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
-        val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.dataset,
-            stats_path=cfg.paths.dataset_stats,
+        if dataloader_type == "shared":
+            # Shared dataloader params (now supports most fast dataloader features)
+            train_kwargs.update(
+                crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+                bbox_padding=cfg.preprocessing.bbox_padding,
+                min_coverage=min_coverage,
+                min_coverage_ratio=min_coverage_ratio,
+                same_case_context=same_case_context,
+                max_ds_len=max_ds_len_train,
+                class_balanced=cfg.get("class_balanced", False),
+                augmentation_config=augmentation_config,
+            )
+        else:
+            # Fast dataloader params
+            train_kwargs.update(
+                crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+                bbox_padding=cfg.preprocessing.bbox_padding,
+                max_ds_len=max_ds_len_train,
+                random_coloring_nb=cfg.get("random_coloring_nb", 0),
+                augment=use_image_augmentation,
+                augment_config=augment_config,
+                carve_mix=use_carve_mix,
+                carve_mix_config=carve_mix_config,
+                advanced_augmentation=use_adv_aug,
+                advanced_augmentation_config=adv_aug_config,
+                augmentation_config=augmentation_config,
+                class_balanced=cfg.get("class_balanced", False),
+                slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
+            )
+        train_loader = get_totalseg2d_dataloader(**train_kwargs)
+        # Build val dataloader kwargs based on type
+        val_kwargs = dict(
+            root_dir=root_dir,
+            stats_path=stats_path,
             label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,
             image_size=_get_image_size(cfg),
-            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-            bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
             split=val_split,
             shuffle=False,
-            max_ds_len=max_ds_len_val,
-            random_coloring_nb=cfg.get("random_coloring_nb", 0),
-            augment=False,  # No augmentation for validation
             max_labels=cfg.get("max_labels", None),
             max_cases=max_cases_val,
-            slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
+        if dataloader_type == "shared":
+            # Shared dataloader params
+            val_kwargs.update(
+                crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+                bbox_padding=cfg.preprocessing.bbox_padding,
+                min_coverage=min_coverage,
+                min_coverage_ratio=min_coverage_ratio,
+                same_case_context=same_case_context,
+                max_ds_len=max_ds_len_val,
+                augment=False,  # No augmentation for validation
+            )
+        else:
+            # Fast dataloader params
+            val_kwargs.update(
+                crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+                bbox_padding=cfg.preprocessing.bbox_padding,
+                max_ds_len=max_ds_len_val,
+                random_coloring_nb=cfg.get("random_coloring_nb", 0),
+                augment=False,
+                slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
+            )
+        val_loader = get_totalseg2d_dataloader(**val_kwargs)
 
     # Model selection based on method config
 

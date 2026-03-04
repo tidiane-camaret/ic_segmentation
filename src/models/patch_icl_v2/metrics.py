@@ -12,11 +12,11 @@ import torch.nn.functional as F
 
 
 # Thresholds for hard-dice metric binarization
-PRED_THRESHOLD = 0.5      # sigmoid probability -> binary prediction
-GT_AREA_THRESHOLD = 0.5  # soft avg-pooled GT -> binary (>=25% coverage = foreground)
+PRED_THRESHOLD = 0.5      # sigmoid probability -> binary 
+GT_AREA_THRESHOLD = 0.5  # soft avg-pooled GT -> binary 
 
 
-def _resize_label(label: torch.Tensor, size: tuple[int, int], min_value: float = 0.5) -> torch.Tensor:
+def _resize_label(label: torch.Tensor, size: tuple[int, int], min_value: float = 1) -> torch.Tensor:
     """Hybrid label resize: area interpolation + max pooling.
 
     Mirrors the _resize_mask approach in the dataloader: area pooling gives soft

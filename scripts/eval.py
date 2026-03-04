@@ -255,10 +255,16 @@ def main(cfg: DictConfig) -> None:
     val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
 
     # Get dataset class and dataloader
+    dataloader_type = cfg.get("dataloader_type", "fast")  # "fast" or "shared"
     if cfg.dataset in ["totalseg2d", "totalsegmri2d", "totalseg2d_every_n_slice"]:
-        from src.dataloaders.totalseg2d_dataloader_fast import (
-            get_dataloader as get_totalseg2d_dataloader,
-        )
+        if dataloader_type == "shared":
+            from src.dataloaders.totalseg2d_shared_dataloader import (
+                get_dataloader as get_totalseg2d_dataloader,
+            )
+        else:
+            from src.dataloaders.totalseg2d_dataloader_fast import (
+                get_dataloader as get_totalseg2d_dataloader,
+            )
     elif cfg.dataset == "medsegbench":
         from src.dataloaders.medsegbench_dataloader import (
             get_dataloader as get_medsegbench_dataloader,
@@ -288,25 +294,65 @@ def main(cfg: DictConfig) -> None:
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         modality = "mri" if "mri" in cfg.dataset else "ct"
-        val_loader = get_totalseg2d_dataloader(
-            root_dir=cfg.paths.dataset,
-            stats_path=cfg.paths.dataset_stats,
+
+        # Shared dataloader specific config
+        same_case_context = cfg.get("same_case_context", False)
+        min_coverage = cfg.get("min_coverage", 0)
+        min_coverage_ratio = cfg.get("min_coverage_ratio", 0)
+
+        # Resolve paths based on dataloader type
+        if dataloader_type == "shared":
+            # Use shared format paths: {base_dataset}_2d_shared/
+            # Derive from DATA_DIR and base dataset name (strip any 2d suffix)
+            data_dir = Path(cfg.paths.DATA_DIR)
+            base_dataset = cfg.get("base_dataset", "totalseg")  # e.g., "totalseg" or "totalsegmri"
+            shared_dir = data_dir / f"{base_dataset}_2d_shared"
+            root_dir = str(shared_dir)
+            stats_path = str(shared_dir / "stats.pkl")
+            if accelerator.is_main_process:
+                print(f"Shared dataloader root: {root_dir}")
+        else:
+            root_dir = cfg.paths.dataset
+            stats_path = cfg.paths.dataset_stats
+
+        # Build val dataloader kwargs based on type
+        val_kwargs = dict(
+            root_dir=root_dir,
+            stats_path=stats_path,
             label_id_list=val_labels,
             context_size=cfg.context_size,
             batch_size=cfg.val_batch_size,
             image_size=_get_image_size(cfg),
-            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-            bbox_padding=cfg.preprocessing.bbox_padding,
             num_workers=cfg.training.get("num_workers", 4),
             split=val_split,
             shuffle=False,
-            random_context=False,
-            max_ds_len=max_ds_len_val,
-            random_coloring_nb=cfg.get("random_coloring_nb", 0),
             max_labels=cfg.get("max_labels", None),
             modality=modality,
-            slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
+        if dataloader_type == "shared":
+            val_kwargs.update(
+                crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+                bbox_padding=cfg.preprocessing.bbox_padding,
+                min_coverage=min_coverage,
+                min_coverage_ratio=min_coverage_ratio,
+                same_case_context=same_case_context,
+                max_ds_len=max_ds_len_val,
+                random_context=False,
+                augment=False,
+            )
+            if accelerator.is_main_process:
+                print(f"Using shared dataloader: same_case_context={same_case_context}, "
+                      f"min_coverage={min_coverage}, min_coverage_ratio={min_coverage_ratio}")
+        else:
+            val_kwargs.update(
+                crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+                bbox_padding=cfg.preprocessing.bbox_padding,
+                random_context=False,
+                max_ds_len=max_ds_len_val,
+                random_coloring_nb=cfg.get("random_coloring_nb", 0),
+                slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
+            )
+        val_loader = get_totalseg2d_dataloader(**val_kwargs)
 
     elif cfg.dataset == "medsegbench":
         msb_cfg = cfg.get("medsegbench", {})
