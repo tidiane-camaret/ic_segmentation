@@ -221,6 +221,10 @@ def main(cfg: DictConfig) -> None:
         min_coverage = cfg.get("min_coverage", 100)
         min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
 
+        # Slice subsampling config (shared dataloader only)
+        max_slices_per_group = cfg.get("max_slices_per_group", None)
+        slice_selection = cfg.get("slice_selection", "all")
+
         # Resolve paths based on dataloader type
         if dataloader_type == "shared":
             # Use shared format paths: {base_dataset}_2d_shared/
@@ -263,6 +267,8 @@ def main(cfg: DictConfig) -> None:
                 max_ds_len=max_ds_len_train,
                 class_balanced=cfg.get("class_balanced", False),
                 augmentation_config=augmentation_config,
+                max_slices_per_group=max_slices_per_group,
+                slice_selection=slice_selection,
             )
         else:
             # Fast dataloader params
@@ -307,6 +313,8 @@ def main(cfg: DictConfig) -> None:
                 same_case_context=same_case_context,
                 max_ds_len=max_ds_len_val,
                 augment=False,  # No augmentation for validation
+                max_slices_per_group=max_slices_per_group,
+                slice_selection=slice_selection,
             )
         else:
             # Fast dataloader params

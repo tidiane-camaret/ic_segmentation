@@ -300,6 +300,10 @@ def main(cfg: DictConfig) -> None:
         min_coverage = cfg.get("min_coverage", 100)
         min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
 
+        # Slice subsampling config (shared dataloader only)
+        max_slices_per_group = cfg.get("max_slices_per_group", None)
+        slice_selection = cfg.get("slice_selection", "all")
+
         # Resolve paths based on dataloader type
         if dataloader_type == "shared":
             # Use shared format paths: {base_dataset}_2d_shared/
@@ -339,6 +343,8 @@ def main(cfg: DictConfig) -> None:
                 max_ds_len=max_ds_len_val,
                 random_context=False,
                 augment=False,
+                max_slices_per_group=max_slices_per_group,
+                slice_selection=slice_selection,
             )
             if accelerator.is_main_process:
                 print(f"Using shared dataloader: same_case_context={same_case_context}, "

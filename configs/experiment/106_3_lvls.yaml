@@ -83,7 +83,7 @@ model:
       target_self_attention: true
       dropout: 0.1
       append_zero_attn: true
-      use_mask_prior: true
+      use_mask_prior: false
       use_context_mask: true
       mask_fusion_type: "concat"
       predict_confidence: false
@@ -117,3 +117,4 @@ model:
       confidence_blend: true       # Blends levels by confidence (no-op with 1 level)
       learned_alpha: true           # Learn α from register tokens
       conf_weighted_aggreg: false    # Aggreg loss weighted by confidence
+      cascade_registers: true 

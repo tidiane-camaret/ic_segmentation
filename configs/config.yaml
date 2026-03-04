@@ -47,7 +47,9 @@ same_case_context: True
 # Coverage filtering: slice valid if coverage >= max(min_coverage, max_coverage * min_coverage_ratio)
 min_coverage: 5  # Minimum pixels for slice to be valid
 min_coverage_ratio: 0  # Minimum ratio of max coverage
-
+ # Slice subsampling (shared dataloader only)                                                                                                                                             
+max_slices_per_group: 10   # Max slices per (case, label, axis), null for unlimited
+slice_selection: "stride_peak"  # "all", "random", "stride", "stride_peak"
 # Dataloader
 train_batch_size: 50
 val_batch_size: 64
