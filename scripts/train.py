@@ -216,7 +216,7 @@ def main(cfg: DictConfig) -> None:
             else:
                 print("Augmentation disabled")
 
-        # Shared dataloader specific config
+        # Coverage filtering config (unified for fast and shared dataloaders)
         same_case_context = cfg.get("same_case_context", False)
         min_coverage = cfg.get("min_coverage", 100)
         min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
@@ -279,7 +279,8 @@ def main(cfg: DictConfig) -> None:
                 advanced_augmentation_config=adv_aug_config,
                 augmentation_config=augmentation_config,
                 class_balanced=cfg.get("class_balanced", False),
-                slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
+                min_coverage=min_coverage,
+                min_coverage_ratio=min_coverage_ratio,
             )
         train_loader = get_totalseg2d_dataloader(**train_kwargs)
         # Build val dataloader kwargs based on type
@@ -315,7 +316,8 @@ def main(cfg: DictConfig) -> None:
                 max_ds_len=max_ds_len_val,
                 random_coloring_nb=cfg.get("random_coloring_nb", 0),
                 augment=False,
-                slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
+                min_coverage=min_coverage,
+                min_coverage_ratio=min_coverage_ratio,
             )
         val_loader = get_totalseg2d_dataloader(**val_kwargs)
 

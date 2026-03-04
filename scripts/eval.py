@@ -295,10 +295,10 @@ def main(cfg: DictConfig) -> None:
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
         modality = "mri" if "mri" in cfg.dataset else "ct"
 
-        # Shared dataloader specific config
+        # Coverage filtering config (unified for fast and shared dataloaders)
         same_case_context = cfg.get("same_case_context", False)
-        min_coverage = cfg.get("min_coverage", 0)
-        min_coverage_ratio = cfg.get("min_coverage_ratio", 0)
+        min_coverage = cfg.get("min_coverage", 100)
+        min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
 
         # Resolve paths based on dataloader type
         if dataloader_type == "shared":
@@ -350,7 +350,8 @@ def main(cfg: DictConfig) -> None:
                 random_context=False,
                 max_ds_len=max_ds_len_val,
                 random_coloring_nb=cfg.get("random_coloring_nb", 0),
-                slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
+                min_coverage=min_coverage,
+                min_coverage_ratio=min_coverage_ratio,
             )
         val_loader = get_totalseg2d_dataloader(**val_kwargs)
 

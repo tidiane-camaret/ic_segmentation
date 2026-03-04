@@ -6,6 +6,9 @@ defaults:
   - /augmentation
   - override /method: patch_icl
 
+# Shared dataloader : ct slices are sampled evenly regardless of label
+
+
 preprocessing:
   image_size: 128
 model:

@@ -5,9 +5,6 @@ defaults:
 
 class_balanced: false
 context_size: 10
-same_case_context: True
-#slice_coverage_ratio: 0.5 # old param
-min_coverage: 0
-min_coverage_ratio: 0
-dataloader_type: shared
+
+
 

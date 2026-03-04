@@ -94,13 +94,16 @@ class TotalSeg2DDataset(Dataset):
         max_cases: Optional[int] = None,
         class_balanced: bool = False,
         modality: str = "ct",  # "ct" or "mri"
-        slice_coverage_ratio: float = 0.5,  # Filter slices with coverage < ratio * max_coverage
+        # Coverage filtering (unified with shared dataloader)
+        min_coverage: int = 100,  # Minimum pixels for a slice to be valid
+        min_coverage_ratio: float = 0.1,  # Minimum ratio of max coverage
         # Context diversity selection
         context_diversity: Optional[Dict] = None,  # {type: "farthest", num_candidates: 10}
     ):
         self.root_dir = Path(root_dir)
         self.modality = modality.lower()
-        self.slice_coverage_ratio = slice_coverage_ratio
+        self.min_coverage = min_coverage
+        self.min_coverage_ratio = min_coverage_ratio
 
         # Context diversity config
         div_cfg = context_diversity or {}
@@ -206,15 +209,15 @@ class TotalSeg2DDataset(Dataset):
                                 n_slices = num_slices.get(axis, 0) if num_slices else (1 if slice_coverage.get(axis, 0) > 0 else 0)
                                 axis_coverages = slice_coverages.get(axis, [])
 
-                                # Filter slices by coverage ratio
-                                if axis_coverages and self.slice_coverage_ratio > 0:
-                                    max_cov = max(axis_coverages) if axis_coverages else 1
-                                    threshold = max_cov * self.slice_coverage_ratio
+                                # Filter slices by coverage (absolute min + ratio)
+                                if axis_coverages:
+                                    max_cov = max(axis_coverages) if axis_coverages else 0
+                                    threshold = max(self.min_coverage, max_cov * self.min_coverage_ratio)
                                     for slice_idx in range(n_slices):
                                         if slice_idx < len(axis_coverages) and axis_coverages[slice_idx] >= threshold:
                                             self.samples.append((case_id, label_id, axis, slice_idx))
                                 else:
-                                    # No coverage data or ratio=0: include all slices
+                                    # No coverage data: include all slices
                                     for slice_idx in range(n_slices):
                                         self.samples.append((case_id, label_id, axis, slice_idx))
 
@@ -229,7 +232,7 @@ class TotalSeg2DDataset(Dataset):
         self.active_labels = list(self.label_to_samples.keys())
 
         print(f"Built mapping for {len(self.label_to_cases)} labels.")
-        print(f"Created {len(self.samples)} samples (modality={self.modality}, slice_coverage_ratio={self.slice_coverage_ratio})")
+        print(f"Created {len(self.samples)} samples (modality={self.modality}, min_coverage={self.min_coverage}, min_coverage_ratio={self.min_coverage_ratio})")
         if self.class_balanced:
             label_counts = {l: len(s) for l, s in self.label_to_samples.items()}
             min_l = min(label_counts, key=label_counts.get)

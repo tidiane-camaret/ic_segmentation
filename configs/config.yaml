@@ -25,6 +25,7 @@ random_coloring_nb: 0
 max_labels: 50
 train_label_ids: "train"
 val_label_ids: "val"
+ 
 
 # MedSegBench-specific settings (used when dataset=medsegbench)
 medsegbench:
@@ -41,7 +42,11 @@ preprocessing:
 
 max_files_3d_to_2d: null  # Limit number of cases/files to process (for debugging)
 class_balanced: true  # Uniform label sampling (each label equally likely per step)
-slice_coverage_ratio: 0.5  # Filter slices with coverage < ratio * max_coverage (0 = no filter)
+dataloader_type: shared
+same_case_context: True
+# Coverage filtering: slice valid if coverage >= max(min_coverage, max_coverage * min_coverage_ratio)
+min_coverage: 50  # Minimum pixels for slice to be valid
+min_coverage_ratio: 0.1  # Minimum ratio of max coverage
 
 # Dataloader
 train_batch_size: 50
