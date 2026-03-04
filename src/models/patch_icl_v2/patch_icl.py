@@ -251,6 +251,8 @@ class PatchICL(nn.Module):
         # Cascade config
         cascade_cfg = config.get('cascade', {})
         self.detach_between_levels = cascade_cfg.get('detach_between_levels', True)
+        # Pass register tokens from level N as extra context tokens to level N+1
+        self.cascade_registers = cascade_cfg.get('cascade_registers', False)
 
         # Sampling robustness config (improves train/val generalization gap)
         sampling_robustness_cfg = config.get('sampling_robustness', {})
@@ -808,6 +810,7 @@ class PatchICL(nn.Module):
         W: int,
         return_attn_weights: bool = False,
         mask_prior: torch.Tensor | None = None,
+        prev_register_tokens: torch.Tensor | None = None,
     ) -> tuple[dict, torch.Tensor, torch.Tensor | None]:
         """Process a single resolution level.
 
@@ -968,6 +971,7 @@ class PatchICL(nn.Module):
                 num_target_patches=K,
                 mask_prior_patches=mask_prior_patches,
                 context_mask_patches=context_mask_patches,
+                prev_register_tokens=prev_register_tokens,
             )
 
             all_logits = backbone_out['mask_patch_logit_preds']
@@ -1010,6 +1014,7 @@ class PatchICL(nn.Module):
                 level_idx=level_idx,
                 resolution=float(resolution),  # Pass actual resolution for FiLM conditioning
                 mask_prior_patches=mask_prior_patches,
+                prev_register_tokens=prev_register_tokens,
             )
             patch_logits = backbone_out['mask_patch_logit_preds']
             if self.confidence_method == 'entropy':
@@ -1086,6 +1091,7 @@ class PatchICL(nn.Module):
         # Process each level with progressive refinement
         combined_pred = None  # Progressively refined prediction
         combined_conf = None  # Progressively refined confidence
+        prev_register_tokens = None  # Register tokens from previous level (for cascade_registers)
         level_outputs = []
 
         for i in range(self.num_levels):
@@ -1173,11 +1179,16 @@ class PatchICL(nn.Module):
                 H=H, W=W,
                 return_attn_weights=return_attn_weights,
                 mask_prior=mask_prior,
+                prev_register_tokens=prev_register_tokens if self.cascade_registers else None,
             )
 
             # Progressive refinement: blend current prediction with previous combined
             coords = level_out['coords']
             register_tokens = level_out.get('register_tokens')
+
+            # Update cascade register tokens for the next level
+            if self.cascade_registers and register_tokens is not None:
+                prev_register_tokens = register_tokens.detach() if self.detach_between_levels else register_tokens
 
             # Compute coverage mask once (reused for blending and level_out)
             coverage = self._create_coverage_mask(coords, patch_size, (resolution, resolution))

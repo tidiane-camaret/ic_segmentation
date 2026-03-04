@@ -61,10 +61,15 @@ class TotalSeg2DSharedDataset(Dataset):
         augmentation_config: Optional[Dict] = None,
         # Context diversity
         context_diversity: Optional[Dict] = None,
+        # Slice subsampling
+        max_slices_per_group: Optional[int] = None,  # Max slices per (case, label, axis)
+        slice_selection: str = "all",  # "all", "random", "stride", "stride_peak"
     ):
         self.root_dir = Path(root_dir)
         self.modality = modality.lower()
         self.same_case_context = same_case_context
+        self.max_slices_per_group = max_slices_per_group
+        self.slice_selection = slice_selection
         self.min_coverage = min_coverage
         self.min_coverage_ratio = min_coverage_ratio
         self.context_size = context_size
@@ -147,12 +152,16 @@ class TotalSeg2DSharedDataset(Dataset):
                     max_cov = max(axis_coverage) if axis_coverage else 0
                     threshold = max(self.min_coverage, max_cov * self.min_coverage_ratio)
 
-                    for slice_idx, cov in enumerate(axis_coverage):
-                        if cov >= threshold:
-                            self.samples.append((case_id, label_id, axis, slice_idx))
+                    valid_slices = [
+                        (si, cov) for si, cov in enumerate(axis_coverage) if cov >= threshold
+                    ]
+                    if self.max_slices_per_group is not None:
+                        valid_slices = self._select_slices(valid_slices, self.max_slices_per_group)
+                    for slice_idx, _ in valid_slices:
+                        self.samples.append((case_id, label_id, axis, slice_idx))
 
                     # Track which cases have this label
-                    if any(c >= threshold for c in axis_coverage):
+                    if valid_slices:
                         self.label_to_cases.setdefault(label_id, []).append(case_id)
                         self.case_to_labels[case_id].add(label_id)
 
@@ -220,6 +229,40 @@ class TotalSeg2DSharedDataset(Dataset):
             print("Warning: Could not import augmentation functions, augmentation disabled")
             self.spatial_transform = None
             self.intensity_transform = None
+
+    def _select_slices(
+        self, valid_slices: List[Tuple[int, float]], max_slices: int
+    ) -> List[Tuple[int, float]]:
+        """Subsample valid slices per (case, label, axis) group.
+
+        valid_slices: list of (slice_idx, coverage) in spatial order.
+        Returns at most max_slices entries.
+        """
+        n = len(valid_slices)
+        if n <= max_slices:
+            return valid_slices
+
+        if self.slice_selection == "random":
+            # Uniform random without replacement, preserve spatial order
+            return sorted(random.sample(valid_slices, max_slices), key=lambda x: x[0])
+
+        elif self.slice_selection == "stride":
+            # Evenly-spaced by spatial position
+            indices = np.linspace(0, n - 1, max_slices, dtype=int)
+            return [valid_slices[i] for i in indices]
+
+        elif self.slice_selection == "stride_peak":
+            # Reserve one slot for the peak-coverage slice, stride the rest
+            peak_pos = max(range(n), key=lambda i: valid_slices[i][1])
+            without_peak = [s for i, s in enumerate(valid_slices) if i != peak_pos]
+            n_stride = max_slices - 1
+            if n_stride == 0:
+                return [valid_slices[peak_pos]]
+            indices = np.linspace(0, len(without_peak) - 1, n_stride, dtype=int)
+            selected = [without_peak[i] for i in indices] + [valid_slices[peak_pos]]
+            return sorted(selected, key=lambda x: x[0])
+
+        return valid_slices  # "all"
 
     def _filter_by_split(self, split: Union[str, List[str]]):
         """Filter cases by train/val/test split."""

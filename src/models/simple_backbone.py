@@ -593,6 +593,7 @@ class CrossPatchAttention(nn.Module):
         is_context: torch.Tensor,
         return_attn_weights: bool = False,
         num_target_patches: int | None = None,
+        prev_register_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict | None]:
         """
         Args:
@@ -602,6 +603,9 @@ class CrossPatchAttention(nn.Module):
             return_attn_weights: If True, return attention weights and registers
             num_target_patches: Number of target patches (first N tokens).
                 Required for context-first attention; if None, context stage is skipped.
+            prev_register_tokens: [B, R, D] - register tokens from the previous level.
+                If provided, they are inserted as extra context-type tokens before the
+                patch sequence so all patches can attend to the prior level's summary.
 
         Returns:
             x: [B, K, D] - updated tokens
@@ -653,16 +657,31 @@ class CrossPatchAttention(nn.Module):
             x = torch.cat([x[:, :K_t], ctx_x], dim=1)
 
         # Stage 2: Joint attention (all patches together)
-        # Add registers
+        # Add fresh registers
+        num_fresh_reg = self.num_registers if self.register_tokens is not None else 0
         if self.register_tokens is not None:
             registers = self.register_tokens.expand(B, -1, -1)
             x = torch.cat([registers, x], dim=1)  # [B, R+K, D]
-            reg_mask = torch.ones(B, self.num_registers, dtype=torch.bool, device=device)
+            reg_mask = torch.ones(B, num_fresh_reg, dtype=torch.bool, device=device)
             is_context_with_reg = torch.cat([reg_mask, is_context], dim=1)
         else:
             is_context_with_reg = is_context
 
-        num_reg = self.num_registers if self.register_tokens is not None else 0
+        # Insert cascade tokens from previous level (after fresh registers, before patches).
+        # Treated as context-type so they inform all queries without being predicted on.
+        num_cascade = 0
+        if prev_register_tokens is not None:
+            num_cascade = prev_register_tokens.shape[1]
+            cascade_mask = torch.ones(B, num_cascade, dtype=torch.bool, device=device)
+            x = torch.cat([x[:, :num_fresh_reg], prev_register_tokens, x[:, num_fresh_reg:]], dim=1)
+            is_context_with_reg = torch.cat([
+                is_context_with_reg[:, :num_fresh_reg],
+                cascade_mask,
+                is_context_with_reg[:, num_fresh_reg:],
+            ], dim=1)
+
+        # Total register-like tokens at the front (no RoPE applied to these)
+        num_reg_total = num_fresh_reg + num_cascade
 
         # Run through attention layers (per-layer type embed + RoPE)
         all_attn_weights = []
@@ -676,7 +695,7 @@ class CrossPatchAttention(nn.Module):
                     coords,
                     self.rope_cache,
                     self.image_size,
-                    num_reg,
+                    num_reg_total,
                     False,  # return_attn_weights must be False for checkpointing
                     use_reentrant=False,
                 )
@@ -687,7 +706,7 @@ class CrossPatchAttention(nn.Module):
                     coords=coords,
                     rope_cache=self.rope_cache,
                     image_size=self.image_size,
-                    num_registers=num_reg,
+                    num_registers=num_reg_total,
                     return_attn_weights=return_attn_weights,
                 )
             if attn_w is not None:
@@ -696,14 +715,14 @@ class CrossPatchAttention(nn.Module):
         # Final norm
         x = self.final_norm(x)
 
-        # Always capture register tokens (needed for learned alpha)
+        # Capture only the fresh register tokens (cascade tokens are discarded)
         register_tokens_out = None
         if self.register_tokens is not None:
-            register_tokens_out = x[:, :self.num_registers].clone()
+            register_tokens_out = x[:, :num_fresh_reg].clone()
 
-        # Remove registers
-        if self.register_tokens is not None:
-            x = x[:, self.num_registers:]
+        # Remove all register-like tokens (fresh + cascade)
+        if num_reg_total > 0:
+            x = x[:, num_reg_total:]
 
         # Always return extras dict with register_tokens
         extras = {
@@ -1028,6 +1047,7 @@ class SimpleBackbone(nn.Module):
         num_target_patches: int | None = None,
         mask_prior_patches: torch.Tensor | None = None,
         context_mask_patches: torch.Tensor | None = None,
+        prev_register_tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass: encode → attention → decode.
@@ -1112,6 +1132,7 @@ class SimpleBackbone(nn.Module):
         attended, extras = self.attention(
             encoded, coords, is_context, return_attn_weights,
             num_target_patches=num_target_patches,
+            prev_register_tokens=prev_register_tokens,
         )
 
         # Decode with resolution conditioning
