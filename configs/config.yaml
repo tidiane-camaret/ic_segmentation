@@ -45,8 +45,8 @@ class_balanced: true  # Uniform label sampling (each label equally likely per st
 dataloader_type: shared
 same_case_context: True
 # Coverage filtering: slice valid if coverage >= max(min_coverage, max_coverage * min_coverage_ratio)
-min_coverage: 50  # Minimum pixels for slice to be valid
-min_coverage_ratio: 0.1  # Minimum ratio of max coverage
+min_coverage: 5  # Minimum pixels for slice to be valid
+min_coverage_ratio: 0  # Minimum ratio of max coverage
 
 # Dataloader
 train_batch_size: 50

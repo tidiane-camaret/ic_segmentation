@@ -1,0 +1,119 @@
+# @package _global_
+# Inherits from method/patch_icl.yaml for model config.
+# Entropy-based confidence: conf = 1 - H(p)/log(2)
+
+defaults:
+  - /augmentation
+  - override /method: patch_icl
+
+# Shared dataloader : ct slices are sampled evenly regardless of label
+
+
+preprocessing:
+  image_size: 128
+model:
+  patch_icl:
+    feature_extractor:
+      output_grid_size: 64
+      freeze: true
+    levels:
+      - resolution: 20
+        patch_size: 8
+        sampling_method: "sliding_window"
+        stride: 7
+        num_patches: 9
+        num_context_patches: 9
+        pad_before: 1
+        pad_after: 1
+      - resolution: 36
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 10
+        num_context_patches: 4  # Fewer patches for context (default: num_patches)
+        pad_before: 1
+        pad_after: 1
+      - resolution: 60
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 20
+        num_context_patches: 4  # Fewer patches for context (default: num_patches)
+        pad_before: 1
+        pad_after: 1
+
+    oracle_levels_train: [false, true, true]
+    oracle_levels_valid: [false, false, false]
+
+    # Scheduled sampling: gradually transition from oracle to model predictions
+    # Reduces train/val distribution mismatch (exposure bias)
+    oracle_scheduling:
+      enabled: true
+      schedule: "linear"        # linear, exponential, inverse_sigmoid
+      start_prob: 1.0           # Start with full oracle
+      end_prob: 0.2             # End with 30% oracle (keep some GT signal)
+      warmup_epochs: 1         # Full oracle for first 10 epochs
+      decay_epochs: 5          # Decay over 50 epochs
+
+    sampler:
+      context_sampling: "border"    # Align context with target: sample from borders
+      context_border_weight: 0.5    # Blend: 50% foreground + 50% border
+
+    aggregator:
+      type: "average"
+      # Note: combine_mode not used - level blending handled by cascade.confidence_blend
+      min_coverage: 1e-6
+      use_confidence: true
+      confidence_mode: "multiply"
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: "${preprocessing.image_size}"
+      embed_dim: 256
+      embed_proj_dim: 256
+      feature_grid_size: "${model.patch_icl.feature_extractor.output_grid_size}"
+      patch_feature_grid_size: 8
+      num_heads: 4
+      num_layers: 2
+      num_context_layers: 1
+      num_registers: 4
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: true
+      use_context_mask: true
+      mask_fusion_type: "concat"
+      predict_confidence: false
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args: null
+      aggreg_loss:
+        type: "softdiceFocal"
+        args: null
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 0.5
+          context_aggreg: 0.5
+      level_weights: [1.0, 0.5, 0.25]
+      confidence:
+        method: "entropy"
+        enabled: true
+        temperature: 1.0
+        learn_temperature: true
+        supervision_weight: 0.0  # Light supervision: conf correlates with correctness
+        boundary_weight: 0
+        boundary_width: 2
+        weighted_seg: false
+
+    cascade:
+      detach_between_levels: false  # Detach gradients between levels to prevent interference (default: false)
+      confidence_blend: true       # Blends levels by confidence (no-op with 1 level)
+      learned_alpha: true           # Learn α from register tokens
+      conf_weighted_aggreg: false    # Aggreg loss weighted by confidence
