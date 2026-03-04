@@ -16,6 +16,26 @@ PRED_THRESHOLD = 0.5      # sigmoid probability -> binary prediction
 GT_AREA_THRESHOLD = 0.5  # soft avg-pooled GT -> binary (>=25% coverage = foreground)
 
 
+def _resize_label(label: torch.Tensor, size: tuple[int, int], min_value: float = 0.5) -> torch.Tensor:
+    """Hybrid label resize: area interpolation + max pooling.
+
+    Mirrors the _resize_mask approach in the dataloader: area pooling gives soft
+    coverage fractions but erases small objects; max pooling preserves their
+    presence. The hybrid ensures any detected foreground contributes >= min_value.
+
+    Args:
+        label: [B, C, H, W] float tensor
+        size: target (H, W)
+        min_value: minimum foreground weight when max pool detects presence
+
+    Returns:
+        Resized label [B, C, *size]
+    """
+    area = F.interpolate(label, size=size, mode='area')
+    maxp = F.adaptive_max_pool2d(label, size)
+    return torch.maximum(area, maxp * min_value)
+
+
 def compute_pixel_mae(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -117,9 +137,7 @@ def compute_level_metrics(
 
     for li, level_out in enumerate(level_outputs):
         level_pred = level_out['pred']
-        labels_ds = F.interpolate(
-            labels.float(), size=level_pred.shape[-2:], mode='area'
-        )
+        labels_ds = _resize_label(labels.float(), size=level_pred.shape[-2:])
 
         dice_result = compute_dice(level_pred, labels_ds)
         metrics[f'level_{li}_dice'] = dice_result['dice'].mean()
@@ -129,9 +147,7 @@ def compute_level_metrics(
         # Refined probs dice (sampling guidance quality from progressive refinement)
         refined_probs = level_out.get('refined_probs')
         if refined_probs is not None:
-            rp_gt = F.interpolate(
-                labels.float(), size=refined_probs.shape[-2:], mode='area'
-            )
+            rp_gt = _resize_label(labels.float(), size=refined_probs.shape[-2:])
 
             # Soft dice (refined_probs is already probabilities)
             rp_dice = compute_dice(refined_probs, rp_gt, apply_sigmoid=False)

@@ -33,7 +33,7 @@ def _get_data_dir_from_config() -> Path:
             continue
 
     # Fallback to default
-    return Path("/work/dlclarge2/ndirt-SegFM3D/data")
+    return Path("/nfs/data/nii/data1/Analysis/camaret___in_context_segmentation/ANALYSIS_20251122/data")
 
 
 # Labels by total volume (occurrences * avg_volume) from totalseg_2d.ipynb
@@ -291,6 +291,7 @@ category_map = {
 
 """
 totalseg_dir = _get_data_dir_from_config() / "totalseg"
+print(f"totalseg_dir: {totalseg_dir}")
 labels_stats_df = pd.read_csv(totalseg_dir / "label_stats.csv", index_col="label_id")
 labels_stats_df.sort_values("occurrences", ascending=False)
 

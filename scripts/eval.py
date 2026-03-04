@@ -4,22 +4,20 @@ for each case in val set:
 - save img/gt/pred logits/probits as npz
 - save attention maps and register tokens
 """
-import datetime
+from datetime import datetime
 import sys
 from pathlib import Path
 
 import hydra
 import numpy as np
 import torch
-from datetime import datetime
-
 from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src import in meta cluster
 from src.losses import build_loss_fn
-from src.train_utils import seed_everything, train_epoch, validate, wait_for_image_saves
+from src.train_utils import seed_everything, validate, wait_for_image_saves
 
 
 def _get_image_size(cfg) -> tuple[int, int]:
@@ -289,6 +287,7 @@ def main(cfg: DictConfig) -> None:
     if cfg.dataset in ["totalseg2d", "totalsegmri2d", "totalseg2d_every_n_slice"]:
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
+        modality = "mri" if "mri" in cfg.dataset else "ct"
         val_loader = get_totalseg2d_dataloader(
             root_dir=cfg.paths.dataset,
             stats_path=cfg.paths.dataset_stats,
@@ -305,6 +304,7 @@ def main(cfg: DictConfig) -> None:
             max_ds_len=max_ds_len_val,
             random_coloring_nb=cfg.get("random_coloring_nb", 0),
             max_labels=cfg.get("max_labels", None),
+            modality=modality,
             slice_coverage_ratio=cfg.get("slice_coverage_ratio", 0.5),
         )
 

@@ -17,7 +17,7 @@ from src.models.patch_icl_v2.aggregate import (
     PatchAggregator,
     create_aggregator,
 )
-from src.models.patch_icl_v2.metrics import compute_dice, GT_AREA_THRESHOLD
+from src.models.patch_icl_v2.metrics import compute_dice, GT_AREA_THRESHOLD, _resize_label
 from src.models.patch_icl_v2.sampling import (
     ContinuousSampler,
     PatchAugmenter,
@@ -592,7 +592,7 @@ class PatchICL(nn.Module):
         mask: torch.Tensor,
         resolution: int,
         warn_if_empty: bool = True,
-        min_value: float = 0.3,
+        min_value: float = 0.5,
     ) -> torch.Tensor:
         """Downsample mask with hybrid approach: soft area fractions + small object preservation.
 
@@ -1100,11 +1100,15 @@ class PatchICL(nn.Module):
             else:
                 oracle_prob = 1.0 if self.oracle_valid[i] else 0.0
 
-            # Compute oracle weights (from GT labels)
+            # Compute oracle weights (from GT labels) using same strategy as context
             oracle_weights = None
             if labels is not None:
                 labels_ds = self._downsample_mask(labels, resolution)
-                oracle_weights = self._mask_to_weights(labels_ds)
+                oracle_weights = self._compute_context_sampling_weights(
+                    self._mask_to_weights(labels_ds),
+                    mode=self.context_sampling_mode,
+                    border_weight=self.context_border_weight,
+                )
 
             # Compute model weights (from previous level predictions)
             model_weights = None
@@ -1355,12 +1359,10 @@ class PatchICL(nn.Module):
             total_loss = total_loss + lw * self.loss_weights['target_patch'] * target_patch_loss
             sum_target_patch = sum_target_patch + target_patch_loss
 
-            # Target aggreg loss (area-interpolated targets for exact size match)
+            # Target aggreg loss
             pred = level_out['pred']
             aggregated_conf = level_out.get('aggregated_conf')
-            labels_ds = F.interpolate(
-                labels.float(), size=pred.shape[-2:], mode='area'
-            )
+            labels_ds = _resize_label(labels.float(), size=pred.shape[-2:])
 
             # Confidence-weighted aggreg loss: model penalized more where confident
             if self.conf_weighted_aggreg and aggregated_conf is not None:
@@ -1379,9 +1381,7 @@ class PatchICL(nn.Module):
                 combined_loss_weight = self.loss_weights['target_combined']
                 if combined_loss_weight > 0:
                     # Downsample GT to combined_pred resolution
-                    labels_combined = F.interpolate(
-                        labels.float(), size=combined_pred.shape[-2:], mode='area'
-                    )
+                    labels_combined = _resize_label(labels.float(), size=combined_pred.shape[-2:])
                     target_combined_loss = self.aggreg_criterion(combined_pred, labels_combined)
                     losses[f'level_{i}_target_combined_loss'] = target_combined_loss
                     total_loss = total_loss + lw * combined_loss_weight * target_combined_loss
@@ -1425,9 +1425,7 @@ class PatchICL(nn.Module):
             if context_pred is not None and context_labels_fullres is not None:
                 B_ctx, k_ctx = context_pred.shape[:2]
                 ctx_flat = context_labels_fullres.view(B_ctx * k_ctx, *context_labels_fullres.shape[2:])
-                context_labels_ds = F.interpolate(
-                    ctx_flat.float(), size=context_pred.shape[-2:], mode='area'
-                )
+                context_labels_ds = _resize_label(ctx_flat.float(), size=context_pred.shape[-2:])
                 context_aggreg_loss = self.aggreg_criterion(
                     context_pred.reshape(B_ctx * k_ctx, -1),
                     context_labels_ds.reshape(B_ctx * k_ctx, -1),

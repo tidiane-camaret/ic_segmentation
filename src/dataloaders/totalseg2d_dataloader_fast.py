@@ -961,7 +961,7 @@ class TotalSeg2DDataset(Dataset):
         resized = torch.nn.functional.interpolate(tensor, size=size, mode=mode, align_corners=False if mode == "bilinear" else None)
         return resized.squeeze().numpy()
 
-    def _resize_mask(self, mask: np.ndarray, size: Tuple[int, int], min_value: float = 0.3) -> np.ndarray:
+    def _resize_mask(self, mask: np.ndarray, size: Tuple[int, int], min_value: float = 0.5) -> np.ndarray:
         """Resize mask with hybrid approach: preserves small objects.
 
         Uses area interpolation for soft targets, but ensures small objects get a minimum

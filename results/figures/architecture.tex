@@ -1,0 +1,98 @@
+\documentclass[tikz,border=10pt]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{positioning, fit, arrows.meta, calc, shapes.geometric}
+
+\begin{document}
+
+\begin{tikzpicture}[
+    font=\sffamily,
+    >=Stealth,
+    node distance=0.8cm,
+    % --- Styles ---
+    img_frame/.style={draw=black, thick, fill=white, minimum width=1.5cm, minimum height=1.5cm, inner sep=0pt},
+    patch/.style={fill=#1, draw=none, minimum size=0.4cm},
+    stack_patch/.style={fill=#1, draw=black!30, line width=0.1pt, minimum size=0.6cm, anchor=center},
+    block/.style={draw=blue!50, fill=blue!5, minimum width=2.4cm, minimum height=4.5cm, rounded corners=4pt, align=center, line width=1pt},
+    arrow_black/.style={->, line width=0.8pt, color=black},
+    mapping/.style={draw=black!20, dashed, line width=0.5pt},
+    label_text/.style={align=center, font=\footnotesize\bfseries, color=black!80}
+]
+
+    % ==========================
+    % 1. INPUT IMAGES (Left)
+    % ==========================
+    \node[img_frame] (It) at (0, 1.2) {};
+    \node[anchor=north west, font=\tiny] at (It.north west) {$I_t$};
+    \node[patch=green!60!black] (itp1) at ($(It.north west)+(0.3,-0.3)$) {}; 
+    \node[patch=green!60!black] (itp2) at ($(It.south east)+(-0.3,0.3)$) {}; 
+
+    \node[img_frame] (Ic) at (0, -0.8) {};
+    \node[anchor=north west, font=\tiny] at (Ic.north west) {$I_c$};
+    \node[patch=green!40] (icp1) at ($(Ic.north east)+(-0.3,-0.3)$) {}; 
+    \node[patch=green!40] (icp2) at ($(Ic.south west)+(0.3,0.3)$) {};
+
+    \node[label_text] at (0, -2.2) {Target \& Context\\Images};
+
+    % ==========================
+    % 2. IMAGE PATCHES STACK
+    % ==========================
+    \coordinate (stack_pos) at (3.2, 0.2);
+    \node[stack_patch=green!60!black] (p1) at ($(stack_pos)+(0, 1.1)$) {};
+    \node[stack_patch=green!60!black] (p2) at ($(stack_pos)+(0, 0.4)$) {};
+    \node[stack_patch=green!40] (p3) at ($(stack_pos)+(0, -0.4)$) {};
+    \node[stack_patch=green!40] (p4) at ($(stack_pos)+(0, -1.1)$) {};
+    
+    % SAMPLING DOTTED LINES
+    \draw[mapping] (itp1.east) -- (p1.west);
+    \draw[mapping] (itp2.east) -- (p2.west);
+    \draw[mapping] (icp1.west) -- (p3.west);
+    \draw[mapping] (icp2.east) -- (p4.west);
+
+    \node[label_text] at (3.2, -2.2) {Image Patches};
+
+    % Arrow 1: Centered and Black
+    \draw[arrow_black] (3.8, 0.2) -- ++(0.6, 0);
+
+    % ==========================
+    % 3. CROSS-ATTENTION BLOCK
+    % ==========================
+    \node[block] (attn) at (5.8, 0.2) {};
+    \node[label_text, font=\small\bfseries] at (attn.center) {Cross-Attention\\Mechanism};
+    
+    % Arrow 2: Centered and Black
+    \draw[arrow_black] (7.2, 0.2) -- ++(0.6, 0);
+
+    % ==========================
+    % 4. PREDICTED LABEL PATCHES
+    % ==========================
+    \coordinate (pred_pos) at (8.6, 0.2);
+    \node[stack_patch=red!80!black] (pp1) at ($(pred_pos)+(0, 1.1)$) {};
+    \node[stack_patch=red!80!black] (pp2) at ($(pred_pos)+(0, 0.4)$) {};
+    \node[stack_patch=red!30] (pp3) at ($(pred_pos)+(0, -0.4)$) {};
+    \node[stack_patch=red!30] (pp4) at ($(pred_pos)+(0, -1.1)$) {};
+
+    \node[label_text] at (8.6, -2.2) {Predicted\\Mask Patches};
+
+    % ==========================
+    % 5. AGGREGATED OUTPUTS (Right)
+    % ==========================
+    \node[img_frame] (Lt_pred) at (11.8, 1.2) {};
+    \node[patch=red!80!black] (ltp1) at ($(Lt_pred.north west)+(0.3,-0.3)$) {}; 
+    \node[patch=red!80!black] (ltp2) at ($(Lt_pred.south east)+(-0.3,0.3)$) {};
+    \node[anchor=south east, font=\tiny] at (Lt_pred.south east) {$L_t$};
+
+    \node[img_frame] (Lc_pred) at (11.8, -0.8) {};
+    \node[patch=red!30] (lcp1) at ($(Lc_pred.north east)+(-0.3,-0.3)$) {}; 
+    \node[patch=red!30] (lcp2) at ($(Lc_pred.south west)+(0.3,0.3)$) {};
+    \node[anchor=south east, font=\tiny] at (Lc_pred.south east) {$L_c$};
+
+    % AGGREGATION DOTTED LINES
+    \draw[mapping] (pp1.east) -- (ltp1.west);
+    \draw[mapping] (pp2.east) -- (ltp2.west);
+    \draw[mapping] (pp3.east) -- (lcp1.west);
+    \draw[mapping] (pp4.east) -- (lcp2.east);
+
+    \node[label_text] at (11.8, -2.2) {Predicted\\Masks};
+
+\end{tikzpicture}
+\end{document}
