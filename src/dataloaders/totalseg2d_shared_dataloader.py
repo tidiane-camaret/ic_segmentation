@@ -125,6 +125,7 @@ class TotalSeg2DSharedDataset(Dataset):
         self.samples = []
         self.label_to_cases: Dict[str, List[str]] = {}
         self.case_to_labels: Dict[str, set] = {}
+        self.valid_slices_cache: Dict[Tuple[str, str, str], List[int]] = {}  # (case, label, axis) -> [slice_idx]
 
         print(f"Building sample index...")
         for h5_file in tqdm(self.h5_files, desc="Scanning"):
@@ -157,7 +158,12 @@ class TotalSeg2DSharedDataset(Dataset):
                     ]
                     if self.max_slices_per_group is not None:
                         valid_slices = self._select_slices(valid_slices, self.max_slices_per_group)
-                    for slice_idx, _ in valid_slices:
+
+                    # Cache valid slice indices for context sampling
+                    valid_indices = [si for si, _ in valid_slices]
+                    self.valid_slices_cache[(case_id, label_id, axis)] = valid_indices
+
+                    for slice_idx in valid_indices:
                         self.samples.append((case_id, label_id, axis, slice_idx))
 
                     # Track which cases have this label
@@ -405,37 +411,40 @@ class TotalSeg2DSharedDataset(Dataset):
         return result['image'].astype(np.float32) / 255.0
 
     def _get_context_slices(
-        self, target_case_id: str, label_id: str, axis: str, target_slice_idx: int = -1
+        self, target_case_id: str, label_id: str, axis: str, target_slice_idx: int = -1,
+        same_case_only: Optional[bool] = None,
     ) -> List[Tuple[str, int]]:
-        """Get valid context slice candidates for a label/axis."""
+        """Get valid context slice candidates for a label/axis.
+
+        Uses cached valid slices from init to ensure context candidates match
+        the same filtering (coverage + max_slices_per_group) as targets.
+
+        Args:
+            same_case_only: If True, only return same-case candidates.
+                           If False, only return other-case candidates.
+                           If None, use self.same_case_context setting.
+        """
+        if same_case_only is None:
+            same_case_only = self.same_case_context
+
         candidates = []
 
         for case_id in self.label_to_cases.get(label_id, []):
             is_same_case = (case_id == target_case_id)
 
-            # same_case_context=True: ONLY sample from target case
-            # same_case_context=False: ONLY sample from other cases
-            if self.same_case_context and not is_same_case:
+            # Filter based on same_case_only parameter
+            if same_case_only and not is_same_case:
                 continue
-            if not self.same_case_context and is_same_case:
-                continue
-
-            case_stats = self.stats.get(case_id, {})
-            label_stats = case_stats.get("labels", {}).get(label_id, {})
-            coverage = label_stats.get("coverage", {}).get(axis, [])
-
-            if not coverage:
+            if not same_case_only and is_same_case:
                 continue
 
-            max_cov = max(coverage)
-            threshold = max(self.min_coverage, max_cov * self.min_coverage_ratio)
-
-            for slice_idx, cov in enumerate(coverage):
-                if cov >= threshold:
-                    # Skip the exact same slice as target
-                    if is_same_case and slice_idx == target_slice_idx:
-                        continue
-                    candidates.append((case_id, slice_idx))
+            # Use cached valid slices (already filtered by coverage + max_slices_per_group)
+            valid_indices = self.valid_slices_cache.get((case_id, label_id, axis), [])
+            for slice_idx in valid_indices:
+                # Skip the exact same slice as target
+                if is_same_case and slice_idx == target_slice_idx:
+                    continue
+                candidates.append((case_id, slice_idx))
 
         return candidates
 
@@ -462,21 +471,29 @@ class TotalSeg2DSharedDataset(Dataset):
             img = self._resize(img, self.image_size, "bilinear")
             mask = self._resize_mask(mask, self.image_size)
 
-        # Retry if empty mask
-        if mask.max() < 0.5:
-            retry_idx = random.randint(0, len(self.samples) - 1)
-            return self.__getitem__(retry_idx)
 
         # Load context
         context_imgs, context_masks, context_case_ids = [], [], []
 
         if self.context_size > 0:
+            # Get primary candidates (respects same_case_context setting)
             candidates = self._get_context_slices(target_case_id, label_id, axis, slice_idx)
+
+            # If same_case_context=True, also get fallback candidates from other cases
+            fallback_candidates = []
+            if self.same_case_context:
+                fallback_candidates = self._get_context_slices(
+                    target_case_id, label_id, axis, slice_idx, same_case_only=False
+                )
 
             if self.random_context:
                 random.shuffle(candidates)
+                random.shuffle(fallback_candidates)
 
-            for ctx_case_id, ctx_slice_idx in candidates:
+            # Combine: primary first, then fallback
+            all_candidates = candidates + fallback_candidates
+
+            for ctx_case_id, ctx_slice_idx in all_candidates:
                 if len(context_imgs) >= self.context_size:
                     break
 
@@ -508,7 +525,7 @@ class TotalSeg2DSharedDataset(Dataset):
                 retry_idx = random.randint(0, len(self.samples) - 1)
                 return self.__getitem__(retry_idx)
 
-            # Resample if fewer context slices than requested
+            # Resample if still fewer context slices than requested (last resort)
             while len(context_imgs) < self.context_size and len(context_imgs) > 0:
                 resample_idx = random.randint(0, len(context_imgs) - 1)
                 context_imgs.append(context_imgs[resample_idx].copy())
@@ -525,10 +542,6 @@ class TotalSeg2DSharedDataset(Dataset):
                 )
                 context_imgs[i] = self._apply_intensity_augmentation(context_imgs[i])
 
-        # Retry if mask became empty after augmentation
-        if mask.max() < 0.5:
-            retry_idx = random.randint(0, len(self.samples) - 1)
-            return self.__getitem__(retry_idx)
 
         # Convert to tensors
         target_in = torch.from_numpy(img.copy()).unsqueeze(0).float()

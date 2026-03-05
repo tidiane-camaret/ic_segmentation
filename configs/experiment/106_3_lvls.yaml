@@ -6,9 +6,6 @@ defaults:
   - /augmentation
   - override /method: patch_icl
 
-# Shared dataloader : ct slices are sampled evenly regardless of label
-
-
 preprocessing:
   image_size: 128
 model:
@@ -30,7 +27,7 @@ model:
         sampling_method: "continuous"
         sampling_temperature: 0.1
         stride: 6
-        num_patches: 10
+        num_patches: 9
         num_context_patches: 4  # Fewer patches for context (default: num_patches)
         pad_before: 1
         pad_after: 1
@@ -39,7 +36,7 @@ model:
         sampling_method: "continuous"
         sampling_temperature: 0.1
         stride: 6
-        num_patches: 20
+        num_patches: 9
         num_context_patches: 4  # Fewer patches for context (default: num_patches)
         pad_before: 1
         pad_after: 1

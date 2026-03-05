@@ -3,8 +3,7 @@ defaults:
   - config
   - _self_
 
-class_balanced: false
-context_size: 10
+class_balanced: true
 
 
 

@@ -6,11 +6,11 @@ paths:
   DATA_DIR: ${.root}/data
   RESULTS_DIR: ${.root}/results
   medsegbench: ${.DATA_DIR}/medsegbench
-  dataset: ${.DATA_DIR}/${dataset}
+  base_dataset: ${.DATA_DIR}/${base_dataset}
   #dataset2d: ${.DATA_DIR}/${dataset}2d
-  dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
+  #dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
   #totalseg2d_every_n_slice: ${.DATA_DIR}/totalseg2d_every_n_slice
-  dataset_stats: ${.DATA_DIR}/${dataset}/stats.pkl
+  #dataset_stats: ${.DATA_DIR}/${dataset}/stats.pkl
   #totalseg2d_every_n_slice_stats: ${.DATA_DIR}/$totalseg2d_every_n_slice/stats.pkl
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints

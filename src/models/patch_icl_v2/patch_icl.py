@@ -7,7 +7,6 @@ to guide patch sampling at finer levels.
 from __future__ import annotations
 
 import math
-import warnings
 
 import torch
 import torch.nn as nn
@@ -593,8 +592,7 @@ class PatchICL(nn.Module):
         self,
         mask: torch.Tensor,
         resolution: int,
-        warn_if_empty: bool = True,
-        min_value: float = 0.5,
+        min_value: float = 1,
     ) -> torch.Tensor:
         """Downsample mask with hybrid approach: soft area fractions + small object preservation.
 
@@ -624,16 +622,7 @@ class PatchICL(nn.Module):
         # This keeps soft boundaries for large objects while preserving small ones
         result = torch.maximum(area_pooled, max_pooled * min_value)
 
-        # Fast warning: check if any sample has zero GT (truly empty labels)
-        if warn_if_empty and self.training:
-            per_sample_max = result.view(result.shape[0], -1).max(dim=1).values
-            num_empty = (per_sample_max < 1e-6).sum().item()
-            if num_empty > 0:
-                warnings.warn(
-                    f"GT mask is zero after downscaling to {resolution}x{resolution} "
-                    f"({num_empty}/{result.shape[0]} samples). Labels may be empty.",
-                    stacklevel=3
-                )
+
         return result
 
     def _mask_to_weights(self, mask: torch.Tensor) -> torch.Tensor:

@@ -90,7 +90,7 @@ class UniverSegExtractor(nn.Module):
         freeze: bool = True,
         output_grid_size: Optional[int] = None,
         input_size: int = 128,
-        skip_preprocess: bool = False,
+        skip_preprocess: bool = True,
     ):
         super().__init__()
         self.device = torch.device(device) if isinstance(device, str) else device

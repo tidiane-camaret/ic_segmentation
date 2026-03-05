@@ -679,17 +679,20 @@ def train_epoch(
                     label_dice_scores[label_id].append(dice_val)
 
                     # Store one sample per label for image logging (wandb or disk)
+                    # Use reservoir sampling so each sample has equal chance of being kept
                     should_save = (use_wandb or save_dir is not None) and is_main
-                    if should_save and label_id not in label_samples:
-                        label_samples[label_id] = _collect_sample_for_viz(
-                            i,
-                            images,
-                            labels,
-                            outputs,
-                            context_in,
-                            context_out,
-                            dice_val,
-                        )
+                    if should_save:
+                        n_seen = len(label_dice_scores[label_id])
+                        if label_id not in label_samples or random.random() < 1.0 / n_seen:
+                            label_samples[label_id] = _collect_sample_for_viz(
+                                i,
+                                images,
+                                labels,
+                                outputs,
+                                context_in,
+                                context_out,
+                                dice_val,
+                            )
 
         # Backward
         scaled_loss = loss / grad_accumulate_steps
@@ -922,11 +925,14 @@ def validate(
             label_dice_scores[label_id].append(dice_val)
 
             # Store one sample per label for visualization (only when saving)
+            # Use reservoir sampling so each sample has equal chance of being kept
             should_save = (use_wandb or save_dir is not None) and is_main
-            if should_save and label_id not in label_samples:
-                label_samples[label_id] = _collect_sample_for_viz(
-                    i, images, labels, outputs, context_in, context_out, dice_val
-                )
+            if should_save:
+                n_seen = len(label_dice_scores[label_id])
+                if label_id not in label_samples or random.random() < 1.0 / n_seen:
+                    label_samples[label_id] = _collect_sample_for_viz(
+                        i, images, labels, outputs, context_in, context_out, dice_val
+                    )
 
         # Update progress bar
         n_batches = batch_idx + 1

@@ -255,8 +255,9 @@ def main(cfg: DictConfig) -> None:
     val_split = list(val_split_cfg) if OmegaConf.is_list(val_split_cfg) else val_split_cfg
 
     # Get dataset class and dataloader
+    base_dataset = cfg.get("base_dataset")  # e.g., "totalseg" or "totalsegmri"
     dataloader_type = cfg.get("dataloader_type", "fast")  # "fast" or "shared"
-    if cfg.dataset in ["totalseg2d", "totalsegmri2d", "totalseg2d_every_n_slice"]:
+    if base_dataset in ["totalseg", "totalsegmri"]:
         if dataloader_type == "shared":
             from src.dataloaders.totalseg2d_shared_dataloader import (
                 get_dataloader as get_totalseg2d_dataloader,
@@ -265,12 +266,12 @@ def main(cfg: DictConfig) -> None:
             from src.dataloaders.totalseg2d_dataloader_fast import (
                 get_dataloader as get_totalseg2d_dataloader,
             )
-    elif cfg.dataset == "medsegbench":
+    elif base_dataset == "medsegbench":
         from src.dataloaders.medsegbench_dataloader import (
             get_dataloader as get_medsegbench_dataloader,
         )
     else:
-        raise ValueError(f"Unknown dataset: {cfg.dataset}")
+        raise ValueError(f"Unknown base dataset: {base_dataset}")
 
     # Logging (only on main process)
     if cfg.logging.use_wandb and accelerator.is_main_process:
@@ -290,10 +291,10 @@ def main(cfg: DictConfig) -> None:
     else:
         max_ds_len_val = max_ds_len_cfg
 
-    if cfg.dataset in ["totalseg2d", "totalsegmri2d", "totalseg2d_every_n_slice"]:
+    if base_dataset in ["totalseg", "totalsegmri"]:
         # Handle label_ids: keep string for split names, convert to list for explicit IDs
         val_labels = cfg.val_label_ids if isinstance(cfg.val_label_ids, str) else list(cfg.val_label_ids)
-        modality = "mri" if "mri" in cfg.dataset else "ct"
+        modality = "mri" if "mri" in cfg.base_dataset else "ct"
 
         # Coverage filtering config (unified for fast and shared dataloaders)
         same_case_context = cfg.get("same_case_context", False)
@@ -309,7 +310,7 @@ def main(cfg: DictConfig) -> None:
             # Use shared format paths: {base_dataset}_2d_shared/
             # Derive from DATA_DIR and base dataset name (strip any 2d suffix)
             data_dir = Path(cfg.paths.DATA_DIR)
-            base_dataset = cfg.get("base_dataset", "totalseg")  # e.g., "totalseg" or "totalsegmri"
+            
             shared_dir = data_dir / f"{base_dataset}_2d_shared"
             root_dir = str(shared_dir)
             stats_path = str(shared_dir / "stats.pkl")
@@ -361,7 +362,7 @@ def main(cfg: DictConfig) -> None:
             )
         val_loader = get_totalseg2d_dataloader(**val_kwargs)
 
-    elif cfg.dataset == "medsegbench":
+    elif base_dataset == "medsegbench":
         msb_cfg = cfg.get("medsegbench", {})
         msb_val_datasets = msb_cfg.get("val_datasets", None)
         if msb_val_datasets is not None:
@@ -704,24 +705,7 @@ def main(cfg: DictConfig) -> None:
             case_table.add_data(result["case_id"], result["label_id"], result.get("axis") or "N/A", result["dice"])
         wandb.log({"per_case_dice": case_table})
 
-    """
-    # Save best (only on main process)
-    if val_final_dice > best_dice:
-        best_dice = val_final_dice
-        if accelerator.is_main_process:
-            print(f"  -> New best dice: {best_dice:.5f}")
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            model_name = f"_ds_{cfg.dataset}_method_{cfg.method}"
-            model_name = model_name + "_" + wandb.run.name if cfg.logging.use_wandb else str(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-            unwrapped_model = accelerator.unwrap_model(model)
-            torch.save({
-                "model_state_dict": unwrapped_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_dice": best_dice,
-                "config": OmegaConf.to_container(cfg, resolve=True),  # checkpoint needs plain dict
-            }, ckpt_dir / f"{model_name}_best_model.pt")
-    """
+
     if accelerator.is_main_process:
         print(f"\nVal complete! Avg Dice: {val_final_dice:.5f}")
 
