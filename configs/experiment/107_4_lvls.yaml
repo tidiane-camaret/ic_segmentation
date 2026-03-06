@@ -41,15 +41,15 @@ model:
         num_context_patches: 4  # Fewer patches for context (default: num_patches)
         pad_before: 1
         pad_after: 1
-      - resolution: 60
+      - resolution: 128
         patch_size: 8
         sampling_method: "continuous"
         sampling_temperature: 0.1
         stride: 6
         num_patches: 9
         num_context_patches: 4  # Fewer patches for context (default: num_patches)
-        pad_before: 1
-        pad_after: 1
+        pad_before: 0
+        pad_after: 0
 
     oracle_levels_train: [false, true, true, true]
     oracle_levels_valid: [false, false, false, false]
@@ -86,7 +86,7 @@ model:
       num_heads: 4
       num_layers: 2
       num_context_layers: 1
-      num_registers: 4
+      num_registers: 1
       target_self_attention: true
       dropout: 0.1
       append_zero_attn: true
@@ -108,6 +108,7 @@ model:
           target_aggreg: 1.0
           context_patch: 0.5
           context_aggreg: 0.5
+          target_combined: 0.5
       level_weights: [1.0, 1.0, 1.0, 1.0]  
       confidence:
         method: "entropy"

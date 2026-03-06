@@ -234,21 +234,30 @@ def compute_all_metrics(
     if level_outputs:
         metrics.update(compute_level_metrics(level_outputs, labels))
 
-        # Final metrics: upsample pred to full resolution for accurate dice
-        last_pred = level_outputs[-1]['pred']
-        last_res = last_pred.shape[-1]
-        full_res = labels.shape[-1]
-        if last_res < full_res:
-            pred_upsampled = F.interpolate(
-                last_pred, size=(full_res, full_res),
-                mode='bilinear', align_corners=False,
-            )
+        # Final metrics: use final_logit (upsampled combined_pred, not raw last level pred)
+        # combined_pred blends all levels via confidence-weighted alpha, which is the actual model output
+        final_logit = outputs.get('final_logit')
+        if final_logit is not None:
+            dice_result = compute_dice(final_logit, labels)
+            metrics['final_dice'] = dice_result['dice'].mean()
+            metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
+            metrics['final_pixel_mae'] = compute_pixel_mae(final_logit, labels).mean()
         else:
-            pred_upsampled = last_pred
-        dice_result = compute_dice(pred_upsampled, labels)
-        metrics['final_dice'] = dice_result['dice'].mean()
-        metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
-        metrics['final_pixel_mae'] = compute_pixel_mae(pred_upsampled, labels).mean()
+            # Fallback: upsample last level pred (legacy behavior)
+            last_pred = level_outputs[-1]['pred']
+            last_res = last_pred.shape[-1]
+            full_res = labels.shape[-1]
+            if last_res < full_res:
+                pred_upsampled = F.interpolate(
+                    last_pred, size=(full_res, full_res),
+                    mode='bilinear', align_corners=False,
+                )
+            else:
+                pred_upsampled = last_pred
+            dice_result = compute_dice(pred_upsampled, labels)
+            metrics['final_dice'] = dice_result['dice'].mean()
+            metrics['final_soft_dice'] = dice_result['soft_dice'].mean()
+            metrics['final_pixel_mae'] = compute_pixel_mae(pred_upsampled, labels).mean()
 
         # Store per-sample dice to avoid redundant interpolation
         if return_per_sample:
@@ -340,24 +349,26 @@ def compute_per_sample_dice(
     if labels.dim() == 3:
         labels = labels.unsqueeze(1)
 
-    level_outputs = outputs.get('level_outputs', [])
-    if level_outputs:
-        last_pred = level_outputs[-1]['pred']
-        last_res = last_pred.shape[-1]
-        full_res = labels.shape[-1]
-        if last_res < full_res:
-            pred_upsampled = F.interpolate(
-                last_pred, size=(full_res, full_res),
-                mode='bilinear', align_corners=False,
-            )
-        else:
-            pred_upsampled = last_pred
-        dice_result = compute_dice(pred_upsampled, labels)
+    # Use final_logit (upsampled combined_pred) which is the actual model output
+    final_logit = outputs.get('final_logit')
+    if final_logit is not None:
+        dice_result = compute_dice(final_logit, labels)
     else:
-        final_logit = outputs.get('final_logit')
-        if final_logit is not None:
-            dice_result = compute_dice(final_logit, labels)
+        # Fallback: upsample last level pred (legacy behavior)
+        level_outputs = outputs.get('level_outputs', [])
+        if level_outputs:
+            last_pred = level_outputs[-1]['pred']
+            last_res = last_pred.shape[-1]
+            full_res = labels.shape[-1]
+            if last_res < full_res:
+                pred_upsampled = F.interpolate(
+                    last_pred, size=(full_res, full_res),
+                    mode='bilinear', align_corners=False,
+                )
+            else:
+                pred_upsampled = last_pred
+            dice_result = compute_dice(pred_upsampled, labels)
         else:
-            raise ValueError("No level_outputs or final_logit in model outputs")
+            raise ValueError("No final_logit or level_outputs in model outputs")
 
     return dice_result['dice']

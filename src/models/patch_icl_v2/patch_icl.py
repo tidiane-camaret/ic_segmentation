@@ -457,6 +457,10 @@ class PatchICL(nn.Module):
     def compute_alpha(self, register_tokens: torch.Tensor) -> torch.Tensor:
         """Compute combination weight α from register tokens.
 
+        Detaches register tokens to prevent target_combined loss from flowing
+        gradients back through the backbone. This isolates alpha_head training
+        and lets the backbone focus on segmentation quality.
+
         Args:
             register_tokens: [B, num_registers, D] from backbone
 
@@ -466,7 +470,8 @@ class PatchICL(nn.Module):
         if not self.use_learned_alpha or register_tokens is None:
             return None
         # Pool registers and project to scalar
-        pooled = register_tokens.mean(dim=1)  # [B, D]
+        # Detach to prevent target_combined gradients from affecting backbone
+        pooled = register_tokens.detach().mean(dim=1)  # [B, D]
         alpha = torch.sigmoid(self.alpha_head(pooled))  # [B, 1]
         return alpha.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
 
