@@ -266,16 +266,20 @@ class ContinuousSampler(nn.Module):
         flat = pooled_weights.flatten(1)
         lo = flat.min(dim=1, keepdim=True).values
         hi = flat.max(dim=1, keepdim=True).values
-        pooled_weights = (pooled_weights - lo.view(B, 1, 1, 1)) / (hi.view(B, 1, 1, 1) - lo.view(B, 1, 1, 1) + 1e-6)
+        # Use larger epsilon for fp16 numerical stability
+        eps = 1e-4 if pooled_weights.dtype == torch.float16 else 1e-6
+        pooled_weights = (pooled_weights - lo.view(B, 1, 1, 1)) / (hi.view(B, 1, 1, 1) - lo.view(B, 1, 1, 1) + eps)
         
         # Apply stride to space out possible sampling positions
         if self.stride > 1:
             # Subsample pooled_weights at stride intervals
             pooled_weights_strided = pooled_weights[:, :, ::self.stride, ::self.stride]
             flat_weights = pooled_weights_strided.reshape(B, -1) / self.temperature
-            
+
             # Gumbel-Top-K sampling from strided positions
-            gumbel = -torch.log(-torch.log(torch.rand_like(flat_weights) + 1e-10) + 1e-10)
+            # Use fp32 for numerical stability in nested log (critical for fp16 training)
+            u = torch.rand_like(flat_weights, dtype=torch.float32).clamp(1e-6, 1 - 1e-6)
+            gumbel = (-torch.log(-torch.log(u))).to(flat_weights.dtype)
             scores = flat_weights + gumbel
             _, indices = torch.topk(scores, K, dim=1)
             
@@ -288,10 +292,12 @@ class ContinuousSampler(nn.Module):
         else:
             # Original sampling without stride
             flat_weights = pooled_weights.reshape(B, -1) / self.temperature
-            
+
             # Gumbel-Top-K: equivalent to multinomial without replacement, but ~10x faster
             # Adding Gumbel noise to log-probs and taking top-k gives same distribution
-            gumbel = -torch.log(-torch.log(torch.rand_like(flat_weights) + 1e-10) + 1e-10)
+            # Use fp32 for numerical stability in nested log (critical for fp16 training)
+            u = torch.rand_like(flat_weights, dtype=torch.float32).clamp(1e-6, 1 - 1e-6)
+            gumbel = (-torch.log(-torch.log(u))).to(flat_weights.dtype)
             scores = flat_weights + gumbel
             _, indices = torch.topk(scores, K, dim=1)
             h_coords_pad = indices // valid_w

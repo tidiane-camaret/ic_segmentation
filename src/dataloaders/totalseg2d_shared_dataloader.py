@@ -195,7 +195,7 @@ class TotalSeg2DSharedDataset(Dataset):
 
         # H5 file cache
         self._h5_cache: Dict[str, h5py.File] = {}
-        self._h5_cache_max = 8
+        self._h5_cache_max = 32
 
     def _setup_augmentation(self, cfg: Dict):
         """Setup augmentation from config."""
@@ -648,5 +648,5 @@ def get_dataloader(
         collate_fn=collate_fn,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
     )

@@ -11,7 +11,7 @@ preprocessing:
 model:
   patch_icl:
     feature_extractor:
-      output_grid_size: 64
+      output_grid_size: 128
       freeze: true
     levels:
       - resolution: 20
@@ -41,9 +41,18 @@ model:
         num_context_patches: 4  # Fewer patches for context (default: num_patches)
         pad_before: 1
         pad_after: 1
+      - resolution: 60
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 6
+        num_patches: 9
+        num_context_patches: 4  # Fewer patches for context (default: num_patches)
+        pad_before: 1
+        pad_after: 1
 
-    oracle_levels_train: [false, true, true]
-    oracle_levels_valid: [false, false, false]
+    oracle_levels_train: [false, true, true, true]
+    oracle_levels_valid: [false, false, false, false]
 
     # Scheduled sampling: gradually transition from oracle to model predictions
     # Reduces train/val distribution mismatch (exposure bias)
@@ -99,7 +108,7 @@ model:
           target_aggreg: 1.0
           context_patch: 0.5
           context_aggreg: 0.5
-      level_weights: [1.0, 0.5, 0.25]
+      level_weights: [1.0, 1.0, 1.0, 1.0]  
       confidence:
         method: "entropy"
         enabled: true

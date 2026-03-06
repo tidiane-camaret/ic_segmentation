@@ -101,18 +101,44 @@ def _print_vram(label=""):
 # Build data + model (mirrors train.py)
 # ---------------------------------------------------------------------------
 
+def _get_image_size(cfg) -> tuple[int, int]:
+    """Get image size as tuple, handling both scalar and list formats."""
+    img_size = cfg.preprocessing.image_size
+    if isinstance(img_size, (list, tuple)):
+        return tuple(img_size[:2])
+    return (img_size, img_size)
+
+
 def build_dataloader(cfg):
     """Build train dataloader from config."""
-    img_aug_cfg = cfg.get("image_augmentation", {})
-    use_image_augmentation = img_aug_cfg.get("enabled", False)
-    augment_config = (
-        OmegaConf.to_container(img_aug_cfg, resolve=True)
-        if use_image_augmentation else None
+    # Unified augmentation config (takes precedence if present)
+    unified_aug_cfg = cfg.get("augmentation", {})
+    use_unified_augmentation = unified_aug_cfg.get("enabled", False)
+    augmentation_config = (
+        OmegaConf.to_container(unified_aug_cfg, resolve=True)
+        if use_unified_augmentation
+        else None
     )
 
-    from src.dataloaders.totalseg2d_dataloader_fast import (
-        get_dataloader as get_totalseg2d_dataloader,
+    # Legacy image augmentation config (only used if unified is not enabled)
+    img_aug_cfg = cfg.get("image_augmentation", {})
+    use_image_augmentation = img_aug_cfg.get("enabled", False) and not use_unified_augmentation
+    augment_config = (
+        OmegaConf.to_container(img_aug_cfg, resolve=True)
+        if use_image_augmentation
+        else None
     )
+
+    # TotalSeg2D dataloader - select based on dataloader_type config
+    dataloader_type = cfg.get("dataloader_type", "fast")  # "fast" or "shared"
+    if dataloader_type == "shared":
+        from src.dataloaders.totalseg2d_shared_dataloader import (
+            get_dataloader as get_totalseg2d_dataloader,
+        )
+    else:
+        from src.dataloaders.totalseg2d_dataloader_fast import (
+            get_dataloader as get_totalseg2d_dataloader,
+        )
 
     train_labels = (
         cfg.train_label_ids
@@ -122,101 +148,214 @@ def build_dataloader(cfg):
     train_split_cfg = cfg.get("train_split", "train")
     train_split = list(train_split_cfg) if OmegaConf.is_list(train_split_cfg) else train_split_cfg
 
+    # Support separate max_ds_len for train/val, with fallback to single value
     max_ds_len_cfg = cfg.get("max_ds_len")
     if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
         max_ds_len_train = max_ds_len_cfg.get("train")
     else:
         max_ds_len_train = max_ds_len_cfg
 
+    # Support separate max_cases for train/val (limits unique cases, not samples)
+    max_cases_cfg = cfg.get("max_cases")
+    if isinstance(max_cases_cfg, dict) or OmegaConf.is_dict(max_cases_cfg):
+        max_cases_train = max_cases_cfg.get("train")
+    else:
+        max_cases_train = max_cases_cfg
+
+    # CarveMix config (only for training)
     carve_mix_cfg = cfg.get("carve_mix", {})
     use_carve_mix = carve_mix_cfg.get("enabled", False)
     carve_mix_config = (
         OmegaConf.to_container(carve_mix_cfg, resolve=True) if use_carve_mix else None
     )
+
+    # Legacy advanced augmentation config (only for training, if unified not used)
     adv_aug_cfg = cfg.get("advanced_augmentation", {})
-    use_adv_aug = adv_aug_cfg.get("enabled", False)
+    use_adv_aug = adv_aug_cfg.get("enabled", False) and not use_unified_augmentation
     adv_aug_config = (
         OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
     )
 
-    return get_totalseg2d_dataloader(
-        root_dir=cfg.paths.dataset2d_h5,
-        stats_path=cfg.paths.dataset_stats,
+    # Coverage filtering config (unified for fast and shared dataloaders)
+    same_case_context = cfg.get("same_case_context", False)
+    min_coverage = cfg.get("min_coverage", 100)
+    min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
+
+    # Slice subsampling config (shared dataloader only)
+    max_slices_per_group = cfg.get("max_slices_per_group", None)
+    slice_selection = cfg.get("slice_selection", "all")
+
+    # Resolve paths based on dataloader type
+    if dataloader_type == "shared":
+        # Use shared format paths: {base_dataset}_2d_shared/
+        data_dir = Path(cfg.paths.DATA_DIR)
+        base_dataset = cfg.get("base_dataset", "totalseg")
+        shared_dir = data_dir / f"{base_dataset}_2d_shared"
+        root_dir = str(shared_dir)
+        stats_path = str(shared_dir / "stats.pkl")
+    else:
+        root_dir = cfg.paths.dataset
+        stats_path = cfg.paths.dataset_stats
+
+    # Build train dataloader kwargs based on type
+    train_kwargs = dict(
+        root_dir=root_dir,
+        stats_path=stats_path,
         label_id_list=train_labels,
         context_size=cfg.context_size,
         batch_size=cfg.train_batch_size,
-        image_size=tuple(cfg.preprocessing.image_size[:2]),
-        crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-        bbox_padding=cfg.preprocessing.bbox_padding,
+        image_size=_get_image_size(cfg),
         num_workers=cfg.training.get("num_workers", 4),
         split=train_split,
         shuffle=True,
-        max_ds_len=max_ds_len_train,
-        random_coloring_nb=cfg.get("random_coloring_nb", 0),
-        augment=use_image_augmentation,
-        augment_config=augment_config,
-        carve_mix=use_carve_mix,
-        carve_mix_config=carve_mix_config,
-        advanced_augmentation=use_adv_aug,
-        advanced_augmentation_config=adv_aug_config,
         max_labels=cfg.get("max_labels", None),
+        max_cases=max_cases_train,
     )
+    if dataloader_type == "shared":
+        # Shared dataloader params
+        train_kwargs.update(
+            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+            bbox_padding=cfg.preprocessing.bbox_padding,
+            min_coverage=min_coverage,
+            min_coverage_ratio=min_coverage_ratio,
+            same_case_context=same_case_context,
+            max_ds_len=max_ds_len_train,
+            class_balanced=cfg.get("class_balanced", False),
+            augmentation_config=augmentation_config,
+            max_slices_per_group=max_slices_per_group,
+            slice_selection=slice_selection,
+        )
+    else:
+        # Fast dataloader params
+        train_kwargs.update(
+            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
+            bbox_padding=cfg.preprocessing.bbox_padding,
+            max_ds_len=max_ds_len_train,
+            random_coloring_nb=cfg.get("random_coloring_nb", 0),
+            augment=use_image_augmentation,
+            augment_config=augment_config,
+            carve_mix=use_carve_mix,
+            carve_mix_config=carve_mix_config,
+            advanced_augmentation=use_adv_aug,
+            advanced_augmentation_config=adv_aug_config,
+            augmentation_config=augmentation_config,
+            class_balanced=cfg.get("class_balanced", False),
+            min_coverage=min_coverage,
+            min_coverage_ratio=min_coverage_ratio,
+        )
+    return get_totalseg2d_dataloader(**train_kwargs)
 
 
 def build_model(cfg, device):
-    """Build PatchICL model from config."""
-    from src.models.patch_icl_v2 import PatchICL
+    """Build model from config (PatchICL or UniverSeg)."""
+    method = cfg.get("method", "patch_icl")
 
-    patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
-    random_coloring_nb = cfg.get("random_coloring_nb", 0)
-    patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
+    if method == "universeg":
+        # UniverSeg baseline model
+        from src.models.universeg_baseline import UniverSegBaseline
 
-    feature_mode = cfg.get("feature_mode", "precomputed")
-    feature_extractor = None
-    if feature_mode == "on_the_fly":
-        fe_cfg = patch_icl_cfg.get("feature_extractor", None)
-        extractor_type = (
-            fe_cfg.get("type", "meddino").lower() if fe_cfg
-            else cfg.get("feature_extractor_type", "meddino").lower()
+        universeg_cfg = cfg.model.get("universeg", {})
+        model = UniverSegBaseline(
+            pretrained=universeg_cfg.get("pretrained", True),
+            input_size=universeg_cfg.get("input_size", 128),
+            freeze=universeg_cfg.get("freeze", False),
         )
-        if extractor_type == "icl_encoder":
-            from src.models.icl_encoder import ICLEncoder
-            feature_extractor = ICLEncoder(
-                layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
-                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-                freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
-            )
-        elif extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
-            from src.models.meddino_extractor import create_meddino_extractor
-            feature_extractor = create_meddino_extractor(
-                model_path=fe_cfg.get("model_path", cfg.paths.ckpts.meddino_vit),
-                target_size=fe_cfg.get("target_size", 256),
-                device=device,
-                layer_idx=fe_cfg.get("layer_idx", 11),
-                freeze=fe_cfg.get("freeze", True),
-            )
-        elif extractor_type == "rad_dino":
-            from src.models.rad_dino_extractor import RADDINOExtractor
+        patch_icl_cfg = {}  # Empty config for loss setup
 
-            feature_extractor = RADDINOExtractor(
-                model_name=fe_cfg.get("model_name", "microsoft/rad-dino") if fe_cfg else "microsoft/rad-dino",
-                target_size=fe_cfg.get("target_size", 224) if fe_cfg else 224,
-                output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-                device=device,
-                freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+        # Simple loss config for UniverSeg
+        loss_cfg = cfg.get("loss", {})
+        patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
+        aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+    else:
+        # Default: PatchICL v2
+        from src.models.patch_icl_v2 import PatchICL
+
+        patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
+        random_coloring_nb = cfg.get("random_coloring_nb", 0)
+        patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
+
+        feature_mode = cfg.get("feature_mode", "precomputed")
+        feature_extractor = None
+        if feature_mode == "on_the_fly":
+            fe_cfg = patch_icl_cfg.get("feature_extractor", None)
+            extractor_type = (
+                fe_cfg.get("type", "meddino").lower() if fe_cfg
+                else cfg.get("feature_extractor_type", "meddino").lower()
             )
-        else:
-            raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
 
-    model = PatchICL(
-        patch_icl_cfg,
-        context_size=cfg.get("context_size", 0),
-        feature_extractor=feature_extractor,
-    )
+            if extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
+                from src.models.meddino_extractor import create_meddino_extractor
+                if fe_cfg and fe_cfg.get("type") in ["meddino", "meddinov3", "meddino_v3"]:
+                    feature_extractor = create_meddino_extractor(
+                        model_path=fe_cfg.get("model_path", cfg.paths.ckpts.meddino_vit),
+                        target_size=fe_cfg.get("target_size", 256),
+                        device=device,
+                        layer_idx=fe_cfg.get("layer_idx", 11),
+                        freeze=fe_cfg.get("freeze", True),
+                    )
+                else:
+                    feature_extractor = create_meddino_extractor(
+                        model_path=cfg.paths.ckpts.meddino_vit,
+                        target_size=cfg.get("feature_extraction_resolution", 256),
+                        device=device,
+                        layer_idx=cfg.get("meddino_layer_idx", 11),
+                        freeze=True,
+                    )
+            elif extractor_type in ["medsam_v1", "medsam_v1_layer"]:
+                from src.models.medsam_extractor import MedSAMv1LayerExtractor
 
-    loss_cfg = patch_icl_cfg.get("loss", {})
-    patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
-    aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+                target_size = fe_cfg.get("target_size", 1024) if fe_cfg else 1024
+                output_grid = fe_cfg.get("output_grid_size") if fe_cfg else None
+                feature_extractor = MedSAMv1LayerExtractor(
+                    checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
+                    target_size=target_size,
+                    device=device,
+                    layer_idx=fe_cfg.get("layer_idx", 11) if fe_cfg else 11,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=output_grid,
+                )
+            elif extractor_type == "universeg":
+                from src.models.universeg_extractor import UniverSegExtractor
+
+                feature_extractor = UniverSegExtractor(
+                    layer_idx=fe_cfg.get("layer_idx", 3) if fe_cfg else 3,
+                    device=device,
+                    pretrained=fe_cfg.get("pretrained", True) if fe_cfg else True,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    input_size=fe_cfg.get("input_size", 128) if fe_cfg else 128,
+                    skip_preprocess=fe_cfg.get("skip_preprocess", True) if fe_cfg else True,
+                )
+            elif extractor_type == "icl_encoder":
+                from src.models.icl_encoder import ICLEncoder
+                feature_extractor = ICLEncoder(
+                    layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
+                )
+            elif extractor_type == "rad_dino":
+                from src.models.rad_dino_extractor import RADDINOExtractor
+
+                feature_extractor = RADDINOExtractor(
+                    model_name=fe_cfg.get("model_name", "microsoft/rad-dino") if fe_cfg else "microsoft/rad-dino",
+                    target_size=fe_cfg.get("target_size", 224) if fe_cfg else 224,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    device=device,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                )
+            else:
+                raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
+
+        model = PatchICL(
+            patch_icl_cfg,
+            context_size=cfg.get("context_size", 0),
+            feature_extractor=feature_extractor,
+        )
+
+        loss_cfg = patch_icl_cfg.get("loss", {})
+        patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
+        aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+
     model.set_loss_functions(
         build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args")),
         build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args")),
@@ -583,7 +722,7 @@ def main(cfg: DictConfig) -> None:
         if prof is not None:
             _sep("Chrome Trace Export")
             print(f"  Traces saved to: {trace_dir}")
-            print(f"  Open at: chrome://tracing  or  https://ui.perfetto.dev")
+            print("  Open at: chrome://tracing  or  https://ui.perfetto.dev")
 
         _sep("Profiling Complete")
         print("""

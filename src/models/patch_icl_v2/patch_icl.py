@@ -189,12 +189,16 @@ def compute_entropy_confidence(
     # Apply temperature scaling before sigmoid (supports learnable tensor)
     is_unit_temp = (temperature == 1.0) if isinstance(temperature, (int, float)) else False
     scaled_logits = logits if is_unit_temp else logits / temperature
-    p = torch.sigmoid(scaled_logits)
+
+    # Compute entropy in fp32 for numerical stability (critical for fp16 training)
+    # Then cast back to original dtype
+    orig_dtype = scaled_logits.dtype
+    p = torch.sigmoid(scaled_logits.float())
     p = p.clamp(1e-6, 1 - 1e-6)
     entropy = -(p * p.log() + (1 - p) * (1 - p).log())
     # Normalize by max entropy (log(2)) so output is in [0, 1]
     normalized_entropy = entropy / math.log(2)
-    confidence = 1.0 - normalized_entropy
+    confidence = (1.0 - normalized_entropy).to(orig_dtype)
     # If multi-channel, take mean across channels -> [B, K, 1, H, W]
     if confidence.shape[2] > 1:
         confidence = confidence.mean(dim=2, keepdim=True)
@@ -573,10 +577,14 @@ class PatchICL(nn.Module):
             # Normalize to [0, 1] range, apply temp, renormalize
             w_min = sampling_weights.amin(dim=(2, 3), keepdim=True)
             w_max = sampling_weights.amax(dim=(2, 3), keepdim=True)
-            w_range = (w_max - w_min).clamp(min=1e-6)
+            # Use larger epsilon for fp16 numerical stability
+            eps = 1e-4 if sampling_weights.dtype == torch.float16 else 1e-6
+            w_range = (w_max - w_min).clamp(min=eps)
             w_normalized = (sampling_weights - w_min) / w_range
             # Higher temp -> more uniform; lower temp -> sharper
-            w_tempered = w_normalized.pow(1.0 / temp)
+            # Clamp exponent to avoid overflow in fp16 (1/0.1 = 10 can overflow)
+            exponent = min(1.0 / temp, 8.0)  # Clamp to avoid extreme sharpening
+            w_tempered = w_normalized.pow(exponent)
             # Renormalize back to original scale (optional, samplers handle unnormalized)
             sampling_weights = w_tempered
 
@@ -656,13 +664,15 @@ class PatchICL(nn.Module):
             return context_mask
 
         # Soft mask has values in [0, 1], with ~0.5 at borders
-        soft_mask = context_mask.clamp(1e-6, 1 - 1e-6)
+        # Compute in fp32 for numerical stability (critical for fp16 training)
+        orig_dtype = context_mask.dtype
+        soft_mask = context_mask.float().clamp(1e-6, 1 - 1e-6)
 
         if mode == 'entropy':
             # High entropy where probability is near 0.5 (borders)
             entropy = -(soft_mask * soft_mask.log() + (1 - soft_mask) * (1 - soft_mask).log())
             entropy = entropy / math.log(2)  # Normalize to [0, 1]
-            return entropy
+            return entropy.to(orig_dtype)
 
         elif mode == 'border':
             # Border score: peaks at 0.5, falls off toward 0 and 1
@@ -676,7 +686,7 @@ class PatchICL(nn.Module):
 
             # Blend: (1-α)*foreground + α*border
             weights = (1 - border_weight) * soft_mask + border_weight * border_weights
-            return weights
+            return weights.to(orig_dtype)
 
         else:
             # Unknown mode, fallback to foreground
@@ -1198,7 +1208,8 @@ class PatchICL(nn.Module):
                         mode='bilinear', align_corners=False
                     )
 
-                eps = 1e-6
+                # Use larger epsilon for fp16 numerical stability
+                eps = 1e-4 if pred.dtype == torch.float16 else 1e-6
 
                 # Learned alpha combination (new approach)
                 if self.use_learned_alpha and aggregated_conf is not None and conf_upsampled is not None:
