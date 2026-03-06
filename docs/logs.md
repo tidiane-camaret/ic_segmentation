@@ -4,6 +4,32 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-03-06: Analysis of Multi-Level Prediction Combination
+
+**Goal:** Document how predictions from multiple resolution levels are combined.
+
+**Summary:**
+
+The PatchICL model uses a coarse-to-fine cascade where levels are processed sequentially. Each level:
+1. Receives the previous level's prediction (`prev_pred`) upsampled to original image size
+2. Uses `prev_pred` as a weight map to guide patch sampling toward predicted foreground
+3. Samples K patches, gets per-patch logits from the backbone transformer
+4. Aggregates patches back to a full mask using weighted averaging (uniform, Gaussian, confidence, or learned weights)
+5. Combines the aggregated result with `prev_pred` via `_combine_with_prev`
+
+**Cross-level combination modes** (`aggregate.py:_combine_with_prev`):
+- `"average"`: Fixed weighted blend (default 0.5/0.5 between current and previous)
+- `"coverage"`: Use current where patches exist, fall back to previous elsewhere (NMSW style)
+- `"replace"`: Ignore previous level entirely
+
+**Current usage:** Nearly all configs use `combine_mode: "average"` with default `combine_weight: 0.5`. The newer 100-series configs note that `combine_mode` is unused because blending is handled by `cascade.confidence_blend`.
+
+**Refinement passes** (optional): Re-sample patches in uncertain regions and combine with the detached previous prediction using the same aggregator.
+
+**Final output:** Last level's prediction bilinearly upsampled to original image size.
+
+---
+
 ## 2026-02-26: Scheduled Oracle Sampling
 
 **Goal:** Reduce train/val distribution mismatch caused by oracle sampling during training.
