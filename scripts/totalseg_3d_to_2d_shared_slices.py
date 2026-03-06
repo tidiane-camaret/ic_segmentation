@@ -237,8 +237,8 @@ def main(cfg: DictConfig) -> None:
     max_files = getattr(cfg, 'max_files_3d_to_2d', None)
     step_size = getattr(cfg, 'slice_step_size', 3)
 
-    dataset_dir = Path(cfg.paths.dataset)
-    output_dir = Path(str(cfg.paths.dataset) + "_2d_shared")
+    dataset_dir = Path(cfg.paths.base_dataset)
+    output_dir = Path(str(cfg.paths.base_dataset) + "_2d_shared")
     stats_path = output_dir / "stats.pkl"
 
     print("=== TotalSeg 3D to 2D (Shared Slices) ===")
