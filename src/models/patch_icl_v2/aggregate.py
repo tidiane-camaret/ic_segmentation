@@ -23,6 +23,7 @@ class PatchAggregator(nn.Module):
         min_coverage: float = 1e-6,
         use_confidence: bool = False,
         confidence_mode: str = "multiply",
+        detach_confidence: bool = False,
     ):
         """
         Args:
@@ -39,6 +40,8 @@ class PatchAggregator(nn.Module):
             confidence_mode: How to use confidence:
                 - "multiply": Multiply base weights by confidence
                 - "replace": Use confidence as the sole weighting
+            detach_confidence: If True, detach confidence before using in aggregation weights.
+                Prevents backbone from gaming confidence-weighted aggregation.
         """
         super().__init__()
         self.patch_size = patch_size
@@ -48,6 +51,7 @@ class PatchAggregator(nn.Module):
         self.min_coverage = min_coverage
         self.use_confidence = use_confidence
         self.confidence_mode = confidence_mode
+        self.detach_confidence = detach_confidence
 
     def _compute_patch_weights(
         self,
@@ -119,10 +123,12 @@ class PatchAggregator(nn.Module):
 
         # Modulate aggregation weights by confidence if enabled
         if self.use_confidence and confidence is not None:
+            # Detach confidence to prevent backbone from gaming aggregation weights
+            conf_for_weights = confidence.detach() if self.detach_confidence else confidence
             if self.confidence_mode == "multiply":
-                aggregation_weights = base_weights * confidence  # [B, K, 1, ps, ps]
+                aggregation_weights = base_weights * conf_for_weights  # [B, K, 1, ps, ps]
             elif self.confidence_mode == "replace":
-                aggregation_weights = confidence
+                aggregation_weights = conf_for_weights
 
         # Build output position grid for all patches (no Python loops / .item() syncs)
         row_offsets = torch.arange(ps, device=device)
@@ -204,10 +210,11 @@ class GaussianAggregator(PatchAggregator):
         min_coverage: float = 1e-6,
         use_confidence: bool = False,
         confidence_mode: str = "multiply",
+        detach_confidence: bool = False,
     ):
         super().__init__(
             patch_size, combine_mode, combine_weight, fill_uncovered, min_coverage,
-            use_confidence, confidence_mode
+            use_confidence, confidence_mode, detach_confidence
         )
         self.sigma_ratio = sigma_ratio
         self._precompute_gaussian()
@@ -246,6 +253,7 @@ def create_aggregator(
     min_coverage = kwargs.get('min_coverage', 1e-6)
     use_confidence = kwargs.get('use_confidence', False)
     confidence_mode = kwargs.get('confidence_mode', 'multiply')
+    detach_confidence = kwargs.get('detach_confidence', False)
 
     if aggregator_type == "gaussian":
         return GaussianAggregator(
@@ -257,6 +265,7 @@ def create_aggregator(
             min_coverage=min_coverage,
             use_confidence=use_confidence,
             confidence_mode=confidence_mode,
+            detach_confidence=detach_confidence,
         )
     else:  # "average" or default
         return PatchAggregator(
@@ -267,4 +276,5 @@ def create_aggregator(
             min_coverage=min_coverage,
             use_confidence=use_confidence,
             confidence_mode=confidence_mode,
+            detach_confidence=detach_confidence,
         )

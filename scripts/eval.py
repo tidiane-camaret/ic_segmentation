@@ -95,6 +95,7 @@ def save_register_tokens_eval(
 
     Saves for each case:
     - level{i}_register_tokens.npy: [R, D] register tokens per level
+    - level{i}_patch_mask_pct.npy: [K] mask percentage per patch
     - metadata.npz: case_id, label_id, axis, dice score
     Optionally (if save_images=True):
     - img.npy, gt_mask.npy, pred_mask.npy (uncompressed numpy for speed)
@@ -146,7 +147,7 @@ def save_register_tokens_eval(
             target_features=target_features,
             context_features=context_features,
             mode="val",
-            return_attn_weights=True,  # Required to get register tokens
+            return_attn_weights=False,
         )
 
         # Compute per-sample dice
@@ -172,25 +173,14 @@ def save_register_tokens_eval(
             case_dir = save_dir / f"{case_id}_{label_id}_{axis}"
             case_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save register tokens, attention weights, and patch mask percentages per level
+            # Save register tokens and patch mask percentages per level
             for level_idx, level_out in enumerate(level_outputs):
                 register_tokens = level_out.get("register_tokens")
                 if register_tokens is not None:
                     reg_np = register_tokens[i].cpu().numpy()  # [R, D]
                     np.save(case_dir / f"level{level_idx}_register_tokens.npy", reg_np)
 
-                attn_weights = level_out.get("attn_weights")
-                if attn_weights is not None:
-                    # attn_weights is a list of [B, H, K, K+1] tensors per layer
-                    # Last column is attention to zero_attn token
-                    for layer_idx, layer_attn in enumerate(attn_weights):
-                        attn_np = layer_attn[i].cpu().numpy()  # [H, K, K+1]
-                        np.save(
-                            case_dir / f"level{level_idx}_layer{layer_idx}_attn_weights.npy",
-                            attn_np,
-                        )
-
-                # Save patch mask percentages (for correlation with zero_attn)
+                # Save patch mask percentages
                 patch_labels = level_out.get("patch_labels")
                 if patch_labels is not None:
                     # patch_labels: [B, K, 1, ps, ps] -> compute mean per patch
@@ -634,83 +624,83 @@ def main(cfg: DictConfig) -> None:
     else:
         save_dir = None
 
-    # Save register tokens per case (separate from validation)
+    # Save register tokens per case (skips full validation to avoid double iteration)
     save_register_tokens = cfg.logging.get("save_register_tokens", False)
-    if save_register_tokens and accelerator.is_main_process:
-        date_str = datetime.today().strftime('%Y-%m-%d')
-        register_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}_register_tokens"
-        print(f"Saving register tokens to: {register_dir}")
-        save_register_images = cfg.logging.get("save_register_images", False)
-        n_cases = save_register_tokens_eval(
-            model, val_loader, device, register_dir, accelerator,
-            save_images=save_register_images,
+    if save_register_tokens:
+        if accelerator.is_main_process:
+            date_str = datetime.today().strftime('%Y-%m-%d')
+            register_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}_register_tokens"
+            print(f"Saving register tokens to: {register_dir}")
+            save_register_images = cfg.logging.get("save_register_images", False)
+            n_cases = save_register_tokens_eval(
+                model, val_loader, device, register_dir, accelerator,
+                save_images=save_register_images,
+            )
+            print(f"Saved register tokens for {n_cases} cases")
+    else:
+        # Full validation with detailed metrics
+        val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
+            model, val_loader, device,
+            save_dir=save_dir, max_save_batches=len(val_loader),
+            accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0
         )
-        print(f"Saved register tokens for {n_cases} cases")
+        if accelerator.is_main_process:
+            val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
+            val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
+            print(
+                f"Val Loss: {val_loss:.5f} | "
+                f"Val FinalDice: {val_final_dice:.5f} | "
+                f"Val SoftDice: {val_soft_dice:.5f} | "
+                f"Val PixelMAE: {val_pixel_mae:.5f} | "
+                f"Val CtxDice: {val_context_dice:.5f}"
+            )
+            # Print per-level metrics
+            for key, value in sorted(detailed_results.items()):
+                if key.startswith("level_"):
+                    print(f"  {key}: {value:.4f}")
+            # Print uncertainty metrics
+            for key in ["mean_entropy", "mean_confidence",
+                         "mean_entropy_on_errors", "mean_entropy_on_correct"]:
+                if key in detailed_results:
+                    print(f"  {key}: {detailed_results[key]:.4f}")
+            # Print per-label dice
+            print("\nPer-label Dice:")
+            for label_id, dice in sorted(detailed_results["per_label"].items(), key=lambda x: x[1], reverse=True):
+                print(f"  {label_id}: {dice:.4f}")
 
-    val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
-        model, val_loader, device,
-        save_dir=save_dir, max_save_batches=len(val_loader),
-        accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0
-    )
-    if accelerator.is_main_process:
-        val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
-        val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
-        print(
-            f"Val Loss: {val_loss:.5f} | "
-            f"Val FinalDice: {val_final_dice:.5f} | "
-            f"Val SoftDice: {val_soft_dice:.5f} | "
-            f"Val PixelMAE: {val_pixel_mae:.5f} | "
-            f"Val CtxDice: {val_context_dice:.5f}"
-        )
-        # Print per-level metrics
-        for key, value in sorted(detailed_results.items()):
-            if key.startswith("level_"):
-                print(f"  {key}: {value:.4f}")
-        # Print uncertainty metrics
-        for key in ["mean_entropy", "mean_confidence",
-                     "mean_entropy_on_errors", "mean_entropy_on_correct"]:
-            if key in detailed_results:
-                print(f"  {key}: {detailed_results[key]:.4f}")
-        # Print per-label dice
-        print("\nPer-label Dice:")
-        for label_id, dice in sorted(detailed_results["per_label"].items(), key=lambda x: x[1], reverse=True):
-            print(f"  {label_id}: {dice:.4f}")
+        if cfg.logging.use_wandb and accelerator.is_main_process:
+            val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
+            val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
+            log_dict = {
+                "val_loss": val_loss,
+                "val_local_dice": val_local_dice,
+                "val_final_dice": val_final_dice,
+                "val_final_soft_dice": val_soft_dice,
+                "val_final_pixel_mae": val_pixel_mae,
+                "val_context_dice": val_context_dice,
+            }
+            # Log all per-level and uncertainty metrics
+            for key, value in detailed_results.items():
+                if key.startswith("level_") or key.startswith("mean_"):
+                    log_dict[f"val/{key}"] = value
+            if flop_info:
+                log_dict["gflops_per_sample"] = flop_info["gflops_per_sample"]
+                log_dict["flops_per_sample"] = flop_info["flops_per_sample"]
+            # Log per-label dice
+            for label_id, dice in detailed_results["per_label"].items():
+                log_dict[f"dice_label/{label_id}"] = dice
+            wandb.log(log_dict)
+
+            # Log per-case results as a wandb Table
+            case_table = wandb.Table(columns=["case_id", "label_id", "axis", "dice"])
+            for result in detailed_results["per_case"]:
+                case_table.add_data(result["case_id"], result["label_id"], result.get("axis") or "N/A", result["dice"])
+            wandb.log({"per_case_dice": case_table})
+
+        if accelerator.is_main_process:
+            print(f"\nVal complete! Avg Dice: {val_final_dice:.5f}")
 
     if cfg.logging.use_wandb and accelerator.is_main_process:
-        val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
-        val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
-        log_dict = {
-            "val_loss": val_loss,
-            "val_local_dice": val_local_dice,
-            "val_final_dice": val_final_dice,
-            "val_final_soft_dice": val_soft_dice,
-            "val_final_pixel_mae": val_pixel_mae,
-            "val_context_dice": val_context_dice,
-        }
-        # Log all per-level and uncertainty metrics
-        for key, value in detailed_results.items():
-            if key.startswith("level_") or key.startswith("mean_"):
-                log_dict[f"val/{key}"] = value
-        if flop_info:
-            log_dict["gflops_per_sample"] = flop_info["gflops_per_sample"]
-            log_dict["flops_per_sample"] = flop_info["flops_per_sample"]
-        # Log per-label dice
-        for label_id, dice in detailed_results["per_label"].items():
-            log_dict[f"dice_label/{label_id}"] = dice
-        wandb.log(log_dict)
-
-        # Log per-case results as a wandb Table
-        case_table = wandb.Table(columns=["case_id", "label_id", "axis", "dice"])
-        for result in detailed_results["per_case"]:
-            case_table.add_data(result["case_id"], result["label_id"], result.get("axis") or "N/A", result["dice"])
-        wandb.log({"per_case_dice": case_table})
-
-
-    if accelerator.is_main_process:
-        print(f"\nVal complete! Avg Dice: {val_final_dice:.5f}")
-
-    if cfg.logging.use_wandb and accelerator.is_main_process:
-        # Wait for background image saving threads to complete before closing wandb
         wait_for_image_saves()
         wandb.finish()
 
