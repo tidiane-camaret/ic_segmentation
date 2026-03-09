@@ -270,11 +270,12 @@ class PatchICL(nn.Module):
         self.sampler_type = sampler_cfg.get('type', 'continuous')
         self.default_stride = sampler_cfg.get('stride', None)
 
-        # Context sampling mode: align with target sampling strategy
-        # - "foreground": Original behavior, sample from GT foreground (default)
-        # - "border": Sample from object borders (where GT is uncertain after downsampling)
-        # - "entropy": Sample from high-entropy regions of soft GT
+        # Sampling modes for target oracle weights and context weights (can be set independently)
+        # - "foreground": sample from GT foreground (default)
+        # - "border": sample from object borders (uncertain after downsampling)
+        # - "entropy": sample from high-entropy regions of soft GT
         self.context_sampling_mode = sampler_cfg.get('context_sampling', 'foreground')
+        self.target_sampling_mode = sampler_cfg.get('target_sampling', self.context_sampling_mode)
         self.context_border_weight = sampler_cfg.get('context_border_weight', 0.5)
 
         # Augmenter (shared)
@@ -1116,7 +1117,7 @@ class PatchICL(nn.Module):
                 labels_ds = self._downsample_mask(labels, resolution)
                 oracle_weights = self._compute_context_sampling_weights(
                     self._mask_to_weights(labels_ds),
-                    mode=self.context_sampling_mode,
+                    mode=self.target_sampling_mode,
                     border_weight=self.context_border_weight,
                 )
 

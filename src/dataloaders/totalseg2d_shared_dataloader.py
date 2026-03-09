@@ -81,16 +81,20 @@ class TotalSeg2DSharedDataset(Dataset):
         self.max_ds_len = max_ds_len
         self.class_balanced = class_balanced
 
-        # Context diversity config
+        # Context diversity config (stored but not yet applied in _get_context_slices)
         div_cfg = context_diversity or {}
         self.context_diversity_type = div_cfg.get('type', 'random')
         self.context_diversity_candidates = div_cfg.get('num_candidates', 10)
 
-        # Setup augmentation
+        # Setup augmentation (augment_config is an alias for augmentation_config)
+        augmentation_config = augmentation_config or augment_config
         self.augment = augment or (augmentation_config is not None and augmentation_config.get("enabled", False))
         if self.augment and augmentation_config is not None:
             self._setup_augmentation(augmentation_config)
         else:
+            self.augmentation_type = "legacy"
+            self.augmentation_config_full = None
+            self.windowing_jitter = 0
             self.spatial_transform = None
             self.intensity_transform = None
 
@@ -198,7 +202,28 @@ class TotalSeg2DSharedDataset(Dataset):
         self._h5_cache_max = 32
 
     def _setup_augmentation(self, cfg: Dict):
-        """Setup augmentation from config."""
+        """Setup augmentation from config.
+
+        Supports two modes:
+        - "universeg"/"custom": two-level pipeline (task + example level), applied jointly
+          to target and all context images for spatial consistency.
+        - "legacy" (default): per-image albumentations spatial + intensity transforms.
+        """
+        aug_type = cfg.get("type", "legacy")
+        self.augmentation_type = aug_type
+
+        if aug_type in ("universeg", "custom"):
+            # Store full config; apply_universeg_augmentation is called in __getitem__
+            self.augmentation_config_full = cfg
+            self.windowing_jitter = 0
+            self.spatial_transform = None
+            self.intensity_transform = None
+            print(f"Augmentation enabled: type=universeg/custom (task+example level)")
+            return
+
+        # Legacy: build albumentations transforms
+        self.augmentation_config_full = None
+        self.windowing_jitter = cfg.get("windowing_jitter", 0)
         try:
             from src.dataloaders.augmentations import (
                 create_spatial_only_transform,
@@ -448,7 +473,7 @@ class TotalSeg2DSharedDataset(Dataset):
 
         return candidates
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int, _retry: int = 0) -> Dict[str, torch.Tensor]:
         """Get a sample with context examples."""
         if self.class_balanced:
             # Two-stage sampling: pick label uniformly, then pick a random sample
@@ -465,7 +490,7 @@ class TotalSeg2DSharedDataset(Dataset):
             bbox = self._get_2d_bbox(target_case_id, label_id, axis)
             img, mask = self._crop_to_bbox(img, mask, bbox)
 
-        img = self._normalize_image(img)
+        img = self._normalize_image(img, jitter=self.windowing_jitter if self.augment else 0)
 
         if self.image_size:
             img = self._resize(img, self.image_size, "bilinear")
@@ -507,7 +532,7 @@ class TotalSeg2DSharedDataset(Dataset):
                         bbox = self._get_2d_bbox(ctx_case_id, label_id, axis)
                         ctx_img, ctx_mask = self._crop_to_bbox(ctx_img, ctx_mask, bbox)
 
-                    ctx_img = self._normalize_image(ctx_img)
+                    ctx_img = self._normalize_image(ctx_img, jitter=self.windowing_jitter if self.augment else 0)
 
                     if self.image_size:
                         ctx_img = self._resize(ctx_img, self.image_size, "bilinear")
@@ -522,8 +547,10 @@ class TotalSeg2DSharedDataset(Dataset):
                     continue
 
             if len(context_imgs) == 0:
+                if _retry >= 10:
+                    raise RuntimeError(f"Could not find valid context for label={label_id} after 10 retries")
                 retry_idx = random.randint(0, len(self.samples) - 1)
-                return self.__getitem__(retry_idx)
+                return self.__getitem__(retry_idx, _retry=_retry + 1)
 
             # Resample if still fewer context slices than requested (last resort)
             while len(context_imgs) < self.context_size and len(context_imgs) > 0:
@@ -534,13 +561,25 @@ class TotalSeg2DSharedDataset(Dataset):
 
         # Apply augmentation (training only)
         if self.augment:
-            img, mask = self._apply_spatial_augmentation(img, mask)
-            img = self._apply_intensity_augmentation(img)
-            for i in range(len(context_imgs)):
-                context_imgs[i], context_masks[i] = self._apply_spatial_augmentation(
-                    context_imgs[i], context_masks[i]
+            if self.augmentation_type in ("universeg", "custom"):
+                from src.dataloaders.augmentations import apply_universeg_augmentation
+                # Override img_size so medical_specialty crops resize back to the correct resolution
+                aug_cfg = dict(self.augmentation_config_full)
+                if self.image_size:
+                    aug_cfg["img_size"] = self.image_size[0]
+                img, mask, context_imgs, context_masks = apply_universeg_augmentation(
+                    img, mask, context_imgs, context_masks,
+                    full_config=aug_cfg,
                 )
-                context_imgs[i] = self._apply_intensity_augmentation(context_imgs[i])
+            else:
+                # Legacy: apply transforms independently per image
+                img, mask = self._apply_spatial_augmentation(img, mask)
+                img = self._apply_intensity_augmentation(img)
+                for i in range(len(context_imgs)):
+                    context_imgs[i], context_masks[i] = self._apply_spatial_augmentation(
+                        context_imgs[i], context_masks[i]
+                    )
+                    context_imgs[i] = self._apply_intensity_augmentation(context_imgs[i])
 
 
         # Convert to tensors
@@ -649,4 +688,5 @@ def get_dataloader(
         pin_memory=True,
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
     )

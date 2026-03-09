@@ -171,6 +171,8 @@ def foreground_random_crop(
 
     rmin, cmin = fg.min(axis=0)
     rmax, cmax = fg.max(axis=0)
+    # Convert to Python int to avoid numpy int64 issues with random.randint
+    rmin, cmin, rmax, cmax = int(rmin), int(cmin), int(rmax), int(cmax)
     fg_h, fg_w = rmax - rmin + 1, cmax - cmin + 1
     H, W = img.shape
 
@@ -816,7 +818,7 @@ def apply_universeg_augmentation(
     context_masks: List[np.ndarray],
     full_config: Dict,  # Pass the entire augmentation dictionary here
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
-    
+
     # 1. Apply Medical Specific Augs (Cropping & Mix) FIRST
     target_img, target_mask, context_imgs, context_masks = apply_medical_specialty_augs(
         target_img, target_mask, context_imgs, context_masks, full_config
