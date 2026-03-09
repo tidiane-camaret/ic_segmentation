@@ -286,10 +286,71 @@ category_map = {
     "brachiocephalic_trunk": "Vessels",
 }
 
-"""
-
-
-"""
+category_map_mri = {
+    # --- ORGANS (ABDOMINAL & PELVIC) ---
+    "esophagus": "Organs (Abd/Pelvis)",
+    "stomach": "Organs (Abd/Pelvis)",
+    "duodenum": "Organs (Abd/Pelvis)",
+    "small_bowel": "Organs (Abd/Pelvis)",
+    "colon": "Organs (Abd/Pelvis)",
+    "liver": "Organs (Abd/Pelvis)",
+    "gallbladder": "Organs (Abd/Pelvis)",
+    "pancreas": "Organs (Abd/Pelvis)",
+    "spleen": "Organs (Abd/Pelvis)",
+    "kidney_left": "Organs (Abd/Pelvis)",
+    "kidney_right": "Organs (Abd/Pelvis)",
+    "urinary_bladder": "Organs (Abd/Pelvis)",
+    "prostate": "Organs (Abd/Pelvis)",
+    "adrenal_gland_left": "Organs (Abd/Pelvis)",
+    "adrenal_gland_right": "Organs (Abd/Pelvis)",
+    # --- ORGANS (THORAX & HEAD/SPINE) ---
+    "heart": "Organs (Thorax/Head/Spine)",
+    "lung_left": "Organs (Thorax/Head/Spine)",
+    "lung_right": "Organs (Thorax/Head/Spine)",
+    "brain": "Organs (Thorax/Head/Spine)",
+    "spinal_cord": "Organs (Thorax/Head/Spine)",
+    # --- BONES (SPINE) ---
+    "vertebrae": "Bones (Spine)",
+    "intervertebral_discs": "Bones (Spine)",
+    "sacrum": "Bones (Spine)",
+    # --- BONES (LIMBS & PELVIS) ---
+    "hip_left": "Bones (Limbs/Pelvis)",
+    "hip_right": "Bones (Limbs/Pelvis)",
+    "femur_left": "Bones (Limbs/Pelvis)",
+    "femur_right": "Bones (Limbs/Pelvis)",
+    "humerus_left": "Bones (Limbs/Pelvis)",
+    "humerus_right": "Bones (Limbs/Pelvis)",
+    "tibia": "Bones (Limbs/Pelvis)",
+    "fibula": "Bones (Limbs/Pelvis)",
+    # --- MUSCLES (TRUNK) ---
+    "autochthon_left": "Muscles (Trunk)",
+    "autochthon_right": "Muscles (Trunk)",
+    "iliopsoas_left": "Muscles (Trunk)",
+    "iliopsoas_right": "Muscles (Trunk)",
+    "gluteus_maximus_left": "Muscles (Trunk)",
+    "gluteus_maximus_right": "Muscles (Trunk)",
+    "gluteus_medius_left": "Muscles (Trunk)",
+    "gluteus_medius_right": "Muscles (Trunk)",
+    "gluteus_minimus_left": "Muscles (Trunk)",
+    "gluteus_minimus_right": "Muscles (Trunk)",
+    # --- MUSCLES (THIGH) ---
+    "quadriceps_femoris_left": "Muscles (Thigh)",
+    "quadriceps_femoris_right": "Muscles (Thigh)",
+    "sartorius_left": "Muscles (Thigh)",
+    "sartorius_right": "Muscles (Thigh)",
+    "thigh_medial_compartment_left": "Muscles (Thigh)",
+    "thigh_medial_compartment_right": "Muscles (Thigh)",
+    "thigh_posterior_compartment_left": "Muscles (Thigh)",
+    "thigh_posterior_compartment_right": "Muscles (Thigh)",
+    # --- VESSELS ---
+    "aorta": "Vessels",
+    "iliac_artery_left": "Vessels",
+    "iliac_artery_right": "Vessels",
+    "inferior_vena_cava": "Vessels",
+    "iliac_vena_left": "Vessels",
+    "iliac_vena_right": "Vessels",
+    "portal_vein_and_splenic_vein": "Vessels",
+}
 totalseg_dir = _get_data_dir_from_config() / "totalseg"
 print(f"totalseg_dir: {totalseg_dir}")
 labels_stats_df = pd.read_csv(totalseg_dir / "label_stats.csv", index_col="label_id")
@@ -299,18 +360,32 @@ label_ids_train = labels_stats_df[labels_stats_df["split"] == "train"].index.tol
 label_ids_val = labels_stats_df[labels_stats_df["split"] == "val"].index.tolist()
 
 
-def get_label_ids(split="all", max_labels=None):
+def get_label_ids(split="all", max_labels=None, modality="ct"):
+    """Get label IDs for a given split and modality.
 
-    # Then apply split
+    Args:
+        split: "train", "val", or "all"
+        max_labels: Optional limit on number of labels
+        modality: "ct" or "mri"
+    """
+    if modality == "mri":
+        mri_dir = _get_data_dir_from_config() / "totalsegmri"
+        mri_stats_df = pd.read_csv(mri_dir / "label_stats.csv", index_col="label_id")
+        train_labels = mri_stats_df[mri_stats_df["split"] == "train"].index.tolist()
+        val_labels = mri_stats_df[mri_stats_df["split"] == "val"].index.tolist()
+    else:
+        train_labels = label_ids_train
+        val_labels = label_ids_val
+
     if split == "all":
-        label_ids = label_ids_train + label_ids_val
+        label_ids = train_labels + val_labels
     elif split == "train":
-        label_ids = label_ids_train
+        label_ids = train_labels
     elif split == "val":
-        label_ids = label_ids_val
+        label_ids = val_labels
     else:
         raise ValueError(f"split must be 'train', 'val', or 'all', got: {split}")
-    # Finally, apply max_labels limit
+
     if max_labels is not None:
         label_ids = label_ids[:max_labels]
     return label_ids

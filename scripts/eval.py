@@ -187,6 +187,12 @@ def save_register_tokens_eval(
                     mask_pct = patch_labels[i].mean(dim=(1, 2, 3)).cpu().numpy()  # [K]
                     np.save(case_dir / f"level{level_idx}_patch_mask_pct.npy", mask_pct)
 
+                # Save alpha (learned level combination weight) if present
+                alpha = level_out.get("alpha")
+                if alpha is not None:
+                    alpha_val = alpha[i].cpu().numpy().item()  # [1, 1, 1] -> scalar
+                    np.save(case_dir / f"level{level_idx}_alpha.npy", alpha_val)
+
             # Save minimal metadata
             np.savez(
                 case_dir / "metadata.npz",

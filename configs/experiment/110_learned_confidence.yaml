@@ -86,7 +86,7 @@ model:
       use_mask_prior: false
       use_context_mask: true
       mask_fusion_type: "concat"
-      predict_confidence: false
+      predict_confidence: true
 
     loss:
       patch_loss:
@@ -104,11 +104,11 @@ model:
           target_combined: 1
       level_weights: [1.0, 1.0, 1.0, 1.0]  
       confidence:
-        method: "entropy"
+        method: "learned"
         enabled: true
         temperature: 1.0
         learn_temperature: true
-        supervision_weight: 0.0  # Light supervision: conf correlates with correctness
+        supervision_weight: 0.1  # Light supervision: conf correlates with correctness
         boundary_weight: 0
         boundary_width: 2
         weighted_seg: false

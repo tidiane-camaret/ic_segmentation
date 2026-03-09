@@ -1,3 +1,58 @@
+% This is a modified version of Springer's LNCS template suitable for anonymized MICCAI 2025 main conference submissions. 
+% Original file: samplepaper.tex, a sample chapter demonstrating the LLNCS macro package for Springer Computer Science proceedings; Version 2.21 of 2022/01/12
+
+\documentclass[runningheads]{llncs}
+%
+\usepackage[T1]{fontenc}
+% T1 fonts will be used to generate the final print and online PDFs,
+% so please use T1 fonts in your manuscript whenever possible.
+% Other font encodings may result in incorrect characters.
+%
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{multirow, booktabs}
+\usepackage{graphicx,verbatim}
+% Used for displaying a sample figure. If possible, figure files should
+% be included in EPS format.
+%
+% If you use the hyperref package, please uncomment the following two lines
+% to display URLs in blue roman font according to Springer's eBook style:
+%\usepackage{color}
+%\renewcommand\UrlFont{\color{blue}\rmfamily}
+%\urlstyle{rm}
+%
+\begin{document}
+%
+\title{Scaling In-Context Segmentation via Hierarchical Supervision}
+\titlerunning{Scaling In-Context Segmentation via Hierarchical Supervision}
+% If the paper title is too long for the running head, you can set
+% an abbreviated paper title here
+%
+\begin{comment}  %% Removed for anonymized MICCAI submission
+\author{First Author\inst{1}\orcidID{0000-1111-2222-3333} \and
+Second Author\inst{2,3}\orcidID{1111-2222-3333-4444} \and
+Third Author\inst{3}\orcidID{2222--3333-4444-5555}}
+%
+\authorrunning{F. Author et al.}
+% First names are abbreviated in the running head.
+% If there are more than two authors, 'et al.' is used.
+%
+\institute{Princeton University, Princeton NJ 08544, USA \and
+Springer Heidelberg, Tiergartenstr. 17, 69121 Heidelberg, Germany
+\email{lncs@springer.com}\\
+\url{http://www.springer.com/gp/computer-science/lncs} \and
+ABC Institute, Rupert-Karls-University Heidelberg, Heidelberg, Germany\\
+\email{\{abc,lncs\}@uni-heidelberg.de}}
+
+\end{comment}
+
+\author{Anonymized Authors}  %% Added for anonymized MICCAI submission
+\authorrunning{Anonymized Author et al.}
+\institute{Anonymized Affiliations \\
+    \email{email@anonymized.com}}
+  
+\maketitle              % typeset the header of the contribution
+%
 \begin{abstract}
 In-context learning (ICL) enables medical image segmentation models to adapt to new anatomical structures from limited examples, reducing the clinical annotation burden. However, standard ICL methods typically rely on dense, global cross-attention, which scales poorly with image resolution. While recent approaches have introduced localized attention mechanisms, they often lack explicit supervision on the selection process, leading to redundant computation in non-informative regions. We propose a hierarchical framework that combines explicit patch selection with multi-level supervision. By supervising the model at both the patch and global levels, our approach learns to actively identify and attend only to the most informative anatomical regions. Evaluated on TotalSegmentator, our method achieves competitive in-domain CT segmentation accuracy while significantly reducing computational overhead for high-resolution volumes compared to full-context baselines.
 
@@ -33,96 +88,168 @@ Direct patch-based methods like Medverse \cite{huMedverseUniversalModel2025a} us
 
 \noindent \textbf{Input:} Target image $I^t \in \mathbb{R}^{H \times W}$ and context set $\{(I^c_i, L^c_i)\}_{i=1}^{N_c}$ of image/label mask pairs.
 
-\subsection{Hierarchical Cascaded Architecture}
-We propose a two-level cascaded framework that progressively refines segmentation masks by transitioning from global context to local detail. Images are first encoded into a dense feature grid $F \in \mathbb{R}^{64 \times 64 \times D}$ using a frozen feature extractor.
+\noindent \textbf{Output:} Predicted segmentation mask $\hat{L}^t$ at original resolution.
 
-\paragraph{Level 0: Coarse Global Context.}
-The first level operates at a $12 \times 12$ resolution. It utilizes a sliding window strategy to sample $K_0=4$ patches of size $8 \times 8$, providing a coarse global overview of the anatomical structures.
+\subsection{Overview}
 
-\paragraph{Level 1: Fine Local Refinement.}
-The second level operates at a $36 \times 36$ resolution. It samples $K_1=6$ patches using a continuous sampling strategy. During inference, these patches are selectively sampled from regions of interest identified by the Level 0 predictions, allowing the model to focus its computational budget on relevant anatomical boundaries.
+Our method processes images through a coarse-to-fine cascade of $M$ resolution levels $\{r_1, \ldots, r_M\}$ (e.g., $20 \rightarrow 60 \rightarrow 128$). At each level:
+\begin{enumerate}
+    \item \textbf{Sampling:} Select $K$ patches using Gumbel-top-$K$ sampling, guided by uncertainty from the previous level.
+    \item \textbf{Attention:} Process target and context patches jointly through transformer layers.
+    \item \textbf{Aggregation:} Combine patch predictions with confidence-weighted Gaussian averaging.
+    \item \textbf{Refinement:} Blend with previous level predictions using learned combination weights.
+\end{enumerate}
 
-\subsection{Border-Aligned Context Sampling}
-To ensure the context set provides high-signal guidance, we employ a border-aligned sampling strategy for context images. Sampling weights are computed as a 50/50 blend of foreground probability and boundary scores. This ensures that the transformer cross-attention mechanism prioritizes patches containing critical transition zones between organs and background.
+\subsection{Differentiable Patch Sampling}
 
-\subsection{Confidence-Driven Level Fusion}
-Predictions from the hierarchy are merged via a learned alpha-blending mechanism. A projection head operating on register tokens predicts a global factor $\alpha \in [0, 1]$, which determines the contribution of the Level 1 refinement relative to the upsampled Level 0 prediction. The fusion is further modulated by per-pixel confidence maps derived from the entropy of the prediction logits:
+We use Gumbel-top-$K$ sampling to select patches in a differentiable manner:
 \begin{equation}
-    \hat{L}_{combined} = \alpha \cdot \hat{L}_{L1} + (1 - \alpha) \cdot \text{up}(\hat{L}_{L0})
+    \text{idx} = \text{top-}K\left(\frac{w(x,y)}{\tau} + g_{x,y}\right), \quad g_{x,y} = -\log(-\log(u)), \; u \sim \text{Uniform}(0,1)
 \end{equation}
+where $w(x,y)$ are sampling weights and $\tau$ is a temperature parameter.
 
-\subsection{Scheduled Oracle Sampling}
-To mitigate exposure bias, we utilize scheduled oracle sampling during training. The probability of using ground truth labels to guide Level 1 sampling decays linearly from 1.0 to 0.2 over the first few epochs. This strategy allows the model to initially learn from "perfect" guidance before gradually adapting to the noisy intermediate predictions it will encounter during inference.
+At level $\ell > 1$, sampling is guided by uncertainty from level $\ell-1$:
+\begin{equation}
+    w_\ell(x, y) = 1 - c_{\ell-1}(x, y)
+\end{equation}
+where $c_{\ell-1}$ is the confidence map from the previous level, focusing computation on uncertain regions.
 
-\subsection{Multi-level Supervision}
-The framework is supervised using a Soft Dice loss applied at both the individual patch level and the aggregated global level. We apply level-specific loss weighting ($w_0=1.0, w_1=0.5$) to prioritize the formation of a robust coarse prediction as the foundation for refinement.
+Patches are sampled such that their \textbf{center} lies within the image, allowing partial overlap with boundaries. This increases coverage of border regions often undersampled by interior-only methods.
+
+\subsection{Feature Extraction and Encoding}
+
+Patches are encoded using frozen pretrained features (RAD-DINO). A lightweight CNN encoder projects patch features $\mathbf{f}_k \in \mathbb{R}^{h \times h \times D}$ to embeddings $\mathbf{z}_k \in \mathbb{R}^{d}$, producing multi-scale skip connections for the decoder.
+
+To enable a single backbone across all resolution levels, we use FiLM-style conditioning:
+\begin{equation}
+    \text{out} = \gamma(r) \odot \text{GroupNorm}(x) + \beta(r)
+\end{equation}
+where $\gamma, \beta$ are predicted from a continuous sinusoidal encoding of resolution $r$, allowing generalization to unseen resolutions.
+
+\subsection{Cross-Patch Attention}
+
+Target and context patch embeddings are processed jointly through $L$ transformer layers with:
+\begin{itemize}
+    \item \textbf{Register tokens:} $R$ learnable tokens prepended to the sequence, providing global context aggregation and enabling prediction of level combination weights.
+    \item \textbf{2D RoPE:} Rotary position embeddings encode spatial patch coordinates $(y, x)$, enabling reasoning about relative patch positions.
+    \item \textbf{Type embeddings:} Per-layer learnable embeddings distinguish target from context patches.
+    \item \textbf{Bidirectional attention:} All patches attend to all others (Flash Attention compatible).
+\end{itemize}
+
+A U-Net style CNN decoder reconstructs patch-level predictions using skip connections from the encoder.
+
+\subsection{Confidence Estimation}
+
+Pixel-level confidence guides aggregation and subsequent level sampling. We compute entropy-based confidence:
+\begin{equation}
+    c(x,y) = 1 - \frac{H(p(x,y))}{\log 2}, \quad H(p) = -p\log p - (1-p)\log(1-p)
+\end{equation}
+where $p = \sigma(\text{logits}/T)$ with learnable temperature $T$ for calibration.
+
+\subsection{Aggregation and Level Combination}
+
+Patch predictions are aggregated using confidence-weighted Gaussian averaging:
+\begin{equation}
+    \hat{L}^t_\ell(x,y) = \frac{\sum_{k} G_k(x,y) \cdot c_k(x,y) \cdot p_k(x,y)}{\sum_{k} G_k(x,y) \cdot c_k(x,y)}
+\end{equation}
+where $G_k$ is a Gaussian kernel centered on patch $k$.
+
+Level predictions are combined using a learned blending coefficient:
+\begin{equation}
+    \hat{L}^t_{\text{comb}} = \frac{\alpha_\ell \cdot \hat{L}^t_\ell \cdot c_\ell + (1 - \alpha_\ell) \cdot \hat{L}^t_{\ell-1} \cdot c_{\ell-1}}{\alpha_\ell \cdot c_\ell + (1 - \alpha_\ell) \cdot c_{\ell-1}}
+\end{equation}
+where $\alpha_\ell = \sigma(\text{MLP}(\bar{\mathbf{r}}_\ell))$ is predicted from mean-pooled register tokens $\bar{\mathbf{r}}_\ell$, allowing the model to adaptively weight each level's contribution.
+
+\subsection{Training}
+
+The model is trained with multi-level supervision:
+\begin{equation}
+    \mathcal{L} = \sum_{\ell=1}^{M} \lambda_\ell \left( \mathcal{L}_\text{patch}^\ell + \mathcal{L}_\text{aggreg}^\ell + \mathcal{L}_\text{combined}^\ell \right)
+\end{equation}
+where $\mathcal{L}_\text{patch}$ supervises individual patch predictions, $\mathcal{L}_\text{aggreg}$ supervises the aggregated output, and $\mathcal{L}_\text{combined}$ provides gradients for the learned $\alpha$. All use soft Dice + Focal loss.
+
+\textbf{Oracle scheduling} gradually transitions from ground-truth guided sampling (oracle) to model-guided sampling during training, reducing the train/validation distribution mismatch.
 
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=\textwidth,keepaspectratio]{imgs/figures/architecture.pdf}
-\caption{Cascaded PatchICL Architecture with two levels of refinement.}
+\caption{Architecture}
 \label{fig:architecture}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth,keepaspectratio]{imgs/figures/attention.pdf}
+\caption{Patch-level attention}
+\label{fig:patch_attn}
 \end{figure}
 
 \section{Experiments}
 
-\textbf{Training:} TotalSegmentator CT \cite{wasserthalTotalSegmentatorRobustSegmentation2023} (training cases, training labels) (See Table \ref{tab:label_splits})
+\subsection{Dataset and Preprocessing}
 
-\textbf{Evaluation:}
+We train and evaluate on TotalSegmentator~\cite{wasserthalTotalSegmentatorRobustSegmentation2023}, a large-scale CT dataset with 104 anatomical structures. To test true in-context generalization, we split by \textbf{label} rather than by case: 50 structures for training, 50 held-out structures for validation (Table~\ref{tab:label_splits}). This ensures the model must generalize to entirely unseen anatomical categories at test time, not just unseen patients.
+
+\textbf{2D Slice Extraction.} We extract 2D slices from 3D volumes along all three anatomical axes (axial, coronal, sagittal), increasing data diversity and providing multi-view perspectives of each structure. Slices are filtered by coverage: only slices with $\geq 30$ foreground pixels are retained, preventing training on uninformative near-empty slices.
+
+\textbf{Class-Balanced Sampling.} To prevent large organs (e.g., liver, lungs) from dominating training, we sample labels uniformly at each step. Within each label, we subsample to at most 6 slices per (case, axis) group using strided selection for even spatial distribution.
+
+\textbf{Context Selection.} Context examples are preferentially drawn from the \textbf{same patient} as the target, providing anatomically consistent support. When insufficient same-case examples exist, we fall back to other patients with the same structure. We use $N_c = 5$ context pairs during training.
+
+\textbf{Evaluation.}
 \begin{itemize}
-    \item TotalSegmentator CT (validation cases, validation labels)
-    \item TotalSegmentator MRI \cite{dantonoliTotalSegmentatorMRIRobust2025} (all cases, all labels)
+    \item \textbf{In-domain:} TotalSegmentator CT (validation labels, all cases)
+    \item \textbf{Out-of-domain:} TotalSegmentator MRI~\cite{dantonoliTotalSegmentatorMRIRobust2025} (all labels, all cases)
 \end{itemize}
 
 
 
 
 \section{Results}
-\subsection{In-domain}
-Baseline : Universeg \cite{butoiUniverSegUniversalMedical2023}  
-
-Parameters : $p=8$ ...
+\subsection{In-Domain CT Segmentation}
 
 \begin{table}[t]
 \centering
-\caption{Dice scores on TotalSegmentator CT validation set (mean $\pm$ std). Best results per category in \textbf{bold}.}\label{tab:dice_totalseg_ct}
-\begin{tabular}{lcc}
-\toprule
-Category & \textbf{PatchICL} & UniverSeg \\
-\midrule
-Organs (Abd./Pelvis)          & 0.268 $\pm$ 0.313 & \textbf{0.309 $\pm$ 0.335} \\
-Organs (Thorax/Head/Spine)    & 0.291 $\pm$ 0.293 & \textbf{0.320 $\pm$ 0.332} \\
-Bones (Spine)                 & \textbf{0.383 $\pm$ 0.338} & 0.243 $\pm$ 0.277 \\
-Bones (Ribs/Sternum)          & \textbf{0.246 $\pm$ 0.327} & 0.095 $\pm$ 0.186 \\
-Bones (Limbs/Shoulder/Pelvis) & \textbf{0.554 $\pm$ 0.352} & 0.395 $\pm$ 0.350 \\
-Muscles                       & 0.331 $\pm$ 0.337 & \textbf{0.396 $\pm$ 0.328} \\
-Vessels                       & 0.120 $\pm$ 0.207 & \textbf{0.153 $\pm$ 0.227} \\
-\midrule
-\textbf{Overall}              & \textbf{0.297 $\pm$ 0.330} & 0.242 $\pm$ 0.303 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Out-of-domain labels}
-
-
-\begin{table}[t]
-\centering
-\caption{Dice scores on TotalSegmentator MRI validation set (mean $\pm$ std). Best results per category in \textbf{bold}.}\label{tab:dice_totalseg_mri}
+\caption{Dice scores on TotalSegmentator CT validation set (mean $\pm$ std). Best per category in \textbf{bold}.}\label{tab:dice_totalseg_ct}
 \begin{tabular}{lcc}
 \toprule
 Category & PatchICL & \textbf{UniverSeg} \\
 \midrule
-Organs (Abd./Pelvis)          & 0.107 $\pm$ 0.205 & \textbf{0.172 $\pm$ 0.248} \\
-Organs (Thorax/Head/Spine)    & 0.056 $\pm$ 0.133 & \textbf{0.156 $\pm$ 0.231} \\
-Bones (Spine)                 & 0.129 $\pm$ 0.188 & \textbf{0.136 $\pm$ 0.210} \\
-Bones (Limbs/Shoulder/Pelvis) & \textbf{0.068 $\pm$ 0.145} & 0.062 $\pm$ 0.123 \\
-Muscles                       & \textbf{0.073 $\pm$ 0.166} & 0.064 $\pm$ 0.136 \\
+Organs (Thorax/Head/Spine)    & 0.482 $\pm$ 0.267 & \textbf{0.588 $\pm$ 0.274} \\
+Organs (Abd./Pelvis)          & 0.428 $\pm$ 0.336 & \textbf{0.524 $\pm$ 0.332} \\
+Muscles                       & 0.330 $\pm$ 0.296 & \textbf{0.489 $\pm$ 0.309} \\
+Vessels                       & 0.366 $\pm$ 0.310 & \textbf{0.478 $\pm$ 0.313} \\
+Other                         & \textbf{0.448 $\pm$ 0.273} & 0.418 $\pm$ 0.313 \\
 \midrule
-\textbf{Overall}              & 0.082 $\pm$ 0.175 & \textbf{0.117 $\pm$ 0.206} \\
+\textbf{Overall}              & 0.421 $\pm$ 0.295 & \textbf{0.454 $\pm$ 0.318} \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\subsection{Cross-Modality Generalization (MRI)}
+
+To evaluate cross-modality generalization, we test on TotalSegmentator MRI~\cite{dantonoliTotalSegmentatorMRIRobust2025} without any fine-tuning. Both methods were trained exclusively on CT data.
+
+\begin{table}[t]
+\centering
+\caption{Dice scores on TotalSegmentator MRI (mean $\pm$ std). Models trained on CT only. Best per category in \textbf{bold}.}\label{tab:dice_totalseg_mri}
+\begin{tabular}{lcc}
+\toprule
+Category & PatchICL & \textbf{UniverSeg} \\
+\midrule
+Organs (Thorax/Head/Spine)    & 0.489 $\pm$ 0.291 & \textbf{0.627 $\pm$ 0.306} \\
+Muscles (Thigh)               & 0.443 $\pm$ 0.276 & \textbf{0.597 $\pm$ 0.281} \\
+Muscles (Trunk)               & 0.420 $\pm$ 0.274 & \textbf{0.592 $\pm$ 0.279} \\
+Organs (Abd./Pelvis)          & 0.405 $\pm$ 0.287 & \textbf{0.573 $\pm$ 0.293} \\
+Bones (Limbs/Pelvis)          & 0.388 $\pm$ 0.302 & \textbf{0.526 $\pm$ 0.323} \\
+Bones (Spine)                 & 0.318 $\pm$ 0.246 & \textbf{0.505 $\pm$ 0.288} \\
+Vessels                       & 0.286 $\pm$ 0.260 & \textbf{0.495 $\pm$ 0.294} \\
+\midrule
+\textbf{Overall}              & 0.398 $\pm$ 0.285 & \textbf{0.565 $\pm$ 0.296} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 
 \subsection{Generalization to unseen dimensions}
 Accuracy and flops
@@ -130,8 +257,8 @@ Accuracy and flops
 
 \begin{figure}[!htbp]
 \centering
-\includegraphics[width=\textwidth]{imgs/figures/universeg_input_size_bar.pdf}
-\caption{Accuracy and compute by input image size}
+\includegraphics[width=\textwidth]{imgs/plots/pareto_input_size.pdf}
+\caption{Accuracy and compute by input dimensions}
 \label{fig:dice_flops_per_input_size}
 \end{figure}
 
@@ -139,7 +266,7 @@ Accuracy and flops
 
 \begin{figure}[!htbp]
 \centering
-\includegraphics[width=\textwidth]{imgs/figures/universeg_context_size_bar.pdf}
+\includegraphics[width=\textwidth]{imgs/plots/pareto_context_size.pdf}
 \caption{Accuracy and compute by number of context pairs}
 \label{fig:dice_flops_per_nb_context}
 \end{figure}
@@ -155,15 +282,15 @@ Accuracy and flops
 
 \begin{figure}[!htbp]
 \centering
-\includegraphics[width=\textwidth]{imgs/figures/reg_tokens_label.png}
-\caption{2D UMAP projection of register tokens labeled by class (TotalSegmentator, validation set)}
+\includegraphics[width=\textwidth]{imgs/plots/reg_tokens_category.png}
+\caption{2D UMAP projection of register 1, labeled by class category (TotalSegmentator, validation set)}
 \label{fig:reg_tokens_label}
 \end{figure}
 
 \begin{figure}[!htbp]
 \centering
-\includegraphics[width=\textwidth]{imgs/figures/reg_tokens_category.png}
-\caption{2D UMAP projection of register tokens labeled by category (TotalSegmentator, validation set)}
+\includegraphics[width=\textwidth]{imgs/plots/reg_tokens_class.png}
+\caption{2D UMAP projection of register 1, labeled by class for each category (TotalSegmentator, validation set)}
 \label{fig:reg_tokens_category}
 \end{figure}
 
@@ -206,3 +333,172 @@ Vessels & IVC, SVC, L.~brachioceph.~v., L.~iliac~v., R.~iliac~v., L.~subclavian~
 \bottomrule
 \end{tabular}
 \end{table}
+
+\newpage
+
+\section{Important Messages to MICCAI Authors}
+
+This is a modified version of Springer's LNCS template suitable for anonymized MICCAI 2026 main conference submissions. The author section has already been anonymized for you.  You cannot remove the author section to gain extra writing space.  You must not remove the abstract and keyword sections in your submission.
+
+To avoid an accidental anonymity breach, you are not required to include the \textbf{Acknowledgments} and the \textbf{Disclosure of Interest} sections for the initial submission phase.  If your paper is accepted, you must reinsert these sections in your final paper.  If you opted to include these sections in the initial submission phase, they will count toward the 8-page limit.
+
+To avoid desk rejection of your paper, you are encouraged to read "Avoiding Desk Rejection" by the MICCAI submission platform manager.  A few important rules are summarized below for your reference:  
+\begin{enumerate}
+    \item Do not modify or remove the provided anonymized author section except for inserting your paper ID.
+    \item Do not remove the keyword section to gain extra writing space. Authors must provide at least one keyword.
+    \item Do not remove the abstract sections to gain extra writing space. 
+    \item Inline figures (wrapping text around a figure) are not allowed.
+    \item Authors are not allowed to change the default margins, font size, font type, and document style.  If you are using any additional packages, it is the author's responsibility to ensure they do not inherently alter the document's layout.
+    \item It is prohibited to use commands such as \verb|\vspace| and \verb|\hspace| to reduce the pre-set white space in the document.  Shrinking the white space between your figures/tables and their captions, and between sections and subsections, is strictly prohibited.
+    \item Please make sure your figures and tables do not span into the margins.
+    \item If you have tables, the smallest font size allowed is 8pt.  Your tables should not be inserted as figures.
+    \item Please ensure your paper is properly anonymized.  Refer to your previously published paper in the third person.  Data collection location of private dataset should be masked.
+        \item  If you are including a link to your code repository or datasets or submitting supplementary materials, you must ensure your repository and supplementary materials are anonymized.
+    \item Your paper must not exceed the page limit.  You can have 8 pages of the main content (text (including paper title, author section, abstract, keyword section), figures and tables, conclusion, acknowledgment and disclaimer) plus up to 2 pages of references.  The reference section does not need to start on a new page.  
+    \item *Beginning in 2025* 
+    Supplementary materials are limited to multimedia content (e.g., videos) as warranted by the technical application (e.g., robotics, surgery, ...). These files should not display any proofs, analysis, additional results, or embedded slides, and should not show any identification markers either. Violation of this guideline will lead to desk rejection. PDF files may not be submitted as supplementary materials in 2026 unless authors are citing a paper that has not yet been published. In such a case, authors are required to submit an anonymized version of the cited paper. ACs will perform checks to ensure the integrity.
+\end{enumerate}
+
+
+\section{Section}
+\subsection{A Subsection Sample}
+Please note that the first paragraph of a section or subsection is
+not indented. The first paragraph that follows a table, figure,
+equation etc. does not need an indent, either.
+
+Subsequent paragraphs, however, are indented.
+
+\subsubsection{Sample Heading (Third Level)} Only two levels of
+headings should be numbered. Lower level headings remain unnumbered;
+they are formatted as run-in headings.
+
+\paragraph{Sample Heading (Fourth Level)}
+The contribution should contain no more than four levels of
+headings. Table~\ref{tab1} gives a summary of all heading levels.
+
+\begin{table}
+\caption{Table captions should be placed above the
+tables.}\label{tab1}
+\begin{tabular}{|l|l|l|}
+\hline
+Heading level &  Example & Font size and style\\
+\hline
+Title (centered) &  {\Large\bfseries Lecture Notes} & 14 point, bold\\
+1st-level heading &  {\large\bfseries 1 Introduction} & 12 point, bold\\
+2nd-level heading & {\bfseries 2.1 Printing Area} & 10 point, bold\\
+3rd-level heading & {\bfseries Run-in Heading in Bold.} Text follows & 10 point, bold\\
+4th-level heading & {\itshape Lowest Level Heading.} Text follows & 10 point, italic\\
+\hline
+\end{tabular}
+\end{table}
+
+
+\begin{table}
+\caption{Test table.}\label{tab2}
+%\scalebox{0.8}
+{
+\begin{tabular}{|l|l|l|}
+\hline
+Heading level &  Example & Font size and style\\
+\hline
+\small small &  {\Large\bfseries Lecture Notes} & 14 point, bold\\
+\tiny tiny &  {\large\bfseries 1 Introduction} & 12 point, bold\\
+\normalfont normal & {\bfseries 2.1 Printing Area} & 10 point, bold\\
+\fontsize{8}{9} 8pt & {\bfseries Run-in Heading in Bold.} Text follows & 10 point, bold\\
+\scriptsize script & {\itshape Lowest Level Heading.} Text follows & 10 point, italic\\
+\hline
+\end{tabular}}
+\end{table}
+
+\noindent Displayed equations are centered and set on a separate
+line.
+\begin{equation}
+x + y = z
+\end{equation}
+Please try to avoid rasterized images for line-art diagrams and
+schemas. Whenever possible, use vector graphics instead (see
+Fig.~\ref{fig1}).
+
+\begin{figure}
+\includegraphics[width=\textwidth]{fig1.eps}
+\caption{A figure caption is always placed below the illustration.
+Please note that short captions are centered, while long ones are
+justified by the macro package automatically.} \label{fig1}
+\end{figure}
+
+\begin{theorem}
+This is a sample theorem. The run-in heading is set in bold, while
+the following text appears in italics. Definitions, lemmas,
+propositions, and corollaries are styled the same way.
+\end{theorem}
+%
+% the environments 'definition', 'lemma', 'proposition', 'corollary',
+% 'remark', and 'example' are defined in the LLNCS documentclass as well.
+%
+\begin{proof}
+Proofs, examples, and remarks have the initial word in italics,
+while the following text appears in normal font.
+\end{proof}
+For citations of references, we prefer the use of square brackets
+and consecutive numbers. Citations using labels or the author/year
+convention are also acceptable. The following bibliography provides
+a sample reference list with entries for journal
+articles~\cite{ref_article1}, an LNCS chapter~\cite{ref_lncs1}, a
+book~\cite{ref_book1}, proceedings without editors~\cite{ref_proc1},
+and a homepage~\cite{ref_url1}. Multiple citations are grouped
+\cite{ref_article1,ref_lncs1,ref_book1},
+\cite{ref_article1,ref_book1,ref_proc1,ref_url1}.
+
+ %% removed for anonymized MICCAI submission.
+    
+    % The following acknowledgement and disclaimer sections can be removed for the double-blind review process.  If and when your paper is accepted, reinsert the acknowledgement and the disclaimer clause in your final camera-ready version.
+    % IF you opted to include the acknowledgement and disclaimer sections, they will count towards the 8-page limit.
+
+\begin{credits}
+\subsubsection{\ackname} A bold run-in heading in small font size at the end of the paper is
+used for general acknowledgments, for example: This study was funded
+by X (grant number Y).
+
+\subsubsection{\discintname}
+It is now necessary to declare any competing interests or to specifically
+state that the authors have no competing interests. Please place the
+statement with a bold run-in heading in small font size beneath the
+(optional) acknowledgments\footnote{If EquinOCS, our proceedings submission
+system, is used, then the disclaimer can be provided directly in the system.},
+for example: The authors have no competing interests to declare that are
+relevant to the content of this article. Or: Author A has received research
+grants from Company W. Author B has received a speaker honorarium from
+Company X and owns stock in Company Y. Author C is a member of committee Z.
+\end{credits}
+
+
+%
+% ---- Bibliography ----
+%
+% BibTeX users should specify bibliography style 'splncs04'.
+% References will then be sorted and formatted in the correct style.
+%
+% \bibliographystyle{splncs04}
+% \bibliography{mybibliography}
+%
+\begin{thebibliography}{8}
+\bibitem{ref_article1}
+Author, F.: Article title. Journal \textbf{2}(5), 99--110 (2016)
+
+\bibitem{ref_lncs1}
+Author, F., Author, S.: Title of a proceedings paper. In: Editor,
+F., Editor, S. (eds.) CONFERENCE 2016, LNCS, vol. 9999, pp. 1--13.
+Springer, Heidelberg (2016). \doi{10.10007/1234567890}
+
+\bibitem{ref_book1}
+Author, F., Author, S., Author, T.: Book title. 2nd edn. Publisher,
+Location (1999)
+
+\bibitem{ref_proc1}
+Author, A.-B.: Contribution title. In: 9th International Proceedings
+on Proceedings, pp. 1--2. Publisher, Location (2010)
+
+\bibitem{ref_url1}
+LNCS Homepage, \url{http://www.springer.com/lncs}, last accessed 2023/10/25
+\end{thebibliography}
+\end{document}
