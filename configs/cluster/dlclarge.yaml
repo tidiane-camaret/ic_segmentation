@@ -23,7 +23,7 @@ paths:
     # patch_icl_v2: ${..RESULTS_DIR}/checkpoints/scarlet-firefly-161/best_model.pt
 
 # Cluster-specific training settings
-train_batch_size: 12
-val_batch_size: 12
+train_batch_size: 25
+val_batch_size: 25
 training:
-  num_workers: 6  # higher values OOM with 512x512 images (forked workers inherit parent address space)
+  num_workers: 10  # higher values OOM with 512x512 images (forked workers inherit parent address space)

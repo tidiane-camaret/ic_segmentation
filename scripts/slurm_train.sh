@@ -29,9 +29,6 @@ uv run accelerate launch \
     --multi_gpu \
     --num_processes=2 \
     scripts/train.py \
-    max_labels=50 \
-    method=universeg \
+    experiment=107_4_lvls \
     cluster=dlclarge \
-    +augmentation=custom
     #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt
-    --mixed_precision=fp16 \
