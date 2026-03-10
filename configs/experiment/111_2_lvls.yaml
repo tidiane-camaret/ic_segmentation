@@ -20,16 +20,7 @@ model:
         sampling_temperature: 0.1
         stride: 7
         num_patches: 9
-        num_context_patches: 4
-        pad_before: 1
-        pad_after: 1
-      - resolution: 60
-        patch_size: 8
-        sampling_method: "continuous"
-        sampling_temperature: 0.1
-        stride: 6
-        num_patches: 12
-        num_context_patches: 4  # Fewer patches for context (default: num_patches)
+        num_context_patches: 9
         pad_before: 1
         pad_after: 1
       - resolution: 128
@@ -38,7 +29,7 @@ model:
         sampling_temperature: 0.1
         stride: 6
         num_patches: 50
-        num_context_patches: 20  # Fewer patches for context (default: num_patches)
+        num_context_patches: 10  # Fewer patches for context (default: num_patches)
         pad_before: 0
         pad_after: 0
 
@@ -56,9 +47,9 @@ model:
       decay_epochs: 30          # Decay over 30 epochs
 
     sampler:
-      target_sampling: "entropy"
-      context_sampling: "entropy"    # Align context with target: sample from borders
-      # context_border_weight: 0.5    # Blend: 50% foreground + 50% border
+      target_sampling: "gt_entropy"              # Oracle weights: sample from GT border regions
+      target_model_sampling: "predicted_uncertainty"  # Model weights: sample from low confidence
+      context_sampling: "gt_entropy"             # Context: sample from GT border regions
 
     aggregator:
       type: "average"
@@ -108,7 +99,7 @@ model:
         enabled: true
         temperature: 1.0
         learn_temperature: true
-        supervision_weight: 0.1  # Light supervision: conf correlates with correctness
+        supervision_weight: 1.0  # Light supervision: conf correlates with correctness
         boundary_weight: 0
         boundary_width: 2
         weighted_seg: false

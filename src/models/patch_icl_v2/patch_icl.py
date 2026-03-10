@@ -257,12 +257,6 @@ class PatchICL(nn.Module):
         # Pass register tokens from level N as extra context tokens to level N+1
         self.cascade_registers = cascade_cfg.get('cascade_registers', False)
 
-        # Sampling robustness config (improves train/val generalization gap)
-        sampling_robustness_cfg = config.get('sampling_robustness', {})
-        self.sampling_dropout = sampling_robustness_cfg.get('dropout', 0.0)  # Probability of using uniform sampling
-        self.sampling_temp_start = sampling_robustness_cfg.get('temperature_start', 1.0)  # Start temperature
-        self.sampling_temp_end = sampling_robustness_cfg.get('temperature_end', 1.0)  # End temperature
-        self.sampling_temp_epochs = sampling_robustness_cfg.get('temperature_epochs', 100)  # Epochs for annealing
         self._current_epoch = 0  # Updated by train loop
 
         # Sampler config (type shared, per-level instances)
@@ -270,13 +264,27 @@ class PatchICL(nn.Module):
         self.sampler_type = sampler_cfg.get('type', 'continuous')
         self.default_stride = sampler_cfg.get('stride', None)
 
-        # Sampling modes for target oracle weights and context weights (can be set independently)
-        # - "foreground": sample from GT foreground (default)
-        # - "border": sample from object borders (uncertain after downsampling)
-        # - "entropy": sample from high-entropy regions of soft GT
-        self.context_sampling_mode = sampler_cfg.get('context_sampling', 'foreground')
-        self.target_sampling_mode = sampler_cfg.get('target_sampling', self.context_sampling_mode)
-        self.context_border_weight = sampler_cfg.get('context_border_weight', 0.5)
+        # Sampling modes - clearly separated by source:
+        #
+        # GT-based modes (for oracle weights and context):
+        #   - "gt_foreground": Sample from GT mask foreground (default)
+        #   - "gt_border": Sample from GT mask borders (soft mask ≈ 0.5)
+        #   - "gt_entropy": Sample from high-entropy regions of soft GT
+        #
+        # Prediction-based modes (for model weights at levels > 0):
+        #   - "predicted_uncertainty": Sample from 1 - confidence (low confidence regions)
+        #   - "predicted_entropy": Sample from entropy of prediction logits
+        #
+        # Target sampling uses oracle mode for oracle weights, model mode for model weights
+        # Context sampling always uses GT-based modes (context has GT masks)
+        self.target_oracle_mode = sampler_cfg.get('target_sampling', 'gt_foreground')
+        self.target_model_mode = sampler_cfg.get('target_model_sampling', 'predicted_uncertainty')
+        self.context_sampling_mode = sampler_cfg.get('context_sampling', 'gt_foreground')
+
+        # Backward compatibility: map old mode names to new
+        mode_map = {'foreground': 'gt_foreground', 'border': 'gt_border', 'entropy': 'gt_entropy'}
+        self.target_oracle_mode = mode_map.get(self.target_oracle_mode, self.target_oracle_mode)
+        self.context_sampling_mode = mode_map.get(self.context_sampling_mode, self.context_sampling_mode)
 
         # Augmenter (shared)
         aug_cfg = sampler_cfg.get('augmentation', {})
@@ -491,16 +499,8 @@ class PatchICL(nn.Module):
         self.feature_extractor = feature_extractor
 
     def set_epoch(self, epoch: int):
-        """Set current epoch for temperature annealing."""
+        """Set current epoch for oracle scheduling."""
         self._current_epoch = epoch
-
-    def _get_sampling_temperature(self) -> float:
-        """Compute current sampling temperature based on epoch-based annealing."""
-        if self.sampling_temp_epochs <= 0:
-            return self.sampling_temp_end
-        progress = min(1.0, self._current_epoch / self.sampling_temp_epochs)
-        # Linear interpolation from start to end
-        return self.sampling_temp_start + progress * (self.sampling_temp_end - self.sampling_temp_start)
 
     def _get_oracle_probability(self, level_idx: int) -> float:
         """Compute oracle sampling probability with scheduled decay.
@@ -546,55 +546,6 @@ class PatchICL(nn.Module):
             return end + (start - end) * sigmoid_val
         else:
             return end
-
-    def _apply_sampling_robustness(
-        self,
-        sampling_weights: torch.Tensor,
-        training: bool,
-    ) -> torch.Tensor:
-        """Apply sampling dropout and temperature scaling for robustness.
-
-        During training:
-        - With probability `sampling_dropout`, replace weights with uniform
-        - Apply temperature scaling: weights^(1/T) where T is annealed
-
-        Args:
-            sampling_weights: [B, 1, H, W] - raw sampling weights
-            training: whether in training mode
-
-        Returns:
-            Adjusted sampling weights
-        """
-        if not training:
-            return sampling_weights
-
-        B = sampling_weights.shape[0]
-        device = sampling_weights.device
-
-        # Sampling dropout: replace some samples with uniform weights
-        if self.sampling_dropout > 0:
-            dropout_mask = torch.rand(B, 1, 1, 1, device=device) < self.sampling_dropout
-            uniform_weights = torch.ones_like(sampling_weights)
-            sampling_weights = torch.where(dropout_mask, uniform_weights, sampling_weights)
-
-        # Temperature scaling (annealed)
-        temp = self._get_sampling_temperature()
-        if temp != 1.0 and temp > 0:
-            # Normalize to [0, 1] range, apply temp, renormalize
-            w_min = sampling_weights.amin(dim=(2, 3), keepdim=True)
-            w_max = sampling_weights.amax(dim=(2, 3), keepdim=True)
-            # Use larger epsilon for fp16 numerical stability
-            eps = 1e-4 if sampling_weights.dtype == torch.float16 else 1e-6
-            w_range = (w_max - w_min).clamp(min=eps)
-            w_normalized = (sampling_weights - w_min) / w_range
-            # Higher temp -> more uniform; lower temp -> sharper
-            # Clamp exponent to avoid overflow in fp16 (1/0.1 = 10 can overflow)
-            exponent = min(1.0 / temp, 8.0)  # Clamp to avoid extreme sharpening
-            w_tempered = w_normalized.pow(exponent)
-            # Renormalize back to original scale (optional, samplers handle unnormalized)
-            sampling_weights = w_tempered
-
-        return sampling_weights
 
     def _downsample(self, x: torch.Tensor, resolution: int) -> torch.Tensor:
         """Downsample tensor to given resolution."""
@@ -645,58 +596,90 @@ class PatchICL(nn.Module):
             return mask
         return mask.max(dim=1, keepdim=True)[0]
 
-    def _compute_context_sampling_weights(
+    def _compute_gt_sampling_weights(
         self,
-        context_mask: torch.Tensor,
-        mode: str = 'foreground',
-        border_weight: float = 0.5,
+        gt_mask: torch.Tensor,
+        mode: str = 'gt_foreground',
     ) -> torch.Tensor:
-        """Compute sampling weights for context patches.
-
-        Aligns context sampling with target sampling strategy (e.g., borders).
+        """Compute sampling weights from GT mask.
 
         Args:
-            context_mask: [B, 1, H, W] - soft GT mask (already downsampled with area mode)
-            mode: Sampling strategy:
-                - "foreground": Sample from foreground (original behavior)
-                - "border": Sample from object borders
-                - "entropy": Sample from high-entropy regions
-            border_weight: Blend factor for border mode (0=foreground only, 1=border only)
+            gt_mask: [B, 1, H, W] - soft GT mask (already downsampled with area mode)
+            mode: GT-based sampling strategy:
+                - "gt_foreground": Sample from foreground (default)
+                - "gt_border": Sample from object borders (soft mask ≈ 0.5)
+                - "gt_entropy": Sample from high-entropy regions of soft GT
 
         Returns:
             sampling_weights: [B, 1, H, W] - weights for patch sampling
         """
-        if mode == 'foreground':
-            return context_mask
+        if mode == 'gt_foreground':
+            return gt_mask
 
-        # Soft mask has values in [0, 1], with ~0.5 at borders
-        # Compute in fp32 for numerical stability (critical for fp16 training)
-        orig_dtype = context_mask.dtype
-        soft_mask = context_mask.float().clamp(1e-6, 1 - 1e-6)
+        # Compute in fp32 for numerical stability
+        orig_dtype = gt_mask.dtype
+        soft_mask = gt_mask.float().clamp(1e-6, 1 - 1e-6)
 
-        if mode == 'entropy':
+        if mode == 'gt_entropy':
             # High entropy where probability is near 0.5 (borders)
             entropy = -(soft_mask * soft_mask.log() + (1 - soft_mask) * (1 - soft_mask).log())
             entropy = entropy / math.log(2)  # Normalize to [0, 1]
             return entropy.to(orig_dtype)
 
-        elif mode == 'border':
+        elif mode == 'gt_border':
             # Border score: peaks at 0.5, falls off toward 0 and 1
-            # border_score = 1 - 2 * |mask - 0.5| = 1 at 0.5, 0 at 0 or 1
             border_score = 1.0 - 2.0 * torch.abs(soft_mask - 0.5)
-
-            # Blend foreground and border weights
-            # Ensure we still sample from foreground regions (not background borders)
-            fg_mask = (soft_mask > 0.1).float()  # Only consider regions with some foreground
-            border_weights = border_score * fg_mask
-
-            # Blend: (1-α)*foreground + α*border
-            weights = (1 - border_weight) * soft_mask + border_weight * border_weights
-            return weights.to(orig_dtype)
+            # Only consider regions with some foreground (not background borders)
+            fg_mask = (soft_mask > 0.1).float()
+            return (border_score * fg_mask).to(orig_dtype)
 
         else:
             # Unknown mode, fallback to foreground
-            return context_mask
+            return gt_mask
+
+    def _compute_prediction_sampling_weights(
+        self,
+        pred_logits: torch.Tensor,
+        confidence: torch.Tensor | None,
+        mode: str = 'predicted_uncertainty',
+    ) -> torch.Tensor:
+        """Compute sampling weights from model predictions.
+
+        Args:
+            pred_logits: [B, C, H, W] - prediction logits from previous level
+            confidence: [B, 1, H, W] - confidence map from previous level (or None)
+            mode: Prediction-based sampling strategy:
+                - "predicted_uncertainty": Sample from 1 - confidence (low confidence)
+                - "predicted_entropy": Sample from entropy of prediction logits
+
+        Returns:
+            sampling_weights: [B, 1, H, W] - weights for patch sampling
+        """
+        orig_dtype = pred_logits.dtype
+
+        if mode == 'predicted_uncertainty':
+            if confidence is not None:
+                # Sample from low confidence regions
+                return (1.0 - confidence).to(orig_dtype)
+            else:
+                # Fallback: use prediction probabilities as weights
+                return torch.sigmoid(pred_logits).to(orig_dtype)
+
+        elif mode == 'predicted_entropy':
+            # Compute entropy from prediction logits
+            pred_prob = torch.sigmoid(pred_logits.float()).clamp(1e-6, 1 - 1e-6)
+            entropy = -(pred_prob * pred_prob.log() + (1 - pred_prob) * (1 - pred_prob).log())
+            entropy = entropy / math.log(2)  # Normalize to [0, 1]
+            # Take max across channels if multi-channel
+            if entropy.shape[1] > 1:
+                entropy = entropy.max(dim=1, keepdim=True)[0]
+            return entropy.to(orig_dtype)
+
+        else:
+            # Unknown mode, fallback to uncertainty
+            if confidence is not None:
+                return (1.0 - confidence).to(orig_dtype)
+            return torch.sigmoid(pred_logits).to(orig_dtype)
 
     def _create_coverage_mask(
         self,
@@ -806,6 +789,7 @@ class PatchICL(nn.Module):
         level_idx: int,
         image: torch.Tensor,
         labels: torch.Tensor | None,
+        labels_ds: torch.Tensor,
         context_in: torch.Tensor | None,
         context_out: torch.Tensor | None,
         target_features: torch.Tensor | None,
@@ -820,6 +804,7 @@ class PatchICL(nn.Module):
         """Process a single resolution level.
 
         Args:
+            labels_ds: [B, C, resolution, resolution] - pre-downsampled labels at level resolution
             mask_prior: [B, 1, H_prev, W_prev] - logits from previous level, used to
                 condition attention via mask prior fusion (if backbone supports it).
 
@@ -838,10 +823,8 @@ class PatchICL(nn.Module):
         B = image.shape[0]
         device = image.device
 
-        # Downsample to level resolution
+        # Downsample image to level resolution (labels_ds passed in from caller)
         image_ds = self._downsample(image, resolution)
-        labels_ds = self._downsample_mask(labels, resolution) if labels is not None else torch.zeros(
-            B, self.num_mask_channels, resolution, resolution, device=device)
 
         # Select target patches using sampling_weights (patches=None since extract_patches=False)
         patches, patch_labels, coords, _, aug_params, target_validity, K = sampler(image_ds, labels_ds, sampling_weights, None)
@@ -894,10 +877,9 @@ class PatchICL(nn.Module):
             context_mask_flat = self._mask_to_weights(
                 context_out_ds.view(B * k, *context_out_ds.shape[2:])
             )
-            context_weights = self._compute_context_sampling_weights(
+            context_weights = self._compute_gt_sampling_weights(
                 context_mask_flat,
                 mode=self.context_sampling_mode,
-                border_weight=self.context_border_weight,
             ).view(B, k, 1, resolution, resolution)
 
             context_patch_labels, context_coords, context_aug_params, context_validity, K_per_ctx = (
@@ -1111,37 +1093,35 @@ class PatchICL(nn.Module):
             else:
                 oracle_prob = 1.0 if self.oracle_valid[i] else 0.0
 
-            # Compute oracle weights (from GT labels) using same strategy as context
-            oracle_weights = None
+            # Downsample labels to level resolution (cached for _forward_level)
             if labels is not None:
                 labels_ds = self._downsample_mask(labels, resolution)
-                oracle_weights = self._compute_context_sampling_weights(
+            else:
+                labels_ds = torch.zeros(B, self.num_mask_channels, resolution, resolution, device=device)
+
+            # Compute oracle weights (from GT labels)
+            oracle_weights = None
+            if labels is not None:
+                oracle_weights = self._compute_gt_sampling_weights(
                     self._mask_to_weights(labels_ds),
-                    mode=self.target_sampling_mode,
-                    border_weight=self.context_border_weight,
+                    mode=self.target_oracle_mode,
                 )
 
             # Compute model weights (from previous level predictions)
             model_weights = None
             if combined_pred is not None:
-                if combined_conf is not None:
-                    # Sample from LOW confidence regions (where model is uncertain)
-                    conf_weights = 1.0 - combined_conf
-                    if self.detach_between_levels:
-                        conf_weights = conf_weights.detach()
-                    model_weights = F.interpolate(
-                        conf_weights, size=(resolution, resolution),
-                        mode='bilinear', align_corners=False
-                    )
-                else:
-                    # Fallback: use prediction probabilities
-                    combined_prob = torch.sigmoid(combined_pred)
-                    if self.detach_between_levels:
-                        combined_prob = combined_prob.detach()
-                    model_weights = F.interpolate(
-                        combined_prob, size=(resolution, resolution),
-                        mode='bilinear', align_corners=False
-                    )
+                # Detach to prevent sampling from affecting prediction gradients
+                pred_detached = combined_pred.detach() if self.detach_between_levels else combined_pred
+                conf_detached = combined_conf.detach() if (combined_conf is not None and self.detach_between_levels) else combined_conf
+
+                # Compute weights at combined_pred resolution, then resize
+                model_weights_fullres = self._compute_prediction_sampling_weights(
+                    pred_detached, conf_detached, mode=self.target_model_mode,
+                )
+                model_weights = F.interpolate(
+                    model_weights_fullres, size=(resolution, resolution),
+                    mode='bilinear', align_corners=False
+                )
 
             # Mix oracle and model weights based on scheduled probability
             refined_probs = None
@@ -1164,9 +1144,6 @@ class PatchICL(nn.Module):
                 sampling_weights = torch.where(use_oracle_mask, oracle_weights, model_weights)
                 refined_probs = model_weights.clone()  # Track model weights for logging
 
-            # Apply sampling robustness (dropout + temperature annealing)
-            sampling_weights = self._apply_sampling_robustness(sampling_weights, training)
-
             # Pass previous prediction as mask prior (level 0 has None)
             mask_prior = None
             if i > 0 and combined_pred is not None:
@@ -1176,6 +1153,7 @@ class PatchICL(nn.Module):
                 level_idx=i,
                 image=image,
                 labels=labels,
+                labels_ds=labels_ds,
                 context_in=context_in,
                 context_out=context_out,
                 target_features=target_features,
@@ -1379,7 +1357,8 @@ class PatchICL(nn.Module):
             # Target aggreg loss
             pred = level_out['pred']
             aggregated_conf = level_out.get('aggregated_conf')
-            labels_ds = _resize_label(labels.float(), size=pred.shape[-2:])
+            level_res = pred.shape[-2:]
+            labels_ds = _resize_label(labels.float(), size=level_res)
 
             # Confidence-weighted aggreg loss: model penalized more where confident
             if self.conf_weighted_aggreg and aggregated_conf is not None:
@@ -1397,22 +1376,49 @@ class PatchICL(nn.Module):
             if i > 0 and self.use_learned_alpha and combined_pred is not None:
                 combined_loss_weight = self.loss_weights['target_combined']
                 if combined_loss_weight > 0:
-                    # Downsample GT to combined_pred resolution
-                    labels_combined = _resize_label(labels.float(), size=combined_pred.shape[-2:])
+                    # Reuse labels_ds if combined_pred is at same resolution (common case)
+                    combined_res = combined_pred.shape[-2:]
+                    labels_combined = labels_ds if combined_res == level_res else _resize_label(labels.float(), size=combined_res)
                     target_combined_loss = self.aggreg_criterion(combined_pred, labels_combined)
                     losses[f'level_{i}_target_combined_loss'] = target_combined_loss
                     total_loss = total_loss + lw * combined_loss_weight * target_combined_loss
                     sum_target_combined = sum_target_combined + target_combined_loss
 
-            # Confidence supervision loss: teach confidence to correlate with correctness
+            # Confidence supervision loss: hybrid of structural uncertainty + prediction error
+            # Low confidence if EITHER at GT borders OR prediction is wrong
             if self.confidence_supervision_weight > 0 and conf_preds is not None:
                 # conf_preds: [B, K, 1, ps, ps], patch_logits: [B, K, C, ps, ps]
-                conf_target = 1.0 - torch.abs(torch.sigmoid(patch_logits.detach()) - patch_labels)
-                if conf_target.shape[2] > 1:  # Multi-channel: average
+
+                # 1. Structural uncertainty from GT (stable target, matches oracle)
+                # patch_labels are soft [0,1] from area pooling, high entropy at borders
+                soft_gt = patch_labels.float().clamp(1e-6, 1 - 1e-6)
+                gt_entropy = -(soft_gt * soft_gt.log() + (1 - soft_gt) * (1 - soft_gt).log())
+                gt_entropy = gt_entropy / math.log(2)  # Normalize to [0, 1]
+
+                # 2. Prediction error (adaptive target, captures model-specific failures)
+                pred_error = torch.abs(torch.sigmoid(patch_logits.detach()) - patch_labels)
+
+                # 3. Combine: high uncertainty if EITHER structurally uncertain OR wrong
+                uncertainty = torch.maximum(gt_entropy, pred_error)
+                conf_target = 1.0 - uncertainty
+
+                # Handle multi-channel: average across channels
+                if conf_target.shape[2] > 1:
                     conf_target = conf_target.mean(dim=2, keepdim=True)
+
                 conf_sup_loss = F.mse_loss(conf_preds, conf_target.detach())
                 losses[f'level_{i}_conf_supervision_loss'] = conf_sup_loss
                 total_loss = total_loss + lw * self.confidence_supervision_weight * conf_sup_loss
+
+                # Log components for debugging
+                losses[f'level_{i}_conf_gt_entropy_mean'] = gt_entropy.mean().detach()
+                losses[f'level_{i}_conf_pred_error_mean'] = pred_error.mean().detach()
+
+                # Boundary confidence penalty (penalize high confidence at patch borders)
+                if self.confidence_boundary_weight > 0:
+                    conf_boundary_loss = self.conf_boundary_loss(conf_preds)
+                    losses[f'level_{i}_conf_boundary_loss'] = conf_boundary_loss
+                    total_loss = total_loss + lw * self.confidence_boundary_weight * conf_boundary_loss
 
             # Log alpha if using learned combination
             alpha = level_out.get('alpha')
@@ -1467,37 +1473,6 @@ class PatchICL(nn.Module):
                 losses[f'level_{i}_refined_probs_dice'] = dice_result['dice'].mean()
                 losses[f'level_{i}_refined_probs_soft_dice'] = dice_result['soft_dice'].mean()
 
-        # Confidence losses (only for learned method - entropy has no learned params)
-        sum_conf_supervision = 0.0
-        sum_conf_boundary = 0.0
-        if self.confidence_enabled and self.confidence_method == 'learned':
-            for i, level_out in enumerate(outputs['level_outputs']):
-                lw = self.level_loss_weights[i]
-                conf_preds = level_out.get('confidence_preds')
-
-                if conf_preds is not None:
-                    patch_logits = level_out['patch_logits']
-                    patch_labels = level_out['patch_labels']
-
-                    # Confidence supervision loss: MSE(conf, 1 - |pred - gt|)
-                    conf_sup_loss = self.conf_supervision_loss(
-                        conf_preds, patch_logits, patch_labels
-                    )
-                    losses[f'level_{i}_conf_supervision_loss'] = conf_sup_loss
-                    total_loss = total_loss + lw * self.confidence_supervision_weight * conf_sup_loss
-                    sum_conf_supervision = sum_conf_supervision + conf_sup_loss
-
-                    # Boundary confidence penalty
-                    if self.confidence_boundary_weight > 0:
-                        conf_boundary_loss = self.conf_boundary_loss(conf_preds)
-                        losses[f'level_{i}_conf_boundary_loss'] = conf_boundary_loss
-                        total_loss = total_loss + lw * self.confidence_boundary_weight * conf_boundary_loss
-                        sum_conf_boundary = sum_conf_boundary + conf_boundary_loss
-
-            # Aggregated confidence losses
-            losses['conf_supervision_loss'] = sum_conf_supervision / self.num_levels
-            losses['conf_boundary_loss'] = sum_conf_boundary / self.num_levels
-
         losses['total_loss'] = total_loss
 
         # Log learned temperature if applicable
@@ -1509,6 +1484,83 @@ class PatchICL(nn.Module):
             for i in range(self.num_levels):
                 if self.oracle_train[i]:
                     losses[f'level_{i}_oracle_prob'] = self._get_oracle_probability(i)
+
+        # Hierarchical diagnostic metrics: analyze level l improvement over level l-1
+        # Helps identify why levels > 0 might underperform
+        level_outputs = outputs.get('level_outputs', [])
+        for i in range(1, len(level_outputs)):
+            prev_level = level_outputs[i - 1]
+            curr_level = level_outputs[i]
+
+            # Get predictions and coverage
+            prev_pred = prev_level['pred']  # [B, C, prev_res, prev_res]
+            curr_pred = curr_level['pred']  # [B, C, curr_res, curr_res]
+            combined_pred = curr_level.get('combined_pred')  # [B, C, curr_res, curr_res]
+            coverage_mask = curr_level.get('coverage_mask')  # [B, 1, curr_res, curr_res]
+
+            if coverage_mask is None:
+                continue
+
+            curr_res = curr_pred.shape[-2:]
+
+            # Upsample prev_pred to current resolution for comparison
+            prev_pred_up = F.interpolate(prev_pred, size=curr_res, mode='bilinear', align_corners=False)
+
+            # Downsample GT to current resolution
+            labels_curr = _resize_label(labels.float(), size=curr_res)
+
+            # Compute softdice on covered vs uncovered regions
+            with torch.no_grad():
+                covered = coverage_mask > 0.5  # [B, 1, H, W]
+                uncovered = ~covered
+
+                # Expand coverage mask to match prediction channels
+                covered_exp = covered.expand_as(curr_pred)
+                uncovered_exp = uncovered.expand_as(curr_pred)
+
+                # Softdice helper for masked regions
+                def masked_softdice(pred, gt, mask):
+                    """Compute softdice only on masked region."""
+                    pred_prob = torch.sigmoid(pred)
+                    # Mask both pred and gt
+                    pred_masked = pred_prob * mask.float()
+                    gt_masked = gt * mask.float()
+                    # Soft intersection and union
+                    intersection = (pred_masked * gt_masked).sum(dim=(1, 2, 3))
+                    denom = pred_masked.sum(dim=(1, 2, 3)) + gt_masked.sum(dim=(1, 2, 3))
+                    # Check if mask has any pixels
+                    mask_sum = mask.float().sum(dim=(1, 2, 3))
+                    valid = mask_sum > 0
+                    dice = torch.where(valid, (2 * intersection + 1e-6) / (denom + 1e-6), torch.zeros_like(intersection))
+                    return dice.mean(), valid.float().mean()
+
+                # 1. Level l-1 pred vs GT on region COVERED by level l
+                prev_covered_dice, prev_covered_valid = masked_softdice(prev_pred_up, labels_curr, covered_exp)
+                losses[f'level_{i}_prev_covered_softdice'] = prev_covered_dice
+
+                # 2. Level l pred vs GT on region COVERED by level l
+                curr_covered_dice, curr_covered_valid = masked_softdice(curr_pred, labels_curr, covered_exp)
+                losses[f'level_{i}_curr_covered_softdice'] = curr_covered_dice
+
+                # 3. Level l-1 pred vs GT on region UNCOVERED by level l
+                prev_uncovered_dice, prev_uncovered_valid = masked_softdice(prev_pred_up, labels_curr, uncovered_exp)
+                losses[f'level_{i}_prev_uncovered_softdice'] = prev_uncovered_dice
+
+                # 4. Level l pred vs GT on region UNCOVERED by level l (should match prev since no update)
+                curr_uncovered_dice, _ = masked_softdice(curr_pred, labels_curr, uncovered_exp)
+                losses[f'level_{i}_curr_uncovered_softdice'] = curr_uncovered_dice
+
+                # 5. Combined pred vs GT on region COVERED by level l
+                if combined_pred is not None:
+                    combined_covered_dice, _ = masked_softdice(combined_pred, labels_curr, covered_exp)
+                    losses[f'level_{i}_combined_covered_softdice'] = combined_covered_dice
+
+                    # Improvement metrics (positive = better)
+                    losses[f'level_{i}_level_improvement'] = curr_covered_dice - prev_covered_dice
+                    losses[f'level_{i}_combination_effect'] = combined_covered_dice - curr_covered_dice
+
+                # Coverage statistics
+                losses[f'level_{i}_coverage_ratio'] = covered.float().mean()
 
         # Aggregated losses for logging (mean across levels)
         n = self.num_levels

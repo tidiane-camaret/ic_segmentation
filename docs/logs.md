@@ -4,6 +4,133 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-03-10: Training Pipeline Optimization
+
+**Goal:** Remove unused code and optimize training performance.
+
+### Changes
+
+**1. Removed `sampling_robustness` feature** (`patch_icl.py`)
+
+- Removed `_get_sampling_temperature()` method
+- Removed `_apply_sampling_robustness()` method
+- Removed config variables: `sampling_dropout`, `sampling_temp_*`
+- Configs 89_generalization, 89a_sampling_dropout, 89b_temp_anneal still reference this but will now be ignored
+
+**2. Removed legacy augmentation paths** (`train.py`)
+
+- Removed separate handling for `image_augmentation`, `carve_mix`, `advanced_augmentation` configs
+- All augmentation now goes through unified `augmentation` config block
+- Legacy configs will still work (params ignored if not in unified format)
+
+**3. Cached downsampled labels per level** (`patch_icl.py`)
+
+- `labels_ds` now computed once in `forward()` and passed to `_forward_level()`
+- Previously computed twice per level (for oracle weights and for sampler)
+- In `compute_loss()`, reuse `labels_ds` for combined_pred loss when same resolution
+
+**4. Simplified train.py augmentation handling**
+
+- Reduced ~25 lines of config parsing to ~5 lines
+- Single `augmentation_config` variable replaces 6 legacy variables
+
+**5. Unified sampling modes** (`patch_icl.py`)
+
+Refactored sampling weight computation with clear GT-based vs prediction-based modes:
+
+| Mode | Source | Description |
+|------|--------|-------------|
+| `gt_foreground` | GT mask | Sample from foreground (default) |
+| `gt_border` | GT mask | Sample from object borders (soft mask ≈ 0.5) |
+| `gt_entropy` | GT mask | Sample from high-entropy regions of soft GT |
+| `predicted_uncertainty` | Predictions | Sample from `1 - confidence` (low confidence) |
+| `predicted_entropy` | Predictions | Sample from entropy of prediction logits |
+
+Config options:
+```yaml
+sampler:
+  target_sampling: "gt_foreground"           # Oracle weights (GT-based)
+  target_model_sampling: "predicted_uncertainty"  # Model weights (prediction-based)
+  context_sampling: "gt_foreground"          # Context (always GT-based)
+```
+
+New methods:
+- `_compute_gt_sampling_weights()`: Replaces old `_compute_context_sampling_weights()`
+- `_compute_prediction_sampling_weights()`: New method for prediction-based sampling
+
+Backward compatible: old mode names (`foreground`, `border`, `entropy`) map to new names.
+
+**6. Hybrid confidence supervision** (`patch_icl.py`)
+
+Changed the confidence learning target from accuracy-based to hybrid:
+
+**Old (accuracy-based):**
+```python
+conf_target = 1 - |pred - gt|  # Low confidence where wrong
+```
+
+**New (hybrid):**
+```python
+gt_entropy = H(soft_gt) / log(2)     # Structural uncertainty at borders
+pred_error = |pred - gt|              # Prediction errors
+uncertainty = max(gt_entropy, pred_error)
+conf_target = 1 - uncertainty         # Low confidence if EITHER
+```
+
+| Region | GT Entropy | Pred Error | Confidence |
+|--------|-----------|------------|------------|
+| Interior, correct | Low | Low | **High** |
+| Interior, wrong | Low | High | **Low** |
+| Border, correct | High | Low | **Low** |
+| Border, wrong | High | High | **Low** |
+
+Benefits:
+- **Stable training**: GT entropy provides consistent signal at borders
+- **Adaptive**: Pred error captures model-specific failures
+- **Oracle alignment**: Learns to have low confidence at borders (matches `gt_entropy` oracle)
+
+New logged metrics:
+- `level_{i}_conf_gt_entropy_mean`: Mean GT entropy (structural uncertainty)
+- `level_{i}_conf_pred_error_mean`: Mean prediction error
+
+Also removed duplicate confidence loss loop (was adding loss twice).
+
+**7. Added hierarchical diagnostic metrics** (`patch_icl.py`)
+
+New metrics for levels > 0 to diagnose multi-level performance:
+
+| Metric | Description |
+|--------|-------------|
+| `level_{i}_prev_covered_softdice` | Softdice of level l-1 pred vs GT on region COVERED by level l |
+| `level_{i}_curr_covered_softdice` | Softdice of level l pred vs GT on region COVERED by level l |
+| `level_{i}_prev_uncovered_softdice` | Softdice of level l-1 pred vs GT on region UNCOVERED by level l |
+| `level_{i}_curr_uncovered_softdice` | Softdice of level l pred vs GT on region UNCOVERED by level l |
+| `level_{i}_combined_covered_softdice` | Softdice of combined pred vs GT on region COVERED by level l |
+| `level_{i}_level_improvement` | `curr_covered - prev_covered` (positive = level l improves on its patches) |
+| `level_{i}_combination_effect` | `combined_covered - curr_covered` (positive = blending helps) |
+| `level_{i}_coverage_ratio` | Fraction of pixels covered by level l patches |
+
+These help answer:
+- Is level l improving on the regions it samples? (`level_improvement`)
+- Is the alpha-blending helping or hurting? (`combination_effect`)
+- How much of the image does level l cover? (`coverage_ratio`)
+
+### Performance Impact
+
+- Reduced redundant `_downsample_mask()` calls per level: 2 → 1
+- Reduced config parsing overhead
+- Code size: ~80 lines removed from patch_icl.py, ~20 lines from train.py
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl_v2/patch_icl.py` | Removed sampling_robustness, added labels_ds param to _forward_level |
+| `scripts/train.py` | Removed legacy augmentation handling |
+| `docs/logs.md` | This entry |
+
+---
+
 ## 2026-02-26: Scheduled Oracle Sampling
 
 **Goal:** Reduce train/val distribution mismatch caused by oracle sampling during training.

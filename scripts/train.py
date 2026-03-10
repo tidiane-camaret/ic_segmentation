@@ -60,21 +60,11 @@ def main(cfg: DictConfig) -> None:
         save_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # Unified augmentation config (takes precedence if present)
-    unified_aug_cfg = cfg.get("augmentation", {})
-    use_unified_augmentation = unified_aug_cfg.get("enabled", False)
+    # Augmentation config
+    aug_cfg = cfg.get("augmentation", {})
     augmentation_config = (
-        OmegaConf.to_container(unified_aug_cfg, resolve=True)
-        if use_unified_augmentation
-        else None
-    )
-
-    # Legacy image augmentation config (only used if unified is not enabled)
-    img_aug_cfg = cfg.get("image_augmentation", {})
-    use_image_augmentation = img_aug_cfg.get("enabled", False) and not use_unified_augmentation
-    augment_config = (
-        OmegaConf.to_container(img_aug_cfg, resolve=True)
-        if use_image_augmentation
+        OmegaConf.to_container(aug_cfg, resolve=True)
+        if aug_cfg.get("enabled", False)
         else None
     )
 
@@ -120,8 +110,8 @@ def main(cfg: DictConfig) -> None:
             image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
             shuffle=True,
-            augment=use_image_augmentation,
-            augment_config=augment_config,
+            augment=augmentation_config is not None,
+            augment_config=augmentation_config,
             max_samples_per_dataset=max_samples,
         )
         val_loader = get_medsegbench_dataloader(
@@ -190,33 +180,14 @@ def main(cfg: DictConfig) -> None:
             max_cases_train = max_cases_cfg
             max_cases_val = max_cases_cfg
 
-        # CarveMix config (only for training)
-        carve_mix_cfg = cfg.get("carve_mix", {})
-        use_carve_mix = carve_mix_cfg.get("enabled", False)
-        carve_mix_config = (
-            OmegaConf.to_container(carve_mix_cfg, resolve=True)
-            if use_carve_mix
-            else None
-        )
-
-        # Legacy advanced augmentation config (only for training, if unified not used)
-        adv_aug_cfg = cfg.get("advanced_augmentation", {})
-        use_adv_aug = adv_aug_cfg.get("enabled", False) and not use_unified_augmentation
-        adv_aug_config = (
-            OmegaConf.to_container(adv_aug_cfg, resolve=True) if use_adv_aug else None
-        )
-
         # Log augmentation mode
         if accelerator.is_main_process:
-            if use_unified_augmentation:
-                print(f"Using unified augmentation config")
-            elif use_image_augmentation or use_carve_mix or use_adv_aug:
-                print(f"Using legacy augmentation config (image_aug={use_image_augmentation}, "
-                      f"carve_mix={use_carve_mix}, advanced={use_adv_aug})")
+            if augmentation_config is not None:
+                print(f"Augmentation enabled")
             else:
                 print("Augmentation disabled")
 
-        # Coverage filtering config (unified for fast and shared dataloaders)
+        # Coverage filtering config
         same_case_context = cfg.get("same_case_context", False)
         min_coverage = cfg.get("min_coverage", 100)
         min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
@@ -277,12 +248,6 @@ def main(cfg: DictConfig) -> None:
                 bbox_padding=cfg.preprocessing.bbox_padding,
                 max_ds_len=max_ds_len_train,
                 random_coloring_nb=cfg.get("random_coloring_nb", 0),
-                augment=use_image_augmentation,
-                augment_config=augment_config,
-                carve_mix=use_carve_mix,
-                carve_mix_config=carve_mix_config,
-                advanced_augmentation=use_adv_aug,
-                advanced_augmentation_config=adv_aug_config,
                 augmentation_config=augmentation_config,
                 class_balanced=cfg.get("class_balanced", False),
                 min_coverage=min_coverage,
