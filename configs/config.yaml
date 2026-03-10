@@ -22,7 +22,7 @@ logging:
 base_dataset: totalseg
 download: false
 random_coloring_nb: 0
-max_labels: 50
+max_labels: null 
 train_label_ids: "train"
 val_label_ids: "val"
  

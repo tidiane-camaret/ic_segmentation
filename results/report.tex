@@ -213,18 +213,20 @@ We train and evaluate on TotalSegmentator~\cite{wasserthalTotalSegmentatorRobust
 \caption{Dice scores on TotalSegmentator CT validation set (mean $\pm$ std). Best per category in \textbf{bold}.}\label{tab:dice_totalseg_ct}
 \begin{tabular}{lcc}
 \toprule
-Category & PatchICL & \textbf{UniverSeg} \\
+Category & PatchICL & UniverSeg \\
 \midrule
-Organs (Thorax/Head/Spine)    & 0.482 $\pm$ 0.267 & \textbf{0.588 $\pm$ 0.274} \\
-Organs (Abd./Pelvis)          & 0.428 $\pm$ 0.336 & \textbf{0.524 $\pm$ 0.332} \\
-Muscles                       & 0.330 $\pm$ 0.296 & \textbf{0.489 $\pm$ 0.309} \\
-Vessels                       & 0.366 $\pm$ 0.310 & \textbf{0.478 $\pm$ 0.313} \\
-Other                         & \textbf{0.448 $\pm$ 0.273} & 0.418 $\pm$ 0.313 \\
+Organs (Thorax/Head/Spine)    & 0.576 $\pm$ 0.277 & \textbf{0.608 $\pm$ 0.317} \\
+Organs (Abd./Pelvis)          & 0.454 $\pm$ 0.329 & \textbf{0.533 $\pm$ 0.329} \\
+Other                         & 0.433 $\pm$ 0.266 & \textbf{0.437 $\pm$ 0.319} \\
+Muscles                       & 0.414 $\pm$ 0.303 & \textbf{0.489 $\pm$ 0.309} \\
+Vessels                       & 0.380 $\pm$ 0.297 & \textbf{0.477 $\pm$ 0.313} \\
 \midrule
-\textbf{Overall}              & 0.421 $\pm$ 0.295 & \textbf{0.454 $\pm$ 0.318} \\
+\textbf{Overall}              & 0.430 $\pm$ 0.287 & \textbf{0.468 $\pm$ 0.322} \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\textbf{Per-class analysis.} PatchICL outperforms UniverSeg on 14 of 56 validation classes, with distinct patterns across structure types. The largest gains occur on middle ribs (7--10), with improvements of +6--13\% Dice. PatchICL also performs better on brain (+3.4\%) and mid-thoracic vertebrae (T6--T9). Notably, on the most challenging classes (UniverSeg Dice $<0.3$), PatchICL wins 6 of 12, all middle ribs. Conversely, PatchICL shows larger gaps on femur ($-$15 to $-$18\%), lower spine vertebrae (S1, L5: $-$13 to $-$17\%), iliopsoas muscles ($-$13 to $-$15\%), and iliac vessels ($-$7 to $-$10\%). The gap increases with task difficulty: on structures where UniverSeg exceeds 0.7 Dice, the average gap is $-$11\%, while on hard structures (Dice $<0.3$), PatchICL shows a +2.5\% advantage.
 
 \subsection{Cross-Modality Generalization (MRI)}
 
