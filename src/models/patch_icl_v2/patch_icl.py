@@ -317,6 +317,7 @@ class PatchICL(nn.Module):
                 augmenter=self.augmenter,
                 pad_before=level_cfg.get('pad_before'),
                 pad_after=level_cfg.get('pad_after'),
+                spread_sigma=level_cfg.get('spread_sigma', 0.0),
             ))
             # Context sampler (uses num_context_patches if specified, else same as target)
             # For sliding_window: context_stride controls patch count (stride takes precedence)
@@ -333,6 +334,7 @@ class PatchICL(nn.Module):
                 augmenter=self.augmenter,
                 pad_before=level_cfg.get('pad_before'),
                 pad_after=level_cfg.get('pad_after'),
+                spread_sigma=level_cfg.get('spread_sigma', 0.0),
             ))
         self.sampler = self.samplers[0]  # backward compat
 
@@ -454,6 +456,7 @@ class PatchICL(nn.Module):
             mask_fusion_type=backbone_cfg.get('mask_fusion_type', 'additive'),
             use_context_mask=backbone_cfg.get('use_context_mask', False),
             predict_confidence=backbone_cfg.get('predict_confidence', False),
+            detach_conf_features=backbone_cfg.get('detach_conf_features', False),
         )
 
         # Alpha predictor for learned level combination (simple linear on pooled registers)

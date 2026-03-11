@@ -215,6 +215,7 @@ class ContinuousSampler(nn.Module):
         pad_before: int | None = None,
         pad_after: int | None = None,
         extract_patches: bool = False,
+        spread_sigma: float = 0.0,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -226,6 +227,30 @@ class ContinuousSampler(nn.Module):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.extract_patches = extract_patches
+        self.spread_sigma = spread_sigma
+
+        # Precompute Gaussian kernel if spreading is enabled
+        if spread_sigma > 0:
+            self.register_buffer('_gaussian_kernel', self._make_gaussian_kernel(spread_sigma))
+        else:
+            self._gaussian_kernel = None
+
+    def _make_gaussian_kernel(self, sigma: float) -> torch.Tensor:
+        """Create a 2D Gaussian kernel for blurring."""
+        k = int(4 * sigma + 1) | 1  # odd kernel size, ~4 sigma coverage
+        x = torch.arange(k, dtype=torch.float32) - k // 2
+        gauss_1d = torch.exp(-x ** 2 / (2 * sigma ** 2))
+        gauss_2d = gauss_1d[:, None] * gauss_1d[None, :]
+        gauss_2d = gauss_2d / gauss_2d.sum()
+        return gauss_2d.view(1, 1, k, k)
+
+    def _gaussian_blur(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply Gaussian blur to spread high-weight regions."""
+        if self._gaussian_kernel is None:
+            return x
+        k = self._gaussian_kernel.shape[-1]
+        pad = k // 2
+        return F.conv2d(x, self._gaussian_kernel.to(x.dtype), padding=pad)
 
     def forward(
         self,
@@ -269,7 +294,11 @@ class ContinuousSampler(nn.Module):
         # Use larger epsilon for fp16 numerical stability
         eps = 1e-4 if pooled_weights.dtype == torch.float16 else 1e-6
         pooled_weights = (pooled_weights - lo.view(B, 1, 1, 1)) / (hi.view(B, 1, 1, 1) - lo.view(B, 1, 1, 1) + eps)
-        
+
+        # Gaussian blur to spread high-weight regions (creates larger clusters around positive zones)
+        if self.spread_sigma > 0:
+            pooled_weights = self._gaussian_blur(pooled_weights)
+
         # Apply stride to space out possible sampling positions
         if self.stride > 1:
             # Subsample pooled_weights at stride intervals
@@ -451,6 +480,7 @@ def create_sampler(
     pad_before: int | None = None,
     pad_after: int | None = None,
     extract_patches: bool = False,
+    spread_sigma: float = 0.0,
 ) -> nn.Module:
     """Factory function to create samplers from config."""
     if sampler_type == "continuous":
@@ -464,6 +494,7 @@ def create_sampler(
             pad_before=pad_before,
             pad_after=pad_after,
             extract_patches=extract_patches,
+            spread_sigma=spread_sigma,
         )
     elif sampler_type == "sliding_window":
         return SlidingWindowSampler(

@@ -203,6 +203,125 @@ def compute_context_metrics(
     }
 
 
+def compute_hierarchical_metrics(
+    level_outputs: list[dict],
+    labels: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute hierarchical diagnostic metrics: level l improvement over level l-1.
+
+    Analyzes covered vs uncovered regions to understand multi-level performance.
+
+    Args:
+        level_outputs: List of level output dicts from model forward
+        labels: Full-resolution ground truth [B, C, H, W]
+
+    Returns:
+        Dict with per-level covered/uncovered softdice and improvement metrics
+    """
+    metrics = {}
+
+    def masked_softdice(pred, gt, mask):
+        """Compute softdice only on masked region."""
+        pred_prob = torch.sigmoid(pred)
+        pred_masked = pred_prob * mask.float()
+        gt_masked = gt * mask.float()
+        intersection = (pred_masked * gt_masked).sum(dim=(1, 2, 3))
+        denom = pred_masked.sum(dim=(1, 2, 3)) + gt_masked.sum(dim=(1, 2, 3))
+        mask_sum = mask.float().sum(dim=(1, 2, 3))
+        valid = mask_sum > 0
+        dice = torch.where(valid, (2 * intersection + 1e-6) / (denom + 1e-6), torch.zeros_like(intersection))
+        return dice.mean(), valid.float().mean()
+
+    with torch.no_grad():
+        for i in range(1, len(level_outputs)):
+            prev_level = level_outputs[i - 1]
+            curr_level = level_outputs[i]
+
+            prev_pred = prev_level['pred']
+            curr_pred = curr_level['pred']
+            combined_pred = curr_level.get('combined_pred')
+            coverage_mask = curr_level.get('coverage_mask')
+
+            if coverage_mask is None:
+                continue
+
+            curr_res = curr_pred.shape[-2:]
+
+            # Upsample prev_pred to current resolution
+            prev_pred_up = F.interpolate(prev_pred, size=curr_res, mode='bilinear', align_corners=False)
+
+            # Downsample GT to current resolution
+            labels_curr = _resize_label(labels.float(), size=curr_res)
+
+            covered = coverage_mask > 0.5
+            uncovered = ~covered
+            covered_exp = covered.expand_as(curr_pred)
+            uncovered_exp = uncovered.expand_as(curr_pred)
+
+            # 1. Level l-1 pred vs GT on region COVERED by level l
+            prev_covered_dice, _ = masked_softdice(prev_pred_up, labels_curr, covered_exp)
+            metrics[f'level_{i}_prev_covered_softdice'] = prev_covered_dice
+
+            # 2. Level l pred vs GT on region COVERED by level l
+            curr_covered_dice, _ = masked_softdice(curr_pred, labels_curr, covered_exp)
+            metrics[f'level_{i}_curr_covered_softdice'] = curr_covered_dice
+
+            # 3. Level l-1 pred vs GT on region UNCOVERED by level l
+            prev_uncovered_dice, _ = masked_softdice(prev_pred_up, labels_curr, uncovered_exp)
+            metrics[f'level_{i}_prev_uncovered_softdice'] = prev_uncovered_dice
+
+            # 4. Level l pred vs GT on region UNCOVERED by level l
+            curr_uncovered_dice, _ = masked_softdice(curr_pred, labels_curr, uncovered_exp)
+            metrics[f'level_{i}_curr_uncovered_softdice'] = curr_uncovered_dice
+
+            # 5. Combined pred vs GT on region COVERED by level l
+            if combined_pred is not None:
+                combined_covered_dice, _ = masked_softdice(combined_pred, labels_curr, covered_exp)
+                metrics[f'level_{i}_combined_covered_softdice'] = combined_covered_dice
+
+                # Improvement metrics (positive = better)
+                metrics[f'level_{i}_level_improvement'] = curr_covered_dice - prev_covered_dice
+                metrics[f'level_{i}_combination_effect'] = combined_covered_dice - curr_covered_dice
+
+            # Coverage statistics
+            metrics[f'level_{i}_coverage_ratio'] = covered.float().mean()
+
+            # Error targeting metrics: how well does level l coverage target level l-1 errors
+            prev_prob = torch.sigmoid(prev_pred_up)
+            prev_binary = (prev_prob > 0.5).float()
+            gt_binary = (labels_curr > 0.5).float()
+            prev_error = (prev_binary != gt_binary).float()  # [B, C, H, W]
+
+            # Reduce to single channel (any channel error)
+            prev_error_any = prev_error.max(dim=1, keepdim=True)[0]  # [B, 1, H, W]
+            covered_f = covered.float()  # [B, 1, H, W]
+
+            # Error recall: fraction of prev errors covered by current patches
+            # High = sampling targets errors well
+            error_pixels = prev_error_any.sum(dim=(2, 3)) + 1e-6
+            covered_error_pixels = (prev_error_any * covered_f).sum(dim=(2, 3))
+            error_recall = (covered_error_pixels / error_pixels).mean()
+            metrics[f'level_{i}_error_recall'] = error_recall
+
+            # Error precision: fraction of coverage that lands on prev errors
+            # High = coverage is efficient (not wasting patches on correct regions)
+            covered_pixels = covered_f.sum(dim=(2, 3)) + 1e-6
+            error_precision = (covered_error_pixels / covered_pixels).mean()
+            metrics[f'level_{i}_error_precision'] = error_precision
+
+            # Baseline: what error coverage would random sampling achieve?
+            # = error_ratio (expected recall with uniform random coverage)
+            error_ratio = prev_error_any.mean()
+            metrics[f'level_{i}_prev_error_ratio'] = error_ratio
+
+            # Error targeting lift: how much better than random
+            # > 1 means sampling targets errors better than random
+            random_expected_precision = error_ratio
+            metrics[f'level_{i}_error_targeting_lift'] = error_precision / (random_expected_precision + 1e-6)
+
+    return metrics
+
+
 def compute_all_metrics(
     outputs: dict[str, torch.Tensor],
     labels: torch.Tensor,
@@ -233,6 +352,10 @@ def compute_all_metrics(
     level_outputs = outputs.get('level_outputs', [])
     if level_outputs:
         metrics.update(compute_level_metrics(level_outputs, labels))
+
+        # Hierarchical metrics: covered/uncovered softdice and improvement
+        if len(level_outputs) > 1:
+            metrics.update(compute_hierarchical_metrics(level_outputs, labels))
 
         # Final metrics: use final_logit (upsampled combined_pred, not raw last level pred)
         # combined_pred blends all levels via confidence-weighted alpha, which is the actual model output

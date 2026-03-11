@@ -753,6 +753,7 @@ class SimpleCNNDecoder(nn.Module):
         feature_grid_size: int = 16,
         use_skip_connections: bool = True,
         predict_confidence: bool = False,
+        detach_conf_features: bool = False,
         scale_embed_dim: int | None = None,
     ):
         super().__init__()
@@ -762,6 +763,7 @@ class SimpleCNNDecoder(nn.Module):
         self.feature_grid_size = feature_grid_size
         self.use_skip_connections = use_skip_connections
         self.predict_confidence = predict_confidence
+        self.detach_conf_features = detach_conf_features
         self.scale_embed_dim = scale_embed_dim if scale_embed_dim is not None else embed_dim
 
         D = embed_dim
@@ -910,7 +912,8 @@ class SimpleCNNDecoder(nn.Module):
         # Confidence head
         conf_pred = None
         if self.predict_confidence:
-            conf_logits = self.conf_head(features)  # [B*K, 1, h, h]
+            conf_features = features.detach() if self.detach_conf_features else features
+            conf_logits = self.conf_head(conf_features)  # [B*K, 1, h, h]
             conf_pred = torch.sigmoid(conf_logits)  # [0, 1] bounded
 
             # Upsample confidence to patch_size if needed
@@ -960,6 +963,7 @@ class SimpleBackbone(nn.Module):
         use_mask_prior: bool = False,
         mask_fusion_type: str = "additive",
         predict_confidence: bool = False,
+        detach_conf_features: bool = False,
         **kwargs,
     ):
         """
@@ -982,6 +986,7 @@ class SimpleBackbone(nn.Module):
             use_mask_prior: If True, fuse mask prior from previous level into encoded features
             mask_fusion_type: How to fuse mask prior ("additive", "gated", or "concat")
             predict_confidence: If True, predict pixel-level confidence alongside segmentation
+            detach_conf_features: If True, detach features before confidence head (isolates conf_head from backbone gradients)
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -1023,6 +1028,7 @@ class SimpleBackbone(nn.Module):
             feature_grid_size=feature_grid_size,
             use_skip_connections=decoder_use_skip_connections,
             predict_confidence=predict_confidence,
+            detach_conf_features=detach_conf_features,
             scale_embed_dim=embed_dim,  # Match scale_encoder output
         )
 

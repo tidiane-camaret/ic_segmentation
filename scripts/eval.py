@@ -252,9 +252,13 @@ def main(cfg: DictConfig) -> None:
 
     # Get dataset class and dataloader
     base_dataset = cfg.get("base_dataset")  # e.g., "totalseg" or "totalsegmri"
-    dataloader_type = cfg.get("dataloader_type", "fast")  # "fast" or "shared"
+    dataloader_type = cfg.get("dataloader_type", "fast")  # "fast", "shared", or "zopt"
     if base_dataset in ["totalseg", "totalsegmri"]:
-        if dataloader_type == "shared":
+        if dataloader_type == "zopt":
+            from src.dataloaders.totalseg2d_zopt_dataloader import (
+                get_dataloader as get_totalseg2d_dataloader,
+            )
+        elif dataloader_type == "shared":
             from src.dataloaders.totalseg2d_shared_dataloader import (
                 get_dataloader as get_totalseg2d_dataloader,
             )
@@ -294,6 +298,7 @@ def main(cfg: DictConfig) -> None:
 
         # Coverage filtering config (unified for fast and shared dataloaders)
         same_case_context = cfg.get("same_case_context", False)
+        same_case_context_ratio = cfg.get("same_case_context_ratio", 0.0)
         min_coverage = cfg.get("min_coverage", 100)
         min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
 
@@ -302,16 +307,17 @@ def main(cfg: DictConfig) -> None:
         slice_selection = cfg.get("slice_selection", "all")
 
         # Resolve paths based on dataloader type
-        if dataloader_type == "shared":
-            # Use shared format paths: {base_dataset}_2d_shared/
-            # Derive from DATA_DIR and base dataset name (strip any 2d suffix)
+        if dataloader_type in ("shared", "zopt"):
+            # Use shared/zopt format paths
             data_dir = Path(cfg.paths.DATA_DIR)
-            
-            shared_dir = data_dir / f"{base_dataset}_2d_shared"
-            root_dir = str(shared_dir)
-            stats_path = str(shared_dir / "stats.pkl")
+            if dataloader_type == "zopt":
+                data_subdir = data_dir / f"{base_dataset}_3d_zopt"
+            else:
+                data_subdir = data_dir / f"{base_dataset}_2d_shared"
+            root_dir = str(data_subdir)
+            stats_path = str(data_subdir / "stats.pkl")
             if accelerator.is_main_process:
-                print(f"Shared dataloader root: {root_dir}")
+                print(f"{dataloader_type.capitalize()} dataloader root: {root_dir}")
         else:
             root_dir = cfg.paths.dataset
             stats_path = cfg.paths.dataset_stats
@@ -330,13 +336,14 @@ def main(cfg: DictConfig) -> None:
             max_labels=cfg.get("max_labels", None),
             modality=modality,
         )
-        if dataloader_type == "shared":
+        if dataloader_type in ("shared", "zopt"):
             val_kwargs.update(
                 crop_to_bbox=cfg.preprocessing.crop_to_bbox,
                 bbox_padding=cfg.preprocessing.bbox_padding,
                 min_coverage=min_coverage,
                 min_coverage_ratio=min_coverage_ratio,
                 same_case_context=same_case_context,
+                same_case_context_ratio=same_case_context_ratio,
                 max_ds_len=max_ds_len_val,
                 random_context=False,
                 augment=False,
@@ -344,7 +351,7 @@ def main(cfg: DictConfig) -> None:
                 slice_selection=slice_selection,
             )
             if accelerator.is_main_process:
-                print(f"Using shared dataloader: same_case_context={same_case_context}, "
+                print(f"Using {dataloader_type} dataloader: same_case_context_ratio={same_case_context_ratio}, "
                       f"min_coverage={min_coverage}, min_coverage_ratio={min_coverage_ratio}")
         else:
             val_kwargs.update(
@@ -384,163 +391,8 @@ def main(cfg: DictConfig) -> None:
             max_samples_per_dataset=max_samples,
         )
     # Get model (don't move to device yet - accelerator.prepare handles that)
-    if cfg.method == "patch_icl":
-        from src.models.patch_icl_v2 import PatchICL
-
-        # Set num_mask_channels based on random_coloring_nb
-        patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
-        random_coloring_nb = cfg.get("random_coloring_nb", 0)
-        patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
-        if accelerator.is_main_process:
-            print(f"Mask channels: {patch_icl_cfg['num_mask_channels']} (random_coloring_nb={random_coloring_nb})")
-
-        # Create feature extractor for on-the-fly mode if needed
-        feature_extractor = None
-        feature_mode = cfg.get("feature_mode", "precomputed")
-        if feature_mode == "on_the_fly":
-            fe_cfg = patch_icl_cfg.get("feature_extractor", None)
-            if fe_cfg is not None:
-                extractor_type = fe_cfg.get("type", "meddino").lower()
-            else:
-                extractor_type = cfg.get("feature_extractor_type", "meddino").lower()
-
-            if extractor_type in ["meddino", "meddinov3", "meddino_v3"]:
-                from src.models.meddino_extractor import create_meddino_extractor
-                if accelerator.is_main_process:
-                    print("Initializing MedDINOv3 for on-the-fly feature extraction...")
-                if fe_cfg is not None:
-                    feature_extractor = create_meddino_extractor(
-                        model_path=fe_cfg.get("model_path", cfg.paths.ckpts.meddino_vit),
-                        target_size=fe_cfg.get("target_size", 256),
-                        device=device,
-                        layer_idx=fe_cfg.get("layer_idx", 11),
-                        freeze=fe_cfg.get("freeze", True),
-                    )
-                else:
-                    feature_extractor = create_meddino_extractor(
-                        model_path=cfg.paths.ckpts.meddino_vit,
-                        target_size=cfg.get("feature_extraction_resolution", 256),
-                        device=device,
-                        layer_idx=cfg.get("meddino_layer_idx", 11),
-                        freeze=True,
-                    )
-                if accelerator.is_main_process:
-                    print(f"Feature mode: on_the_fly (MedDINO, resolution={fe_cfg.get('target_size', 256) if fe_cfg else cfg.get('feature_extraction_resolution', 256)})")
-
-            elif extractor_type in ["medsam_v1", "medsam_v1_layer"]:
-                from src.models.medsam_extractor import MedSAMv1LayerExtractor
-                if accelerator.is_main_process:
-                    print("Initializing MedSAM v1 for on-the-fly feature extraction...")
-                target_size = fe_cfg.get("target_size", 1024) if fe_cfg else 1024
-                output_grid = fe_cfg.get("output_grid_size") if fe_cfg else None
-                feature_extractor = MedSAMv1LayerExtractor(
-                    checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
-                    target_size=target_size,
-                    device=device,
-                    layer_idx=fe_cfg.get("layer_idx", 11) if fe_cfg else 11,
-                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
-                    output_grid_size=output_grid,
-                )
-                if accelerator.is_main_process:
-                    info = feature_extractor.get_feature_info()
-                    print(f"Feature mode: on_the_fly (MedSAM v1 layer {info['layer_idx']}, "
-                          f"input={info['input_size']}×{info['input_size']}, "
-                          f"grid={info['output_grid_size']}×{info['output_grid_size']})")
-            elif extractor_type == "universeg":
-                from src.models.universeg_extractor import UniverSegExtractor
-                if accelerator.is_main_process:
-                    print("Initializing UniverSeg for on-the-fly feature extraction...")
-                feature_extractor = UniverSegExtractor(
-                    layer_idx=fe_cfg.get("layer_idx", 3) if fe_cfg else 3,
-                    device=device,
-                    pretrained=fe_cfg.get("pretrained", True) if fe_cfg else True,
-                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
-                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-                    input_size=fe_cfg.get("input_size", 128) if fe_cfg else 128,
-                )
-                if accelerator.is_main_process:
-                    info = feature_extractor.get_feature_info()
-                    print(f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
-                          f"dim={info['feature_dim']}, input={info['input_size']}x{info['input_size']}, "
-                          f"grid={info['output_grid_size']})")
-            elif extractor_type == "icl_encoder":
-                from src.models.icl_encoder import ICLEncoder
-                if accelerator.is_main_process:
-                    print("Initializing ICLEncoder for on-the-fly feature extraction...")
-                feature_extractor = ICLEncoder(
-                    layer_idx=fe_cfg.get("layer_idx", "all") if fe_cfg else "all",
-                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-                    freeze=fe_cfg.get("freeze", False) if fe_cfg else False,
-                )
-                if accelerator.is_main_process:
-                    info = feature_extractor.get_feature_info()
-                    print(f"Feature mode: on_the_fly (ICLEncoder layers={info['layer_indices']}, "
-                          f"dim={info['feature_dim']}, grid={info['output_grid_size']})")
-            elif extractor_type == "rad_dino":
-                from src.models.rad_dino_extractor import RADDINOExtractor
-                if accelerator.is_main_process:
-                    print("Initializing RAD-DINO for on-the-fly feature extraction...")
-                feature_extractor = RADDINOExtractor(
-                    model_name=fe_cfg.get("model_name", "microsoft/rad-dino") if fe_cfg else "microsoft/rad-dino",
-                    target_size=fe_cfg.get("target_size", 224) if fe_cfg else 224,
-                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
-                    device=device,
-                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
-                )
-                if accelerator.is_main_process:
-                    info = feature_extractor.get_feature_info()
-                    print(f"Feature mode: on_the_fly (RAD-DINO model={info['model_name']}, "
-                          f"dim={info['feature_dim']}, grid={info['output_grid_size']}, frozen={info['frozen']})")
-            else:
-                raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
-        else:
-            if accelerator.is_main_process:
-                print(f"Feature mode: precomputed")
-
-        model = PatchICL(
-            patch_icl_cfg,
-            context_size=cfg.get("context_size", 0),
-            feature_extractor=feature_extractor,
-        )
-
-        # Build and set loss functions from patch_icl config
-        loss_cfg = patch_icl_cfg.get("loss", {})
-        patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
-        aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
-
-        patch_criterion = build_loss_fn(patch_loss_cfg["type"], patch_loss_cfg.get("args"))
-        aggreg_criterion = build_loss_fn(aggreg_loss_cfg["type"], aggreg_loss_cfg.get("args"))
-        model.set_loss_functions(patch_criterion, aggreg_criterion)
-        if accelerator.is_main_process:
-            print(f"Loss functions: patch={patch_loss_cfg['type']}, aggreg={aggreg_loss_cfg['type']}")
-
-                # Load checkpoint weights
-        ckpt_path = cfg.get("checkpoint", None)
-        if ckpt_path:
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
-            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            if accelerator.is_main_process:
-                print(f"Loaded checkpoint from {ckpt_path} (epoch {checkpoint.get('epoch', '?')}, dice {checkpoint.get('best_dice', '?'):.4f})")
-        else:
-            if accelerator.is_main_process:
-                print("No checkpoint loaded, using default weights")
-    elif cfg.method == "universeg":
-        from src.models.universeg_baseline import UniverSegBaseline
-
-        universeg_cfg = cfg.model.get("universeg", {})
-        model = UniverSegBaseline(
-            pretrained=universeg_cfg.get("pretrained", True),
-            input_size=universeg_cfg.get("input_size", 128),
-        )
-
-        # Set loss functions for evaluation
-        aggreg_criterion = build_loss_fn("dice", None)
-        patch_criterion = build_loss_fn("dice", None)
-        model.set_loss_functions(patch_criterion, aggreg_criterion)
-        if accelerator.is_main_process:
-            print(f"Using UniverSeg baseline model (input_size={model.input_size})")
-    else:
-        raise ValueError(f"Unknown method: {cfg.method}")
+    from src.model_builder import build_model
+    model = build_model(cfg, device, verbose=accelerator.is_main_process)
     
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if accelerator.is_main_process:

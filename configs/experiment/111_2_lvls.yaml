@@ -14,24 +14,26 @@ model:
       output_grid_size: 128
       freeze: true
     levels:
-      - resolution: 20
+      - resolution: 24
         patch_size: 8
         sampling_method: "continuous"
         sampling_temperature: 0.1
-        stride: 7
+        stride: 8
         num_patches: 9
         num_context_patches: 9
-        pad_before: 1
-        pad_after: 1
+        pad_before: 0
+        pad_after: 0
       - resolution: 128
         patch_size: 8
         sampling_method: "continuous"
         sampling_temperature: 0.1
-        stride: 6
-        num_patches: 50
-        num_context_patches: 10  # Fewer patches for context (default: num_patches)
+        stride: 8
+        num_patches: 40
+        num_context_patches: 20  # Fewer patches for context (default: num_patches)
         pad_before: 0
         pad_after: 0
+        spread_sigma: 2.0  # Gaussian blur sigma to spread sampling around positive zones
+        
 
     oracle_levels_train: [false, true, true]
     oracle_levels_valid: [false, false, false]
@@ -41,9 +43,9 @@ model:
     oracle_scheduling:
       enabled: true
       schedule: "linear"        # linear, exponential, inverse_sigmoid
-      start_prob: 1.0           # Start with full oracle
-      end_prob: 0.2             # End with 30% oracle (keep some GT signal)
-      warmup_epochs: 10         # Full oracle for first 20 epochs
+      start_prob: 0.3           # Start with full oracle
+      end_prob: 0.0           # End with 30% oracle (keep some GT signal)
+      warmup_epochs: 1         # Full oracle for first 20 epochs
       decay_epochs: 30          # Decay over 30 epochs
 
     sampler:
@@ -55,7 +57,7 @@ model:
       type: "average"
       # Note: combine_mode not used - level blending handled by cascade.confidence_blend
       min_coverage: 1e-6
-      use_confidence: true
+      use_confidence: false
       confidence_mode: "multiply"
       detach_confidence: true  # Prevent backbone from gaming aggregation weights
 
@@ -78,6 +80,7 @@ model:
       use_context_mask: true
       mask_fusion_type: "concat"
       predict_confidence: true
+      detach_conf_features: true
 
     loss:
       patch_loss:
@@ -90,23 +93,23 @@ model:
         default:
           target_patch: 1.0
           target_aggreg: 1.0
-          context_patch: 0.5
-          context_aggreg: 0.5
-          target_combined: 1
+          context_patch: 1.0
+          context_aggreg: 1.0
+          target_combined: 1.0
       level_weights: [1.0, 1.0, 1.0, 1.0]  
       confidence:
         method: "learned"
         enabled: true
         temperature: 1.0
         learn_temperature: true
-        supervision_weight: 1.0  # Light supervision: conf correlates with correctness
+        supervision_weight: 0.2  # Light supervision: conf correlates with correctness
         boundary_weight: 0
         boundary_width: 2
         weighted_seg: false
 
     cascade:
       detach_between_levels: true  # Detach gradients between levels to prevent interference (default: false)
-      confidence_blend: true       # Blends levels by confidence (no-op with 1 level)
-      learned_alpha: true           # Learn α from register tokens
+      confidence_blend: false       # Blends levels by confidence (no-op with 1 level)
+      learned_alpha: false           # Learn α from register tokens
       conf_weighted_aggreg: false    # Aggreg loss weighted by confidence
       cascade_registers: true 

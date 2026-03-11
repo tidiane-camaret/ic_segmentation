@@ -42,22 +42,24 @@ preprocessing:
 
 max_files_3d_to_2d: null  # Limit number of cases/files to process (for debugging)
 class_balanced: true  # Uniform label sampling (each label equally likely per step)
-dataloader_type: shared
-same_case_context: True
+dataloader_type: zopt
+same_case_context_ratio: 1.0  # Ratio of context from same case (0.0=all other, 1.0=all same)
 # Coverage filtering: slice valid if coverage >= max(min_coverage, max_coverage * min_coverage_ratio)
 min_coverage: 30  # Minimum pixels for slice to be valid
 min_coverage_ratio: 0  # Minimum ratio of max coverage
  # Slice subsampling (shared dataloader only)                                                                                                                                             
-max_slices_per_group: 6   # Max slices per (case, label, axis), null for unlimited
-slice_selection: "stride"  # "all", "random", "stride", "stride_peak"
+max_slices_per_group: 10   # Max slices per (case, label, axis), null for unlimited
+slice_selection: "stride_peak"  # "all", "random", "stride", "stride_peak"
 # Dataloader
 train_batch_size: 50
 val_batch_size: 64
 max_ds_len:  # Can be null, int, or dict with train/val keys
   train: null
   val: null
-
-context_size: 5
+max_cases:                                                                                                                                                                               
+    train: 400                                                                                                                                                                             
+    val: null
+context_size: 6
 
 
 # Optimizer
@@ -86,6 +88,13 @@ training:
 warmup_scheduler:
   enabled: true
   warmup_epochs: 10
+
+# Iterative evaluation settings
+iterative:
+  num_initial_context: 3       # Context slices from reference case
+  num_propagated_context: 2    # Previous predictions to include as context
+  propagation_direction: "forward"  # "forward", "backward", "center_out"
+  use_gt_propagation: false    # Ablation: use GT masks instead of predictions
 
 method: null
 checkpoint: null  # Path to model checkpoint to load weights from

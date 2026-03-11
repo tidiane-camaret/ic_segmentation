@@ -69,10 +69,10 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Dataloader
-    dataset_type = cfg.get("dataset", "totalseg")
+    base_dataset = cfg.get("base_dataset", "totalseg")
     feature_mode = cfg.get("feature_mode", "precomputed")
 
-    if dataset_type == "medsegbench":
+    if base_dataset == "medsegbench":
         from src.dataloaders.medsegbench_dataloader import (
             get_dataloader as get_medsegbench_dataloader,
         )
@@ -129,8 +129,12 @@ def main(cfg: DictConfig) -> None:
 
     else:
         # TotalSeg2D dataloader - select based on dataloader_type config
-        dataloader_type = cfg.get("dataloader_type", "fast")  # "fast" or "shared"
-        if dataloader_type == "shared":
+        dataloader_type = cfg.get("dataloader_type", "fast")  # "fast", "shared", or "zopt"
+        if dataloader_type == "zopt":
+            from src.dataloaders.totalseg2d_zopt_dataloader import (
+                get_dataloader as get_totalseg2d_dataloader,
+            )
+        elif dataloader_type == "shared":
             from src.dataloaders.totalseg2d_shared_dataloader import (
                 get_dataloader as get_totalseg2d_dataloader,
             )
@@ -189,6 +193,7 @@ def main(cfg: DictConfig) -> None:
 
         # Coverage filtering config
         same_case_context = cfg.get("same_case_context", False)
+        same_case_context_ratio = cfg.get("same_case_context_ratio", 0.0)
         min_coverage = cfg.get("min_coverage", 100)
         min_coverage_ratio = cfg.get("min_coverage_ratio", 0.1)
 
@@ -197,17 +202,18 @@ def main(cfg: DictConfig) -> None:
         slice_selection = cfg.get("slice_selection", "all")
 
         # Resolve paths based on dataloader type
-        if dataloader_type == "shared":
-            # Use shared format paths: {base_dataset}_2d_shared/
-            # Derive from DATA_DIR and base dataset name (strip any 2d suffix)
+        if dataloader_type in ("shared", "zopt"):
+            # Use shared/zopt format paths: {base_dataset}_2d_shared/ or {base_dataset}_3d_zopt/
             data_dir = Path(cfg.paths.DATA_DIR)
-            base_dataset = cfg.get("base_dataset", "totalseg")  # e.g., "totalseg" or "totalsegmri"
-            shared_dir = data_dir / f"{base_dataset}_2d_shared"
-            root_dir = str(shared_dir)
-            stats_path = str(shared_dir / "stats.pkl")
+            if dataloader_type == "zopt":
+                data_subdir = data_dir / f"{base_dataset}_3d_zopt"
+            else:
+                data_subdir = data_dir / f"{base_dataset}_2d_shared"
+            root_dir = str(data_subdir)
+            stats_path = str(data_subdir / "stats.pkl")
             if accelerator.is_main_process:
-                print(f"Shared dataloader root: {root_dir}")
-                print(f"Shared dataloader: same_case_context={same_case_context}, "
+                print(f"{dataloader_type.capitalize()} dataloader root: {root_dir}")
+                print(f"Dataloader config: same_case_context_ratio={same_case_context_ratio}, "
                       f"min_coverage={min_coverage}, min_coverage_ratio={min_coverage_ratio}")
         else:
             root_dir = cfg.paths.dataset
@@ -227,14 +233,15 @@ def main(cfg: DictConfig) -> None:
             max_labels=cfg.get("max_labels", None),
             max_cases=max_cases_train,
         )
-        if dataloader_type == "shared":
-            # Shared dataloader params (now supports most fast dataloader features)
+        if dataloader_type in ("shared", "zopt"):
+            # Shared/zopt dataloader params (same interface)
             train_kwargs.update(
                 crop_to_bbox=cfg.preprocessing.crop_to_bbox,
                 bbox_padding=cfg.preprocessing.bbox_padding,
                 min_coverage=min_coverage,
                 min_coverage_ratio=min_coverage_ratio,
                 same_case_context=same_case_context,
+                same_case_context_ratio=same_case_context_ratio,
                 max_ds_len=max_ds_len_train,
                 class_balanced=cfg.get("class_balanced", False),
                 augmentation_config=augmentation_config,
@@ -268,14 +275,15 @@ def main(cfg: DictConfig) -> None:
             max_labels=cfg.get("max_labels", None),
             max_cases=max_cases_val,
         )
-        if dataloader_type == "shared":
-            # Shared dataloader params
+        if dataloader_type in ("shared", "zopt"):
+            # Shared/zopt dataloader params
             val_kwargs.update(
                 crop_to_bbox=cfg.preprocessing.crop_to_bbox,
                 bbox_padding=cfg.preprocessing.bbox_padding,
                 min_coverage=min_coverage,
                 min_coverage_ratio=min_coverage_ratio,
                 same_case_context=same_case_context,
+                same_case_context_ratio=same_case_context_ratio,
                 max_ds_len=max_ds_len_val,
                 augment=False,  # No augmentation for validation
                 max_slices_per_group=max_slices_per_group,
