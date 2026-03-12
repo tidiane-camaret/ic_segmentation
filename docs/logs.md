@@ -4,6 +4,87 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-03-12: Fair Hierarchical Metrics + Metrics Cleanup
+
+**Goal:** Fix biased hierarchical comparison metrics and remove redundant metrics.
+
+### Problem: Max-Pool GT Inflation Bias
+
+When comparing level l-1 vs level l performance, the previous metrics used `_resize_label()` which includes max-pooling. This inflates small foreground objects more at coarser resolutions, making coarse level predictions appear artificially better.
+
+Additionally, level l-1 was trained against GT at resolution l-1 (more inflated), while level l was trained against GT at resolution l (less inflated). When evaluating both at resolution l, this creates an unfair comparison.
+
+### Solution: Area-Only GT for Fair Comparison
+
+Changed `compute_hierarchical_metrics()` to use area-only interpolation (no max-pool) as the primary comparison method:
+
+```python
+# Old (biased): uses max-pool which inflates small FG
+labels_curr = _resize_label(labels, size=curr_res)
+
+# New (fair): pure area interpolation
+labels_curr_area = F.interpolate(labels, size=curr_res, mode='area')
+```
+
+### New Metrics Structure
+
+| Metric | GT Method | Resolution | When Computed |
+|--------|-----------|------------|---------------|
+| `level_{i}_dice`, `level_{i}_soft_dice` | max-pool | native | Always (training) |
+| `level_{i}_prev/curr_covered_softdice` | **area-only** | level l | Always |
+| `level_{i}_level_improvement` | **area-only** | level l | Always |
+| `level_{i}_*_fullres` | full-res GT | full | **Validation only** |
+
+Added `compute_fullres` parameter to `compute_hierarchical_metrics()` and `compute_all_metrics()`. Full-resolution metrics are expensive (O(full_res²) vs O(level_res²)) so only computed during validation.
+
+### Removed Redundant Metrics
+
+| Removed | Reason |
+|---------|--------|
+| `local_dice`, `local_soft_dice` | Only measured last level's patches; `level_{i}_soft_dice` more informative |
+| `pixel_mae`, `final_pixel_mae`, `level_{i}_pixel_mae` | Soft dice is more informative |
+| `level_{i}_prev/curr_uncovered_softdice` | Uncovered regions aren't updated, less actionable |
+| `compute_patch_metrics()` | Unused after removing local_dice |
+| `compute_pixel_mae()` | Unused after removing pixel_mae |
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/models/patch_icl_v2/metrics.py` | Removed `compute_pixel_mae()`, `compute_patch_metrics()`. Updated `compute_hierarchical_metrics()` with area-only GT and conditional fullres. Removed pixel_mae from level metrics. |
+| `src/models/patch_icl_v2/__init__.py` | Removed `compute_pixel_mae` export |
+| `src/train_utils.py` | Removed `compute_pixel_mae` import, removed mae/PatchDice from progress bars, updated `validate()` return tuple |
+| `scripts/train.py` | Updated for new `validate()` return signature, removed `val_local_dice` logging |
+| `scripts/eval.py` | Updated for new `validate()` return signature, removed pixel_mae logging |
+
+### Final Metrics Summary
+
+**Per-level (native resolution):**
+- `level_{i}_dice`, `level_{i}_soft_dice`
+
+**Hierarchical (area-only GT, fair comparison):**
+- `level_{i}_prev_covered_softdice`, `level_{i}_curr_covered_softdice`
+- `level_{i}_level_improvement`, `level_{i}_combination_effect`
+- `level_{i}_combined_covered_softdice`
+- `level_{i}_coverage_ratio`
+
+**Hierarchical (full-res, validation only):**
+- `level_{i}_*_fullres` variants
+
+**Error targeting:**
+- `level_{i}_error_recall`, `level_{i}_error_precision`
+- `level_{i}_error_targeting_lift`, `level_{i}_prev_error_ratio`
+
+**Final output:**
+- `final_dice`, `final_soft_dice`
+- `context_dice`, `context_soft_dice`
+
+**Uncertainty:**
+- `mean_entropy`, `mean_confidence`
+- `mean_entropy_on_errors`, `mean_entropy_on_correct`
+
+---
+
 ## 2026-03-10: Training Pipeline Optimization
 
 **Goal:** Remove unused code and optimize training performance.
