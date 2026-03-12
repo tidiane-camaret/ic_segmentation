@@ -630,16 +630,14 @@ def main(cfg: DictConfig) -> None:
             compute_metrics_every=cfg.training.get("compute_metrics_every", 10),
         )
 
-        val_loss, val_local_dice, val_final_dice, val_context_dice, val_detailed = (
-            validate(
-                model,
-                val_loader,
-                device,
-                accelerator=accelerator,
-                use_wandb=cfg.logging.use_wandb,
-                epoch=epoch,
-                save_dir=val_save_dir,
-            )
+        val_loss, val_final_dice, val_context_dice, val_detailed = validate(
+            model,
+            val_loader,
+            device,
+            accelerator=accelerator,
+            use_wandb=cfg.logging.use_wandb,
+            epoch=epoch,
+            save_dir=val_save_dir,
         )
 
         scheduler.step()
@@ -656,10 +654,8 @@ def main(cfg: DictConfig) -> None:
             log_dict = {
                 "epoch": epoch,
                 "val_loss": val_loss,
-                "val_local_dice": val_local_dice,
                 "val_final_dice": val_final_dice,
                 "val_context_dice": val_context_dice,
-                "val_local_softdice": val_detailed.get("local_softdice", 0),
                 "val_final_softdice": val_detailed.get("final_softdice", 0),
                 "val_context_softdice": val_detailed.get("context_softdice", 0),
                 "lr": scheduler.get_last_lr()[0],

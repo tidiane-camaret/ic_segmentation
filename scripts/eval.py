@@ -497,19 +497,17 @@ def main(cfg: DictConfig) -> None:
             print(f"Saved register tokens for {n_cases} cases")
     else:
         # Full validation with detailed metrics
-        val_loss, val_local_dice, val_final_dice, val_context_dice, detailed_results = validate(
+        val_loss, val_final_dice, val_context_dice, detailed_results = validate(
             model, val_loader, device,
             save_dir=save_dir, max_save_batches=len(val_loader),
             accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0
         )
         if accelerator.is_main_process:
-            val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
             val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
             print(
                 f"Val Loss: {val_loss:.5f} | "
                 f"Val FinalDice: {val_final_dice:.5f} | "
                 f"Val SoftDice: {val_soft_dice:.5f} | "
-                f"Val PixelMAE: {val_pixel_mae:.5f} | "
                 f"Val CtxDice: {val_context_dice:.5f}"
             )
             # Print per-level metrics
@@ -527,14 +525,11 @@ def main(cfg: DictConfig) -> None:
                 print(f"  {label_id}: {dice:.4f}")
 
         if cfg.logging.use_wandb and accelerator.is_main_process:
-            val_pixel_mae = detailed_results.get("final_pixel_mae", 0.0)
             val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
             log_dict = {
                 "val_loss": val_loss,
-                "val_local_dice": val_local_dice,
                 "val_final_dice": val_final_dice,
                 "val_final_soft_dice": val_soft_dice,
-                "val_final_pixel_mae": val_pixel_mae,
                 "val_context_dice": val_context_dice,
             }
             # Log all per-level and uncertainty metrics

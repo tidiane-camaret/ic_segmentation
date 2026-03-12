@@ -40,7 +40,6 @@ from src.models.patch_icl_v2.metrics import (
     _resize_label,
     compute_all_metrics,
     compute_per_sample_dice,
-    compute_pixel_mae,
 )
 
 
@@ -726,11 +725,6 @@ def train_epoch(
         pbar.set_postfix(
             {
                 "loss": f"{avg_loss:.4f}",
-                "mae": (
-                    f"{dice_accum['final_pixel_mae'] / dice_count['final_pixel_mae']:.4f}"
-                    if dice_count["final_pixel_mae"] > 0
-                    else "N/A"
-                ),
                 "sdice": (
                     f"{dice_accum['final_soft_dice'] / dice_count['final_soft_dice']:.4f}"
                     if dice_count["final_soft_dice"] > 0
@@ -760,9 +754,8 @@ def train_epoch(
             print(
                 f"Epoch {epoch:04d} | Batch {idx:04d} | "
                 f"Loss: {avg_loss:.5f} | "
-                f"PatchDice: {dice_accum['local_dice'] / max(dice_count['local_dice'], 1):.5f} | "
                 f"FinalDice: {dice_accum['final_dice'] / max(dice_count['final_dice'], 1):.5f} | "
-                f"SoftDice: {dice_accum['final_soft_dice'] / max(dice_count['final_soft_dice'], 1):.5f}"
+                f"FinalSoftDice: {dice_accum['final_soft_dice'] / max(dice_count['final_soft_dice'], 1):.5f}"
             )
 
         del outputs, losses
@@ -874,7 +867,8 @@ def validate(
         total_loss += loss.item()
 
         # Compute all dice metrics using centralized function (with per-sample dice)
-        metrics = compute_all_metrics(outputs, labels, return_per_sample=True)
+        # compute_fullres=True for expensive full-resolution hierarchical metrics
+        metrics = compute_all_metrics(outputs, labels, return_per_sample=True, compute_fullres=True)
 
         # Accumulate all scalar metrics dynamically
         for key, val in metrics.items():
@@ -939,10 +933,6 @@ def validate(
         pbar.set_postfix(
             {
                 "loss": f"{total_loss / n_batches:.4f}",
-                "mae": (
-                    f"{dice_accum['final_pixel_mae'] / dice_count['final_pixel_mae']:.4f}"
-                    if dice_count["final_pixel_mae"] > 0 else "N/A"
-                ),
                 "sdice": (
                     f"{dice_accum['final_soft_dice'] / dice_count['final_soft_dice']:.4f}"
                     if dice_count["final_soft_dice"] > 0 else "N/A"
@@ -971,7 +961,6 @@ def validate(
 
     return (
         total_loss / n,
-        dice_accum["local_dice"] / max(dice_count["local_dice"], 1),
         dice_accum["final_dice"] / max(dice_count["final_dice"], 1),
         dice_accum.get("context_dice", 0.0) / max(dice_count.get("context_dice", 0), 1),
         detailed_results,

@@ -1,0 +1,124 @@
+# @package _global_
+# Inherits from method/patch_icl.yaml for model config.
+# Entropy-based confidence: conf = 1 - H(p)/log(2)
+
+defaults:
+  - /augmentation
+  - override /method: patch_icl
+
+preprocessing:
+  image_size: 256
+model:
+  patch_icl:
+    feature_extractor:
+      output_grid_size: "${preprocessing.image_size}"
+      freeze: true
+    levels:
+      - resolution: 24
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 9
+        num_context_patches: 9
+        pad_before: 0
+        pad_after: 0
+      - resolution: 128
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 40
+        num_context_patches: 20  # Fewer patches for context (default: num_patches)
+        pad_before: 0
+        pad_after: 0
+        spread_sigma: 2.0  # Gaussian blur sigma to spread sampling around positive zones
+      - resolution: 256
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 40
+        num_context_patches: 20  # Fewer patches for context (default: num_patches)
+        pad_before: 0
+        pad_after: 0
+        spread_sigma: 2.0  # Gaussian blur sigma to spread sampling around positive zones        
+
+    oracle_levels_train: [false, true, true]
+    oracle_levels_valid: [false, false, false]
+
+    # Scheduled sampling: gradually transition from oracle to model predictions
+    # Reduces train/val distribution mismatch (exposure bias)
+    oracle_scheduling:
+      enabled: true
+      schedule: "linear"        # linear, exponential, inverse_sigmoid
+      start_prob: 0.3           # Start with full oracle
+      end_prob: 0.0           # End with 30% oracle (keep some GT signal)
+      warmup_epochs: 1         # Full oracle for first 20 epochs
+      decay_epochs: 30          # Decay over 30 epochs
+
+    sampler:
+      target_sampling: "gt_entropy"              # Oracle weights: sample from GT border regions
+      target_model_sampling: "predicted_uncertainty"  # Model weights: sample from low confidence
+      context_sampling: "gt_entropy"             # Context: sample from GT border regions
+
+    aggregator:
+      type: "average"
+      # Note: combine_mode not used - level blending handled by cascade.confidence_blend
+      min_coverage: 1e-6
+      use_confidence: false
+      confidence_mode: "multiply"
+      detach_confidence: true  # Prevent backbone from gaming aggregation weights
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: "${preprocessing.image_size}"
+      embed_dim: 256
+      embed_proj_dim: 256
+      feature_grid_size: "${model.patch_icl.feature_extractor.output_grid_size}"
+      patch_feature_grid_size: 8
+      num_heads: 4
+      num_layers: 2
+      num_context_layers: 1
+      num_registers: 1
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: false
+      use_context_mask: true
+      mask_fusion_type: "concat"
+      predict_confidence: true
+      detach_conf_features: true
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args: null
+      aggreg_loss:
+        type: "softdiceFocal"
+        args: null
+      weights:
+        default:
+          target_patch: 1.0
+          target_aggreg: 1.0
+          context_patch: 1.0
+          context_aggreg: 1.0
+          target_combined: 1.0
+      level_weights: [1.0, 1.0, 1.0]  
+      confidence:
+        method: "learned"
+        enabled: true
+        temperature: 1.0
+        learn_temperature: true
+        supervision_weight: 0.2  # Light supervision: conf correlates with correctness
+        boundary_weight: 0
+        boundary_width: 2
+        weighted_seg: false
+
+    cascade:
+      detach_between_levels: true  # Detach gradients between levels to prevent interference (default: false)
+      confidence_blend: false       # Blends levels by confidence (no-op with 1 level)
+      learned_alpha: false           # Learn α from register tokens
+      conf_weighted_aggreg: false    # Aggreg loss weighted by confidence
+      cascade_registers: true 
