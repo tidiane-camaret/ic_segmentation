@@ -730,6 +730,12 @@ def train_epoch(
                     if dice_count["final_soft_dice"] > 0
                     else "N/A"
                 ),
+
+                "dice": (
+                    f"{dice_accum['final_dice'] / dice_count['final_dice']:.4f}"
+                    if dice_count["final_dice"] > 0
+                    else "N/A" 
+                ),
             }
         )
 
@@ -743,20 +749,6 @@ def train_epoch(
                 if dice_count[key] > 0:
                     log_dict[f"train_batch/{key}"] = dice_accum[key] / dice_count[key]
             wandb.log(log_dict, step=global_step)
-
-        # Print progress
-        if print_every and idx % print_every == 0 and is_main:
-            avg_loss = (
-                loss_accum["total_loss"] / loss_count["total_loss"]
-                if loss_count["total_loss"]
-                else 0
-            )
-            print(
-                f"Epoch {epoch:04d} | Batch {idx:04d} | "
-                f"Loss: {avg_loss:.5f} | "
-                f"FinalDice: {dice_accum['final_dice'] / max(dice_count['final_dice'], 1):.5f} | "
-                f"FinalSoftDice: {dice_accum['final_soft_dice'] / max(dice_count['final_soft_dice'], 1):.5f}"
-            )
 
         del outputs, losses
 
@@ -936,6 +928,10 @@ def validate(
                 "sdice": (
                     f"{dice_accum['final_soft_dice'] / dice_count['final_soft_dice']:.4f}"
                     if dice_count["final_soft_dice"] > 0 else "N/A"
+                ),
+                "dice": (
+                    f"{dice_accum['final_dice'] / dice_count['final_dice']:.4f}"
+                    if dice_count["final_dice"] > 0 else "N/A"
                 ),
             }
         )

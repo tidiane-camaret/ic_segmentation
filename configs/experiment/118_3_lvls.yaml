@@ -11,11 +11,14 @@ defaults:
   - override /method: patch_icl
 
 preprocessing:
-  image_size: 128
+  image_size: 256
+  # Feature extractor operates at this size (can differ from image_size)
+  # If not set, defaults to image_size
+  feature_image_size: 128
 model:
   patch_icl:
     feature_extractor:
-      output_grid_size: "${preprocessing.image_size}"
+      output_grid_size: "${preprocessing.feature_image_size}"
       freeze: true
     levels:
       - resolution: 24

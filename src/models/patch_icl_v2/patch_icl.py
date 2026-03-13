@@ -209,6 +209,11 @@ class PatchICL(nn.Module):
         self.feature_extractor = feature_extractor
         self._feature_extractor_cfg = config.get('feature_extractor', None)
 
+        # Feature image size: allows feature extractor to operate at different resolution
+        # than the rest of the model (e.g., features at 128, model at 256)
+        fe_cfg = self._feature_extractor_cfg or {}
+        self.feature_image_size = fe_cfg.get('output_grid_size', None)
+
         # Level configs
         levels_cfg = config.get('levels', [{'resolution': 32, 'patch_size': 16, 'num_patches': 16}])
         self.levels = levels_cfg
@@ -778,9 +783,32 @@ class PatchICL(nn.Module):
         context_images: torch.Tensor | None = None,
         context_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Extract features on-the-fly using the feature extractor."""
+        """Extract features on-the-fly using the feature extractor.
+
+        If feature_image_size is set and differs from input size, images are
+        resized before feature extraction. This allows the feature extractor
+        to operate at a different resolution than the rest of the model.
+        """
         if self.feature_extractor is None:
             raise RuntimeError("No feature extractor available.")
+
+        # Resize images if feature_image_size differs from input size
+        input_size = target_images.shape[-1]
+        if self.feature_image_size is not None and self.feature_image_size != input_size:
+            fe_size = self.feature_image_size
+            target_images = F.interpolate(
+                target_images, size=(fe_size, fe_size),
+                mode='bilinear', align_corners=False
+            )
+            if context_images is not None:
+                B, k = context_images.shape[:2]
+                ctx_flat = context_images.view(B * k, *context_images.shape[2:])
+                ctx_flat = F.interpolate(
+                    ctx_flat, size=(fe_size, fe_size),
+                    mode='bilinear', align_corners=False
+                )
+                context_images = ctx_flat.view(B, k, *ctx_flat.shape[1:])
+
         if getattr(self.feature_extractor, '_frozen', False):
             with torch.no_grad():
                 return self.feature_extractor.extract_batch(target_images, context_images, context_masks)
