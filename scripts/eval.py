@@ -4,8 +4,8 @@ for each case in val set:
 - save img/gt/pred logits/probits as npz
 - save attention maps and register tokens
 """
-from datetime import datetime
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import hydra
@@ -227,7 +227,7 @@ def main(cfg: DictConfig) -> None:
     # Initialize accelerator with optional mixed precision
     from accelerate import DistributedDataParallelKwargs
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    mixed_precision = cfg.training.get("mixed_precision", None)
+    mixed_precision = cfg.training.get("mixed_precision", "no")
     accelerator = Accelerator(
         kwargs_handlers=[ddp_kwargs],
         mixed_precision=mixed_precision,
@@ -393,12 +393,6 @@ def main(cfg: DictConfig) -> None:
     # Get model (don't move to device yet - accelerator.prepare handles that)
     from src.model_builder import build_model
     model = build_model(cfg, device, verbose=accelerator.is_main_process)
-    
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    if accelerator.is_main_process:
-        print(f"Model parameters: {num_params:,}")
-
-
 
     # Optimizer
     opt_type = cfg.optimizer.get("optimizer_type", "adamw").lower()

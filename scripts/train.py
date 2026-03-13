@@ -496,6 +496,13 @@ def main(cfg: DictConfig) -> None:
             if model_fe_keys and not ckpt_fe_keys:
                 print("WARNING: Model has feature_extractor but checkpoint does not - using fresh weights")
 
+        # Filter out gaussian kernel buffers (shape depends on spread_sigma, not learned)
+        gaussian_keys = [k for k in ckpt_state_dict.keys() if '_gaussian_kernel' in k]
+        for k in gaussian_keys:
+            del ckpt_state_dict[k]
+        if gaussian_keys and accelerator.is_main_process:
+            print(f"Filtered {len(gaussian_keys)} gaussian kernel buffers from checkpoint")
+
         # Load with strict=False but track what was loaded
         missing, unexpected = model.load_state_dict(ckpt_state_dict, strict=False)
 

@@ -7,11 +7,6 @@ paths:
   RESULTS_DIR: ${.root}/results
   medsegbench: ${.DATA_DIR}/medsegbench
   base_dataset: ${.DATA_DIR}/${base_dataset}
-  #dataset2d: ${.DATA_DIR}/${dataset}2d
-  #dataset2d_h5: ${.DATA_DIR}/${dataset}2d_h5
-  #totalseg2d_every_n_slice: ${.DATA_DIR}/totalseg2d_every_n_slice
-  #dataset_stats: ${.DATA_DIR}/${dataset}/stats.pkl
-  #totalseg2d_every_n_slice_stats: ${.DATA_DIR}/$totalseg2d_every_n_slice/stats.pkl
   ckpts:
     save_dir: ${..RESULTS_DIR}/checkpoints
     medverse: /nfs/norasys/notebooks/camaret/repos/Medverse/Medverse.ckpt
@@ -22,7 +17,7 @@ paths:
     patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
     patch_icl_v2: null #${..RESULTS_DIR}/checkpoints/peach-plasma-179/best_model.pt
 # Cluster-specific training settings
-train_batch_size: 80
-val_batch_size: 80
+train_batch_size: 100
+val_batch_size: 100
 training:
   num_workers: 18

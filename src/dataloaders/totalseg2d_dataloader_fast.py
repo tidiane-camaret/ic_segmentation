@@ -113,7 +113,7 @@ class TotalSeg2DDataset(Dataset):
 
         # Resolve label_id_list
         if isinstance(label_id_list, str):
-            self.label_id_list = get_label_ids(label_id_list, max_labels=max_labels)
+            self.label_id_list = get_label_ids(label_id_list, max_labels=max_labels, modality=self.modality)
         else:
             self.label_id_list = label_id_list[:max_labels] if max_labels else label_id_list
         label_id_set = set(self.label_id_list)

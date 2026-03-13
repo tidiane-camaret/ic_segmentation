@@ -752,8 +752,8 @@ class SimpleCNNDecoder(nn.Module):
         patch_size: int = 16,
         feature_grid_size: int = 16,
         use_skip_connections: bool = True,
-        predict_confidence: bool = False,
-        detach_conf_features: bool = False,
+        predict_sampling_map: bool = False,
+        detach_sampling_features: bool = False,
         scale_embed_dim: int | None = None,
     ):
         super().__init__()
@@ -762,8 +762,8 @@ class SimpleCNNDecoder(nn.Module):
         self.patch_size = patch_size
         self.feature_grid_size = feature_grid_size
         self.use_skip_connections = use_skip_connections
-        self.predict_confidence = predict_confidence
-        self.detach_conf_features = detach_conf_features
+        self.predict_sampling_map = predict_sampling_map
+        self.detach_sampling_features = detach_sampling_features
         self.scale_embed_dim = scale_embed_dim if scale_embed_dim is not None else embed_dim
 
         D = embed_dim
@@ -801,12 +801,12 @@ class SimpleCNNDecoder(nn.Module):
             nn.Conv2d(D // 2, num_classes, 1),
         )
 
-        # Confidence head (predicts pixel-level confidence)
-        if predict_confidence:
-            self.conf_head = nn.Sequential(
+        # Sampling map head (predicts pixel-level map for guiding next-level sampling)
+        if predict_sampling_map:
+            self.sampling_head = nn.Sequential(
                 nn.Conv2d(D, D // 2, 3, padding=1),
                 nn.GELU(),
-                nn.Conv2d(D // 2, 1, 1),  # Single channel confidence
+                nn.Conv2d(D // 2, 1, 1),
             )
 
     def _decode_trunk(
@@ -879,7 +879,7 @@ class SimpleCNNDecoder(nn.Module):
 
         Returns:
             seg_pred: [B, K, num_classes, patch_size, patch_size]
-            conf_pred: [B, K, 1, patch_size, patch_size] or None if predict_confidence=False
+            sampling_map: [B, K, 1, patch_size, patch_size] or None if predict_sampling_map=False
         """
         B, K, D = encoded.shape
         h = self.feature_grid_size
@@ -909,23 +909,23 @@ class SimpleCNNDecoder(nn.Module):
 
         seg_pred = seg_pred.view(B, K, self.num_classes, self.patch_size, self.patch_size)
 
-        # Confidence head
-        conf_pred = None
-        if self.predict_confidence:
-            conf_features = features.detach() if self.detach_conf_features else features
-            conf_logits = self.conf_head(conf_features)  # [B*K, 1, h, h]
-            conf_pred = torch.sigmoid(conf_logits)  # [0, 1] bounded
+        # Sampling map head
+        sampling_map = None
+        if self.predict_sampling_map:
+            map_features = features.detach() if self.detach_sampling_features else features
+            map_logits = self.sampling_head(map_features)  # [B*K, 1, h, h]
+            sampling_map = torch.sigmoid(map_logits)  # [0, 1] bounded
 
-            # Upsample confidence to patch_size if needed
+            # Upsample to patch_size if needed
             if h != self.patch_size:
-                conf_pred = F.interpolate(
-                    conf_pred, size=(self.patch_size, self.patch_size),
+                sampling_map = F.interpolate(
+                    sampling_map, size=(self.patch_size, self.patch_size),
                     mode='bilinear', align_corners=False
                 )
 
-            conf_pred = conf_pred.view(B, K, 1, self.patch_size, self.patch_size)
+            sampling_map = sampling_map.view(B, K, 1, self.patch_size, self.patch_size)
 
-        return seg_pred, conf_pred
+        return seg_pred, sampling_map
 
 
 class SimpleBackbone(nn.Module):
@@ -962,8 +962,8 @@ class SimpleBackbone(nn.Module):
         gradient_checkpointing: bool = False,
         use_mask_prior: bool = False,
         mask_fusion_type: str = "additive",
-        predict_confidence: bool = False,
-        detach_conf_features: bool = False,
+        predict_sampling_map: bool = False,
+        detach_sampling_features: bool = False,
         **kwargs,
     ):
         """
@@ -985,8 +985,8 @@ class SimpleBackbone(nn.Module):
             max_levels: Deprecated, no longer used. Scale encoding is now resolution-agnostic.
             use_mask_prior: If True, fuse mask prior from previous level into encoded features
             mask_fusion_type: How to fuse mask prior ("additive", "gated", or "concat")
-            predict_confidence: If True, predict pixel-level confidence alongside segmentation
-            detach_conf_features: If True, detach features before confidence head (isolates conf_head from backbone gradients)
+            predict_sampling_map: If True, predict pixel-level sampling map alongside segmentation
+            detach_sampling_features: If True, detach features before sampling head
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -995,7 +995,7 @@ class SimpleBackbone(nn.Module):
         self.use_mask_prior = use_mask_prior
         self.use_context_mask = kwargs.get('use_context_mask', False)
         self.mask_fusion_type = mask_fusion_type
-        self.predict_confidence = predict_confidence
+        self.predict_sampling_map = predict_sampling_map
 
         # Continuous scale encoding (resolution-agnostic, replaces fixed level_embed)
         self.scale_encoder = ContinuousScaleEncoding(embed_dim, learnable_freqs=True)
@@ -1027,8 +1027,8 @@ class SimpleBackbone(nn.Module):
             patch_size=patch_size,
             feature_grid_size=feature_grid_size,
             use_skip_connections=decoder_use_skip_connections,
-            predict_confidence=predict_confidence,
-            detach_conf_features=detach_conf_features,
+            predict_sampling_map=predict_sampling_map,
+            detach_sampling_features=detach_sampling_features,
             scale_embed_dim=embed_dim,  # Match scale_encoder output
         )
 
@@ -1142,14 +1142,14 @@ class SimpleBackbone(nn.Module):
         )
 
         # Decode with resolution conditioning
-        seg_pred, conf_pred = self.decoder(attended, skips, scale_embed)
+        seg_pred, sampling_map = self.decoder(attended, skips, scale_embed)
 
         result = {
             'mask_patch_logit_preds': seg_pred,
         }
 
-        if conf_pred is not None:
-            result['confidence_preds'] = conf_pred
+        if sampling_map is not None:
+            result['sampling_map'] = sampling_map
 
         if extras is not None:
             result['attn_weights'] = extras['attn_weights']

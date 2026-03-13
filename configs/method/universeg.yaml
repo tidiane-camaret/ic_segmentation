@@ -3,7 +3,7 @@
 
 method: "universeg"
 training:
-  mixed_precision: no
+  mixed_precision: "no"
 model:
   universeg:
     pretrained: true

@@ -165,44 +165,35 @@ def extract_patch_features(
     return patch_features
 
 
-def compute_entropy_confidence(
+def compute_entropy_sampling_map(
     logits: torch.Tensor,
     temperature: float | torch.Tensor = 1.0,
 ) -> torch.Tensor:
-    """Compute confidence from binary prediction entropy.
+    """Compute sampling map from binary prediction entropy.
 
-    Confidence = 1 - H(p)/log(2), where H(p) = -(p*log(p) + (1-p)*log(1-p)).
-    Fully differentiable. Returns 1 near p=0 or p=1, 0 at p=0.5.
-
-    Temperature scaling improves calibration:
-    - T > 1.0: softens logits -> lower confidence (good for overconfident models)
-    - T < 1.0: sharpens logits -> higher confidence
-    - T = 1.0: no scaling (default)
+    Returns 1 - H(p)/log(2), where H(p) = -(p*log(p) + (1-p)*log(1-p)).
+    High values (near 1) where predictions are confident (p near 0 or 1).
+    Low values (near 0) where predictions are uncertain (p near 0.5).
 
     Args:
         logits: [B, K, C, H, W] - raw prediction logits
-        temperature: temperature for logit scaling (default 1.0), can be learnable tensor
+        temperature: temperature for logit scaling (default 1.0)
 
     Returns:
-        confidence: [B, K, 1, H, W] - confidence in [0, 1]
+        sampling_map: [B, K, 1, H, W] - values in [0, 1]
     """
-    # Apply temperature scaling before sigmoid (supports learnable tensor)
     is_unit_temp = (temperature == 1.0) if isinstance(temperature, (int, float)) else False
     scaled_logits = logits if is_unit_temp else logits / temperature
 
-    # Compute entropy in fp32 for numerical stability (critical for fp16 training)
-    # Then cast back to original dtype
     orig_dtype = scaled_logits.dtype
     p = torch.sigmoid(scaled_logits.float())
     p = p.clamp(1e-6, 1 - 1e-6)
     entropy = -(p * p.log() + (1 - p) * (1 - p).log())
-    # Normalize by max entropy (log(2)) so output is in [0, 1]
     normalized_entropy = entropy / math.log(2)
-    confidence = (1.0 - normalized_entropy).to(orig_dtype)
-    # If multi-channel, take mean across channels -> [B, K, 1, H, W]
-    if confidence.shape[2] > 1:
-        confidence = confidence.mean(dim=2, keepdim=True)
-    return confidence
+    sampling_map = (1.0 - normalized_entropy).to(orig_dtype)
+    if sampling_map.shape[2] > 1:
+        sampling_map = sampling_map.mean(dim=2, keepdim=True)
+    return sampling_map
 
 
 class PatchICL(nn.Module):
@@ -307,6 +298,8 @@ class PatchICL(nn.Module):
             num_patches = level_cfg['num_patches']
             num_patches_val = level_cfg.get('num_patches_val', num_patches)
             # Target sampler
+            # spread_sigma_target overrides spread_sigma for target patches
+            target_spread = level_cfg.get('spread_sigma_target', level_cfg.get('spread_sigma', 0.0))
             self.samplers.append(create_sampler(
                 sampler_type=level_sampler_type,
                 patch_size=level_cfg['patch_size'],
@@ -317,10 +310,11 @@ class PatchICL(nn.Module):
                 augmenter=self.augmenter,
                 pad_before=level_cfg.get('pad_before'),
                 pad_after=level_cfg.get('pad_after'),
-                spread_sigma=level_cfg.get('spread_sigma', 0.0),
+                spread_sigma=target_spread,
             ))
             # Context sampler (uses num_context_patches if specified, else same as target)
-            # For sliding_window: context_stride controls patch count (stride takes precedence)
+            # spread_sigma_context overrides spread_sigma for context patches
+            context_spread = level_cfg.get('spread_sigma_context', level_cfg.get('spread_sigma', 0.0))
             num_context_patches = level_cfg.get('num_context_patches', num_patches)
             num_context_patches_val = level_cfg.get('num_context_patches_val', num_context_patches)
             context_stride = level_cfg.get('context_stride', level_stride)
@@ -334,7 +328,7 @@ class PatchICL(nn.Module):
                 augmenter=self.augmenter,
                 pad_before=level_cfg.get('pad_before'),
                 pad_after=level_cfg.get('pad_after'),
-                spread_sigma=level_cfg.get('spread_sigma', 0.0),
+                spread_sigma=context_spread,
             ))
         self.sampler = self.samplers[0]  # backward compat
 
@@ -386,49 +380,40 @@ class PatchICL(nn.Module):
         while len(self.level_loss_weights) < self.num_levels:
             self.level_loss_weights.append(1.0)
 
-        # Confidence method: "learned" (CNN head) or "entropy" (from prediction logits)
-        conf_cfg = loss_cfg.get('confidence', {})
-        self.confidence_method = conf_cfg.get('method', 'learned')
-        assert self.confidence_method in ('learned', 'entropy'), \
-            f"confidence.method must be 'learned' or 'entropy', got '{self.confidence_method}'"
+        # Sampling map config - controls the auxiliary head that guides next-level sampling
+        # Source: "learned" (CNN head), "entropy" (from logits), "none" (disabled)
+        sampling_map_cfg = config.get('sampling_map', {})
+        self.sampling_map_source = sampling_map_cfg.get('source', 'none')
+        assert self.sampling_map_source in ('learned', 'entropy', 'none'), \
+            f"sampling_map.source must be 'learned', 'entropy', or 'none', got '{self.sampling_map_source}'"
 
-        # Temperature scaling for entropy confidence (calibration)
-        # T > 1.0 softens overconfident predictions, T < 1.0 sharpens
-        # Can be learned via learn_temperature: true
-        init_temp = conf_cfg.get('temperature', 1.0)
-        self.learn_temperature = conf_cfg.get('learn_temperature', False)
+        # Temperature for entropy-based sampling map
+        init_temp = sampling_map_cfg.get('temperature', 1.0)
+        self.learn_temperature = sampling_map_cfg.get('learn_temperature', False)
         if self.learn_temperature:
-            # Store log(T) as learnable parameter; T = exp(log_T) ensures T > 0
             self._log_temperature = nn.Parameter(torch.tensor(math.log(init_temp)))
         else:
             self.register_buffer('_log_temperature', torch.tensor(math.log(init_temp)))
 
-        # Confidence loss config
-        self.confidence_enabled = conf_cfg.get('enabled', False)
-        self.confidence_supervision_weight = conf_cfg.get('supervision_weight', 0.0)
-        self.confidence_boundary_weight = conf_cfg.get('boundary_weight', 0.0)
-        self.confidence_boundary_width = conf_cfg.get('boundary_width', 2)
-        self.use_confidence_weighted_seg = conf_cfg.get('weighted_seg', False)
+        # Training objectives for sampling map (only when source="learned")
+        objectives_cfg = sampling_map_cfg.get('objectives', {})
+        self.sampling_map_uncertainty_weight = objectives_cfg.get('uncertainty', 0.0)
+        self.sampling_map_boundary_weight = objectives_cfg.get('boundary_penalty', 0.0)
+        self.sampling_map_boundary_width = objectives_cfg.get('boundary_width', 2)
 
-        # Initialize confidence loss functions (only for learned method)
-        if self.confidence_enabled and self.confidence_method == 'learned':
-            from src.losses import ConfidenceSupervisionLoss, BoundaryConfidenceLoss
-            self.conf_supervision_loss = ConfidenceSupervisionLoss()
-            self.conf_boundary_loss = BoundaryConfidenceLoss(
+        # Initialize boundary loss if needed
+        if self.sampling_map_source == 'learned' and self.sampling_map_boundary_weight > 0:
+            from src.losses import BoundaryConfidenceLoss
+            self.sampling_map_boundary_loss = BoundaryConfidenceLoss(
                 patch_size=self.patch_size,
-                border_width=self.confidence_boundary_width,
+                border_width=self.sampling_map_boundary_width,
             )
 
-        # Cascade confidence blending config
+        # Cascade config
         cascade_cfg = config.get('cascade', {})
-        self.confidence_blend = cascade_cfg.get('confidence_blend', False)
+        self.sampling_map_blend = cascade_cfg.get('sampling_map_blend', False)
         self.use_learned_alpha = cascade_cfg.get('learned_alpha', False)
-        self.conf_weighted_aggreg = cascade_cfg.get('conf_weighted_aggreg', False)
-
-        # Initialize confidence-weighted segmentation loss if enabled (for patch or aggreg)
-        if self.use_confidence_weighted_seg or self.conf_weighted_aggreg:
-            from src.losses import ConfidenceWeightedDiceLoss
-            self.conf_weighted_seg_loss = ConfidenceWeightedDiceLoss()
+        self.additive_fusion = cascade_cfg.get('additive_fusion', False)
 
         # Backbone (shared across levels, with level embedding)
         backbone_cfg = config.get('backbone', {})
@@ -455,8 +440,8 @@ class PatchICL(nn.Module):
             use_mask_prior=backbone_cfg.get('use_mask_prior', False),
             mask_fusion_type=backbone_cfg.get('mask_fusion_type', 'additive'),
             use_context_mask=backbone_cfg.get('use_context_mask', False),
-            predict_confidence=backbone_cfg.get('predict_confidence', False),
-            detach_conf_features=backbone_cfg.get('detach_conf_features', False),
+            predict_sampling_map=(self.sampling_map_source == 'learned'),
+            detach_sampling_features=sampling_map_cfg.get('detach_features', True),
         )
 
         # Alpha predictor for learned level combination (simple linear on pooled registers)
@@ -488,7 +473,7 @@ class PatchICL(nn.Module):
         return alpha.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
 
     @property
-    def confidence_temperature(self) -> torch.Tensor:
+    def sampling_map_temperature(self) -> torch.Tensor:
         """Get current temperature value (always positive via exp)."""
         return self._log_temperature.exp()
 
@@ -504,6 +489,34 @@ class PatchICL(nn.Module):
     def set_epoch(self, epoch: int):
         """Set current epoch for oracle scheduling."""
         self._current_epoch = epoch
+
+    def _get_patch_sampling_map(
+        self,
+        backbone_out: dict,
+        patch_logits: torch.Tensor,
+        K: int,
+    ) -> torch.Tensor | None:
+        """Get per-patch sampling map based on configured source.
+
+        Args:
+            backbone_out: Output dict from backbone
+            patch_logits: [B, K, C, ps, ps] - patch prediction logits
+            K: Number of target patches
+
+        Returns:
+            patch_sampling_map: [B, K, 1, ps, ps] or None if source='none'
+        """
+        if self.sampling_map_source == 'none':
+            return None
+        elif self.sampling_map_source == 'entropy':
+            return compute_entropy_sampling_map(
+                patch_logits, temperature=self.sampling_map_temperature
+            )
+        else:  # 'learned'
+            learned_map = backbone_out.get('sampling_map')
+            if learned_map is not None:
+                return learned_map[:, :K]
+            return None
 
     def _get_oracle_probability(self, level_idx: int) -> float:
         """Compute oracle sampling probability with scheduled decay.
@@ -612,6 +625,7 @@ class PatchICL(nn.Module):
                 - "gt_foreground": Sample from foreground (default)
                 - "gt_border": Sample from object borders (soft mask ≈ 0.5)
                 - "gt_entropy": Sample from high-entropy regions of soft GT
+                - "gt_foreground_entropy_balanced": Equal weight to center (foreground) and border (entropy)
 
         Returns:
             sampling_weights: [B, 1, H, W] - weights for patch sampling
@@ -636,6 +650,14 @@ class PatchICL(nn.Module):
             fg_mask = (soft_mask > 0.1).float()
             return (border_score * fg_mask).to(orig_dtype)
 
+        elif mode == 'gt_foreground_entropy_balanced':
+            # Equal weight to center (foreground) and border (entropy)
+            center_weight = soft_mask  # High where p≈1
+            entropy = -(soft_mask * soft_mask.log() + (1 - soft_mask) * (1 - soft_mask).log())
+            entropy = entropy / math.log(2)  # Normalize to [0, 1]
+            combined = 0.5 * center_weight + 0.5 * entropy
+            return combined.to(orig_dtype)
+
         else:
             # Unknown mode, fallback to foreground
             return gt_mask
@@ -643,45 +665,55 @@ class PatchICL(nn.Module):
     def _compute_prediction_sampling_weights(
         self,
         pred_logits: torch.Tensor,
-        confidence: torch.Tensor | None,
+        sampling_map: torch.Tensor | None,
         mode: str = 'predicted_uncertainty',
     ) -> torch.Tensor:
         """Compute sampling weights from model predictions.
 
         Args:
             pred_logits: [B, C, H, W] - prediction logits from previous level
-            confidence: [B, 1, H, W] - confidence map from previous level (or None)
+            sampling_map: [B, 1, H, W] - sampling map from previous level (or None)
             mode: Prediction-based sampling strategy:
-                - "predicted_uncertainty": Sample from 1 - confidence (low confidence)
-                - "predicted_entropy": Sample from entropy of prediction logits
+                - "sampling_map": Use 1 - sampling_map directly (sample uncertain regions)
+                - "predicted_entropy": Compute entropy from prediction logits
+                - "predicted_foreground_entropy_balanced": 50% foreground + 50% entropy
 
         Returns:
             sampling_weights: [B, 1, H, W] - weights for patch sampling
         """
         orig_dtype = pred_logits.dtype
 
-        if mode == 'predicted_uncertainty':
-            if confidence is not None:
-                # Sample from low confidence regions
-                return (1.0 - confidence).to(orig_dtype)
+        if mode == 'sampling_map':
+            if sampling_map is not None:
+                # Sample from low-value regions (high uncertainty)
+                return (1.0 - sampling_map).to(orig_dtype)
             else:
-                # Fallback: use prediction probabilities as weights
+                # Fallback: use prediction probabilities
                 return torch.sigmoid(pred_logits).to(orig_dtype)
 
         elif mode == 'predicted_entropy':
-            # Compute entropy from prediction logits
             pred_prob = torch.sigmoid(pred_logits.float()).clamp(1e-6, 1 - 1e-6)
             entropy = -(pred_prob * pred_prob.log() + (1 - pred_prob) * (1 - pred_prob).log())
-            entropy = entropy / math.log(2)  # Normalize to [0, 1]
-            # Take max across channels if multi-channel
+            entropy = entropy / math.log(2)
             if entropy.shape[1] > 1:
                 entropy = entropy.max(dim=1, keepdim=True)[0]
             return entropy.to(orig_dtype)
 
+        elif mode == 'predicted_foreground_entropy_balanced':
+            pred_prob = torch.sigmoid(pred_logits.float()).clamp(1e-6, 1 - 1e-6)
+            center_weight = pred_prob
+            entropy = -(pred_prob * pred_prob.log() + (1 - pred_prob) * (1 - pred_prob).log())
+            entropy = entropy / math.log(2)
+            if center_weight.shape[1] > 1:
+                center_weight = center_weight.max(dim=1, keepdim=True)[0]
+                entropy = entropy.max(dim=1, keepdim=True)[0]
+            combined = 0.5 * center_weight + 0.5 * entropy
+            return combined.to(orig_dtype)
+
         else:
-            # Unknown mode, fallback to uncertainty
-            if confidence is not None:
-                return (1.0 - confidence).to(orig_dtype)
+            # Unknown mode, fallback to sampling_map or entropy
+            if sampling_map is not None:
+                return (1.0 - sampling_map).to(orig_dtype)
             return torch.sigmoid(pred_logits).to(orig_dtype)
 
     def _create_coverage_mask(
@@ -814,7 +846,7 @@ class PatchICL(nn.Module):
         Returns:
             level_out: Dict with all level outputs (patches, logits, coords, etc.)
             pred: Aggregated prediction logits [B, C, resolution, resolution]
-            aggregated_conf: Aggregated confidence map or None
+            aggregated_sampling_map: Aggregated sampling map or None
         """
         level_cfg = self.levels[level_idx]
         resolution = level_cfg['resolution']
@@ -968,15 +1000,8 @@ class PatchICL(nn.Module):
             patch_logits = all_logits[:, :K]
             context_patch_logits = all_logits[:, K:]
 
-            # Extract confidence predictions (only for target patches - context doesn't use confidence)
-            all_confidence = backbone_out.get('confidence_preds')
-            patch_confidence = None
-            if self.confidence_method == 'entropy':
-                patch_confidence = compute_entropy_confidence(
-                    patch_logits, temperature=self.confidence_temperature
-                )
-            elif all_confidence is not None:
-                patch_confidence = all_confidence[:, :K]
+            # Extract sampling map (only for target patches)
+            patch_sampling_map = self._get_patch_sampling_map(backbone_out, patch_logits, K)
 
             # Aggregate context predictions
             context_preds = []
@@ -1007,26 +1032,21 @@ class PatchICL(nn.Module):
                 prev_register_tokens=prev_register_tokens,
             )
             patch_logits = backbone_out['mask_patch_logit_preds']
-            if self.confidence_method == 'entropy':
-                patch_confidence = compute_entropy_confidence(
-                    patch_logits, temperature=self.confidence_temperature
-                )
-            else:
-                patch_confidence = backbone_out.get('confidence_preds')
+            patch_sampling_map = self._get_patch_sampling_map(backbone_out, patch_logits, K)
 
         # Apply inverse augmentation and aggregate
         patch_logits_for_agg = patch_logits
         if self.augmenter is not None and aug_params:
             patch_logits_for_agg = self.augmenter.inverse(patch_logits, aug_params)
 
-        # Aggregate with confidence if available
-        aggregated_conf = None
-        if patch_confidence is not None:
+        # Aggregate with sampling_map if available
+        aggregated_sampling_map = None
+        if patch_sampling_map is not None:
             agg_result = aggregator(
                 patch_logits_for_agg, coords, (resolution, resolution),
-                confidence=patch_confidence
+                sampling_map=patch_sampling_map
             )
-            pred, aggregated_conf = agg_result
+            pred, aggregated_sampling_map = agg_result
         else:
             pred = aggregator(patch_logits_for_agg, coords, (resolution, resolution))
 
@@ -1049,11 +1069,11 @@ class PatchICL(nn.Module):
             'register_tokens': backbone_out.get('register_tokens'),
             'patch_size': patch_size,
             'level_res': resolution,
-            'confidence_preds': patch_confidence,
-            'aggregated_conf': aggregated_conf,
+            'patch_sampling_map': patch_sampling_map,
+            'aggregated_sampling_map': aggregated_sampling_map,
         }
 
-        return level_out, pred, aggregated_conf
+        return level_out, pred, aggregated_sampling_map
 
     def forward(
         self,
@@ -1080,7 +1100,7 @@ class PatchICL(nn.Module):
 
         # Process each level with progressive refinement
         combined_pred = None  # Progressively refined prediction
-        combined_conf = None  # Progressively refined confidence
+        combined_sampling_map = None  # Progressively refined sampling map
         prev_register_tokens = None  # Register tokens from previous level (for cascade_registers)
         level_outputs = []
 
@@ -1115,11 +1135,11 @@ class PatchICL(nn.Module):
             if combined_pred is not None:
                 # Detach to prevent sampling from affecting prediction gradients
                 pred_detached = combined_pred.detach() if self.detach_between_levels else combined_pred
-                conf_detached = combined_conf.detach() if (combined_conf is not None and self.detach_between_levels) else combined_conf
+                map_detached = combined_sampling_map.detach() if (combined_sampling_map is not None and self.detach_between_levels) else combined_sampling_map
 
                 # Compute weights at combined_pred resolution, then resize
                 model_weights_fullres = self._compute_prediction_sampling_weights(
-                    pred_detached, conf_detached, mode=self.target_model_mode,
+                    pred_detached, map_detached, mode=self.target_model_mode,
                 )
                 model_weights = F.interpolate(
                     model_weights_fullres, size=(resolution, resolution),
@@ -1152,7 +1172,7 @@ class PatchICL(nn.Module):
             if i > 0 and combined_pred is not None:
                 mask_prior = combined_pred.detach() if self.detach_between_levels else combined_pred
 
-            level_out, pred, aggregated_conf = self._forward_level(
+            level_out, pred, aggregated_sampling_map = self._forward_level(
                 level_idx=i,
                 image=image,
                 labels=labels,
@@ -1180,79 +1200,79 @@ class PatchICL(nn.Module):
             coverage = self._create_coverage_mask(coords, patch_size, (resolution, resolution))
 
             if combined_pred is not None:
-                # Upsample previous combined prediction and confidence to current resolution
-                # Detach to prevent level N+1 loss from affecting level N representations
+                # Upsample previous combined prediction and sampling_map to current resolution
                 prev_pred = combined_pred.detach() if self.detach_between_levels else combined_pred
                 combined_upsampled = F.interpolate(
                     prev_pred, size=(resolution, resolution),
                     mode='bilinear', align_corners=False
                 )
-                conf_upsampled = None
-                if combined_conf is not None:
-                    prev_conf = combined_conf.detach() if self.detach_between_levels else combined_conf
-                    conf_upsampled = F.interpolate(
-                        prev_conf, size=(resolution, resolution),
+                map_upsampled = None
+                if combined_sampling_map is not None:
+                    prev_map = combined_sampling_map.detach() if self.detach_between_levels else combined_sampling_map
+                    map_upsampled = F.interpolate(
+                        prev_map, size=(resolution, resolution),
                         mode='bilinear', align_corners=False
                     )
 
                 # Use larger epsilon for fp16 numerical stability
                 eps = 1e-4 if pred.dtype == torch.float16 else 1e-6
 
-                # Learned alpha combination (new approach)
-                if self.use_learned_alpha and aggregated_conf is not None and conf_upsampled is not None:
-                    # Compute α from current level's register tokens
+                # Learned alpha combination
+                if self.use_learned_alpha and aggregated_sampling_map is not None and map_upsampled is not None:
                     alpha = self.compute_alpha(register_tokens)
                     if alpha is None:
                         alpha = torch.tensor(0.5, device=pred.device)
 
-                    # Store alpha for logging
                     level_out['alpha'] = alpha
 
-                    # Detach predictions, keep gradients for confidence
                     pred_detached = pred.detach()
                     prev_pred_detached = combined_upsampled.detach()
 
-                    # Confidence-weighted combination:
-                    # pred_comb = (α × pred_l × conf_l + (1-α) × pred_prev × conf_prev) / (α × conf_l + (1-α) × conf_prev)
-                    weighted_curr = alpha * pred_detached * aggregated_conf
-                    weighted_prev = (1 - alpha) * prev_pred_detached * conf_upsampled
-                    conf_weight_sum = alpha * aggregated_conf + (1 - alpha) * conf_upsampled + eps
+                    # Sampling-map-weighted combination
+                    weighted_curr = alpha * pred_detached * aggregated_sampling_map
+                    weighted_prev = (1 - alpha) * prev_pred_detached * map_upsampled
+                    map_weight_sum = alpha * aggregated_sampling_map + (1 - alpha) * map_upsampled + eps
 
-                    # In covered regions: use weighted combination; uncovered: use previous
-                    blended_pred = (weighted_curr + weighted_prev) / conf_weight_sum
+                    blended_pred = (weighted_curr + weighted_prev) / map_weight_sum
                     combined_pred = coverage * blended_pred + (1 - coverage) * combined_upsampled
 
-                    # Confidence combination: α × conf_l + (1-α) × conf_prev
-                    blended_conf = alpha * aggregated_conf + (1 - alpha) * conf_upsampled
-                    combined_conf = coverage * blended_conf + (1 - coverage) * conf_upsampled
+                    blended_map = alpha * aggregated_sampling_map + (1 - alpha) * map_upsampled
+                    combined_sampling_map = coverage * blended_map + (1 - coverage) * map_upsampled
 
-                # Legacy confidence blend (relative confidence weighting)
-                # Detach everything: blend is a heuristic, not an optimization target
-                elif self.confidence_blend and combined_conf is not None and aggregated_conf is not None:
-                    # Relative weight: current_conf / (current_conf + prev_conf)
-                    # Detach confidences to prevent blend from affecting confidence learning
-                    conf_curr = aggregated_conf.detach()
-                    conf_prev = conf_upsampled.detach()
-                    relative_current = conf_curr / (conf_curr + conf_prev + eps)
+                # Additive fusion: direct logit addition
+                elif self.additive_fusion:
+                    combined_pred = combined_upsampled + coverage * pred
+                    if aggregated_sampling_map is not None:
+                        if map_upsampled is not None:
+                            # Weighted average: current level overrides previous in covered regions
+                            combined_sampling_map = coverage * aggregated_sampling_map + (1 - coverage) * map_upsampled
+                        else:
+                            combined_sampling_map = aggregated_sampling_map
+
+                # Sampling map blend (relative weighting)
+                elif self.sampling_map_blend and combined_sampling_map is not None and aggregated_sampling_map is not None:
+                    map_curr = aggregated_sampling_map.detach()
+                    map_prev = map_upsampled.detach()
+                    relative_current = map_curr / (map_curr + map_prev + eps)
                     blend_weight = coverage * relative_current
                     combined_pred = blend_weight * pred + (1 - blend_weight) * combined_upsampled
-                    combined_conf = coverage * torch.max(aggregated_conf, conf_upsampled) + (1 - coverage) * conf_upsampled
+                    combined_sampling_map = coverage * torch.max(aggregated_sampling_map, map_upsampled) + (1 - coverage) * map_upsampled
 
                 else:
-                    # Standard coverage-based blending
+                    # Standard coverage-based blending (default)
                     combined_pred = coverage * pred + (1 - coverage) * combined_upsampled
-                    if aggregated_conf is not None:
-                        if conf_upsampled is not None:
-                            combined_conf = coverage * aggregated_conf + (1 - coverage) * conf_upsampled
+                    if aggregated_sampling_map is not None:
+                        if map_upsampled is not None:
+                            combined_sampling_map = coverage * aggregated_sampling_map + (1 - coverage) * map_upsampled
                         else:
-                            combined_conf = aggregated_conf
+                            combined_sampling_map = aggregated_sampling_map
             else:
                 combined_pred = pred
-                combined_conf = aggregated_conf
+                combined_sampling_map = aggregated_sampling_map
 
-            # Store combined prediction for loss computation (provides gradient for alpha)
+            # Store combined prediction for loss computation
             level_out['combined_pred'] = combined_pred
-            level_out['combined_conf'] = combined_conf
+            level_out['combined_sampling_map'] = combined_sampling_map
 
             level_out['refined_probs'] = refined_probs  # Probs used for sampling (after refinement)
             level_out['coverage_mask'] = coverage  # Reuse coverage computed earlier
@@ -1262,17 +1282,17 @@ class PatchICL(nn.Module):
         final_pred = F.interpolate(combined_pred, size=(H, W), mode='bilinear', align_corners=False)
         coarse_pred = F.interpolate(level_outputs[0]['pred'], size=(H, W), mode='bilinear', align_corners=False)
 
-        # Final confidence map
-        final_conf = None
-        if combined_conf is not None:
-            final_conf = F.interpolate(combined_conf, size=(H, W), mode='bilinear', align_corners=False)
+        # Final sampling map
+        final_sampling_map = None
+        if combined_sampling_map is not None:
+            final_sampling_map = F.interpolate(combined_sampling_map, size=(H, W), mode='bilinear', align_corners=False)
 
         # Backward compat aliases from last level
         last = level_outputs[-1]
         return {
             'final_pred': final_pred,
             'final_logit': final_pred,
-            'final_conf': final_conf,
+            'final_sampling_map': final_sampling_map,
             'coarse_pred': coarse_pred,
             'level_outputs': level_outputs,
             'patches': last['patches'],
@@ -1335,48 +1355,34 @@ class PatchICL(nn.Module):
             patch_logits = level_out['patch_logits']
             patch_labels = level_out['patch_labels']
             target_validity = level_out.get('target_validity')
-            conf_preds = level_out.get('confidence_preds')
+            patch_sampling_map = level_out.get('patch_sampling_map')
             K = patch_logits.shape[1]
 
-            # Use confidence-weighted loss if enabled and confidence available
-            if self.use_confidence_weighted_seg and conf_preds is not None:
-                # Reshape for loss: [B*K, C, ps, ps]
-                logits_flat = patch_logits.reshape(B * K, *patch_logits.shape[2:])
-                labels_flat = patch_labels.reshape(B * K, *patch_labels.shape[2:])
-                conf_flat = conf_preds.reshape(B * K, *conf_preds.shape[2:])
-                target_patch_loss = self.conf_weighted_seg_loss(
-                    logits_flat, labels_flat, conf_flat
-                )
-            else:
-                target_patch_loss = self._masked_patch_loss(
-                    patch_logits.reshape(B * K, -1),
-                    patch_labels.reshape(B * K, -1),
-                    target_validity.reshape(B * K, -1) if target_validity is not None else None,
-                )
+            target_patch_loss = self._masked_patch_loss(
+                patch_logits.reshape(B * K, -1),
+                patch_labels.reshape(B * K, -1),
+                target_validity.reshape(B * K, -1) if target_validity is not None else None,
+            )
             losses[f'level_{i}_target_patch_loss'] = target_patch_loss
             total_loss = total_loss + lw * self.loss_weights['target_patch'] * target_patch_loss
             sum_target_patch = sum_target_patch + target_patch_loss
 
             # Target aggreg loss
             pred = level_out['pred']
-            aggregated_conf = level_out.get('aggregated_conf')
             level_res = pred.shape[-2:]
             labels_ds = _resize_label(labels.float(), size=level_res)
-
-            # Confidence-weighted aggreg loss: model penalized more where confident
-            if self.conf_weighted_aggreg and aggregated_conf is not None:
-                target_aggreg_loss = self.conf_weighted_seg_loss(pred, labels_ds, aggregated_conf)
-            else:
-                target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
+            target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
 
             losses[f'level_{i}_target_aggreg_loss'] = target_aggreg_loss
             total_loss = total_loss + lw * self.loss_weights['target_aggreg'] * target_aggreg_loss
             sum_target_aggreg = sum_target_aggreg + target_aggreg_loss
 
-            # Combined prediction loss (provides gradient for alpha in learned combination)
+            # Combined prediction loss (supervises the fused multi-level output)
+            # For additive_fusion: provides gradient through combined = prev + coverage * pred
+            # For learned_alpha: provides gradient for alpha head
             # Only for levels > 0 where combination actually happens
             combined_pred = level_out.get('combined_pred')
-            if i > 0 and self.use_learned_alpha and combined_pred is not None:
+            if i > 0 and (self.additive_fusion or self.use_learned_alpha) and combined_pred is not None:
                 combined_loss_weight = self.loss_weights['target_combined']
                 if combined_loss_weight > 0:
                     # Reuse labels_ds if combined_pred is at same resolution (common case)
@@ -1387,41 +1393,31 @@ class PatchICL(nn.Module):
                     total_loss = total_loss + lw * combined_loss_weight * target_combined_loss
                     sum_target_combined = sum_target_combined + target_combined_loss
 
-            # Confidence supervision loss: hybrid of structural uncertainty + prediction error
-            # Low confidence if EITHER at GT borders OR prediction is wrong
-            if self.confidence_supervision_weight > 0 and conf_preds is not None:
-                # conf_preds: [B, K, 1, ps, ps], patch_logits: [B, K, C, ps, ps]
+            # Sampling map training objectives (only for source='learned')
+            if self.sampling_map_source == 'learned' and patch_sampling_map is not None:
+                # Uncertainty objective: map should be high where prediction is correct
+                if self.sampling_map_uncertainty_weight > 0:
+                    # Target: high value where confident (low GT entropy AND low pred error)
+                    soft_gt = patch_labels.float().clamp(1e-6, 1 - 1e-6)
+                    gt_entropy = -(soft_gt * soft_gt.log() + (1 - soft_gt) * (1 - soft_gt).log())
+                    gt_entropy = gt_entropy / math.log(2)
 
-                # 1. Structural uncertainty from GT (stable target, matches oracle)
-                # patch_labels are soft [0,1] from area pooling, high entropy at borders
-                soft_gt = patch_labels.float().clamp(1e-6, 1 - 1e-6)
-                gt_entropy = -(soft_gt * soft_gt.log() + (1 - soft_gt) * (1 - soft_gt).log())
-                gt_entropy = gt_entropy / math.log(2)  # Normalize to [0, 1]
+                    pred_error = torch.abs(torch.sigmoid(patch_logits.detach()) - patch_labels)
+                    uncertainty = torch.maximum(gt_entropy, pred_error)
+                    map_target = 1.0 - uncertainty
 
-                # 2. Prediction error (adaptive target, captures model-specific failures)
-                pred_error = torch.abs(torch.sigmoid(patch_logits.detach()) - patch_labels)
+                    if map_target.shape[2] > 1:
+                        map_target = map_target.mean(dim=2, keepdim=True)
 
-                # 3. Combine: high uncertainty if EITHER structurally uncertain OR wrong
-                uncertainty = torch.maximum(gt_entropy, pred_error)
-                conf_target = 1.0 - uncertainty
+                    uncertainty_loss = F.mse_loss(patch_sampling_map, map_target.detach())
+                    losses[f'level_{i}_sampling_map_uncertainty_loss'] = uncertainty_loss
+                    total_loss = total_loss + lw * self.sampling_map_uncertainty_weight * uncertainty_loss
 
-                # Handle multi-channel: average across channels
-                if conf_target.shape[2] > 1:
-                    conf_target = conf_target.mean(dim=2, keepdim=True)
-
-                conf_sup_loss = F.mse_loss(conf_preds, conf_target.detach())
-                losses[f'level_{i}_conf_supervision_loss'] = conf_sup_loss
-                total_loss = total_loss + lw * self.confidence_supervision_weight * conf_sup_loss
-
-                # Log components for debugging
-                losses[f'level_{i}_conf_gt_entropy_mean'] = gt_entropy.mean().detach()
-                losses[f'level_{i}_conf_pred_error_mean'] = pred_error.mean().detach()
-
-                # Boundary confidence penalty (penalize high confidence at patch borders)
-                if self.confidence_boundary_weight > 0:
-                    conf_boundary_loss = self.conf_boundary_loss(conf_preds)
-                    losses[f'level_{i}_conf_boundary_loss'] = conf_boundary_loss
-                    total_loss = total_loss + lw * self.confidence_boundary_weight * conf_boundary_loss
+                # Boundary penalty: penalize high values at patch borders
+                if self.sampling_map_boundary_weight > 0:
+                    boundary_loss = self.sampling_map_boundary_loss(patch_sampling_map)
+                    losses[f'level_{i}_sampling_map_boundary_loss'] = boundary_loss
+                    total_loss = total_loss + lw * self.sampling_map_boundary_weight * boundary_loss
 
             # Log alpha if using learned combination
             alpha = level_out.get('alpha')
@@ -1479,8 +1475,8 @@ class PatchICL(nn.Module):
         losses['total_loss'] = total_loss
 
         # Log learned temperature if applicable
-        if self.confidence_method == 'entropy':
-            losses['confidence_temperature'] = self.confidence_temperature.detach()
+        if self.sampling_map_source == 'entropy':
+            losses['sampling_map_temperature'] = self.sampling_map_temperature.detach()
 
         # Log oracle scheduling probabilities if enabled
         if self.oracle_sched_enabled:

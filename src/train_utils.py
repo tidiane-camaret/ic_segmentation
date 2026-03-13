@@ -64,13 +64,13 @@ def _save_sample_images(
     """Save sample images with patches to disk.
 
     Layout: One row per level with columns:
-    [Ctx1, Ctx2, Target, Pred, Conf, Level Pred+GT, Combined+GT, Next SampW]
+    [Ctx1, Ctx2, Target, Pred, SampMap, Level Pred+GT, Combined+GT, Next SampW]
 
     - Pred: Raw level prediction probabilities
-    - Conf: Level confidence map
+    - SampMap: Level sampling map (guides next level patch selection)
     - Level Pred+GT: Binary level prediction with GT contour (at level resolution)
     - Combined+GT: Combined prediction (blended with previous levels) with GT contour
-    - Next SampW: Sampling weights for next level (1-conf or sigmoid(combined))
+    - Next SampW: Sampling weights for next level (1 - sampling_map)
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
@@ -158,9 +158,9 @@ def _save_sample_images(
             l_level_res = level_info.get("level_res", 32)
             l_pred_probs = level_info.get("pred_probs")
             l_refined_probs = level_info.get("refined_probs")
-            l_aggregated_conf = level_info.get("aggregated_conf")
+            l_aggregated_sampling_map = level_info.get("aggregated_sampling_map")
             l_combined_pred = level_info.get("combined_pred")
-            l_combined_conf = level_info.get("combined_conf")
+            l_combined_sampling_map = level_info.get("combined_sampling_map")
 
             col_idx = 0
 
@@ -208,14 +208,14 @@ def _save_sample_images(
             row[col_idx].axis("off")
             col_idx += 1
 
-            # --- Level confidence map ---
-            if l_aggregated_conf is not None:
-                conf_img = l_aggregated_conf.squeeze().numpy()
-                im = row[col_idx].imshow(conf_img, cmap="viridis", vmin=0, vmax=1)
-                row[col_idx].set_title(f"Conf ({conf_img.shape[0]})")
+            # --- Level sampling map ---
+            if l_aggregated_sampling_map is not None:
+                map_img = l_aggregated_sampling_map.squeeze().numpy()
+                im = row[col_idx].imshow(map_img, cmap="viridis", vmin=0, vmax=1)
+                row[col_idx].set_title(f"SampMap ({map_img.shape[0]})")
                 fig.colorbar(im, ax=row[col_idx], fraction=0.046, pad=0.04)
             else:
-                row[col_idx].set_title("Conf N/A")
+                row[col_idx].set_title("SampMap N/A")
             row[col_idx].axis("off")
             col_idx += 1
 
@@ -276,15 +276,15 @@ def _save_sample_images(
             col_idx += 1
 
             # --- Next SampW: Sampling weights for next level ---
-            # At level i, next level uses: 1-combined_conf (if available) or refined_probs
+            # At level i, next level uses: 1-combined_sampling_map (if available) or refined_probs
             # refined_probs at level i was used TO SAMPLE level i (from level i-1 output)
-            # For viz, show what will guide level i+1: 1-combined_conf
+            # For viz, show what will guide level i+1: 1-combined_sampling_map
             next_samp_w = None
             samp_w_label = "Next SampW N/A"
-            if l_combined_conf is not None:
-                # Next level samples from LOW confidence regions
-                next_samp_w = 1.0 - l_combined_conf.squeeze().numpy()
-                samp_w_label = f"1-Conf ({next_samp_w.shape[0]})"
+            if l_combined_sampling_map is not None:
+                # Next level samples from LOW map value regions (high uncertainty)
+                next_samp_w = 1.0 - l_combined_sampling_map.squeeze().numpy()
+                samp_w_label = f"1-Map ({next_samp_w.shape[0]})"
             elif l_combined_pred is not None:
                 # Fallback: use combined prediction probabilities
                 next_samp_w = l_combined_pred.squeeze().numpy()
@@ -499,10 +499,10 @@ def _collect_sample_for_viz(
         pred_probs = torch.sigmoid(outputs["final_logit"][i]).detach().cpu()
     pred_binary = (pred_probs > PRED_THRESHOLD).float()
 
-    # Get final confidence map if available
-    final_conf = outputs.get("final_conf")
-    if final_conf is not None:
-        final_conf = final_conf[i].detach().cpu()
+    # Get final sampling map if available
+    final_sampling_map = outputs.get("final_sampling_map")
+    if final_sampling_map is not None:
+        final_sampling_map = final_sampling_map[i].detach().cpu()
 
     # Collect per-level info
     levels = []
@@ -520,17 +520,17 @@ def _collect_sample_for_viz(
         l_refined = level_out.get("refined_probs")
         if l_refined is not None:
             l_refined = l_refined[i].detach().cpu()
-        # Collect confidence maps
-        l_aggregated_conf = level_out.get("aggregated_conf")
-        if l_aggregated_conf is not None:
-            l_aggregated_conf = l_aggregated_conf[i].detach().cpu()
+        # Collect sampling maps
+        l_aggregated_sampling_map = level_out.get("aggregated_sampling_map")
+        if l_aggregated_sampling_map is not None:
+            l_aggregated_sampling_map = l_aggregated_sampling_map[i].detach().cpu()
         # Combined prediction (blended with previous levels)
         l_combined_pred = level_out.get("combined_pred")
         if l_combined_pred is not None:
             l_combined_pred = torch.sigmoid(l_combined_pred[i]).detach().cpu()
-        l_combined_conf = level_out.get("combined_conf")
-        if l_combined_conf is not None:
-            l_combined_conf = l_combined_conf[i].detach().cpu()
+        l_combined_sampling_map = level_out.get("combined_sampling_map")
+        if l_combined_sampling_map is not None:
+            l_combined_sampling_map = l_combined_sampling_map[i].detach().cpu()
         levels.append(
             {
                 "target_coords": l_coords,
@@ -539,9 +539,9 @@ def _collect_sample_for_viz(
                 "level_res": level_out.get("level_res", 32),
                 "pred_probs": l_pred_probs,
                 "refined_probs": l_refined,
-                "aggregated_conf": l_aggregated_conf,
+                "aggregated_sampling_map": l_aggregated_sampling_map,
                 "combined_pred": l_combined_pred,
-                "combined_conf": l_combined_conf,
+                "combined_sampling_map": l_combined_sampling_map,
             }
         )
 
@@ -556,7 +556,7 @@ def _collect_sample_for_viz(
             context_out[i].detach().cpu() if context_out is not None else None
         ),
         "levels": levels,
-        "final_conf": final_conf,
+        "final_sampling_map": final_sampling_map,
     }
 
 

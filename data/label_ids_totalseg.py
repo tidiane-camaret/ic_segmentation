@@ -351,13 +351,22 @@ category_map_mri = {
     "iliac_vena_right": "Vessels",
     "portal_vein_and_splenic_vein": "Vessels",
 }
-totalseg_dir = _get_data_dir_from_config() / "totalseg"
-print(f"totalseg_dir: {totalseg_dir}")
-labels_stats_df = pd.read_csv(totalseg_dir / "label_stats.csv", index_col="label_id")
-labels_stats_df.sort_values("occurrences", ascending=False)
 
-label_ids_train = labels_stats_df[labels_stats_df["split"] == "train"].index.tolist()
-label_ids_val = labels_stats_df[labels_stats_df["split"] == "val"].index.tolist()
+# Cache for label stats per modality
+_label_stats_cache = {}
+
+
+def _get_label_splits(modality="ct"):
+    """Load and cache label train/val splits for the given modality."""
+    if modality not in _label_stats_cache:
+        subdir = "totalsegmri" if modality == "mri" else "totalseg"
+        data_dir = _get_data_dir_from_config() / subdir
+        stats_df = pd.read_csv(data_dir / "label_stats.csv", index_col="label_id")
+        _label_stats_cache[modality] = {
+            "train": stats_df[stats_df["split"] == "train"].index.tolist(),
+            "val": stats_df[stats_df["split"] == "val"].index.tolist(),
+        }
+    return _label_stats_cache[modality]
 
 
 def get_label_ids(split="all", max_labels=None, modality="ct"):
@@ -368,14 +377,9 @@ def get_label_ids(split="all", max_labels=None, modality="ct"):
         max_labels: Optional limit on number of labels
         modality: "ct" or "mri"
     """
-    if modality == "mri":
-        mri_dir = _get_data_dir_from_config() / "totalsegmri"
-        mri_stats_df = pd.read_csv(mri_dir / "label_stats.csv", index_col="label_id")
-        train_labels = mri_stats_df[mri_stats_df["split"] == "train"].index.tolist()
-        val_labels = mri_stats_df[mri_stats_df["split"] == "val"].index.tolist()
-    else:
-        train_labels = label_ids_train
-        val_labels = label_ids_val
+    splits = _get_label_splits(modality)
+    train_labels = splits["train"]
+    val_labels = splits["val"]
 
     if split == "all":
         label_ids = train_labels + val_labels
