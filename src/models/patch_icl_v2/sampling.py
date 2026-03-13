@@ -216,7 +216,14 @@ class ContinuousSampler(nn.Module):
         pad_after: int | None = None,
         extract_patches: bool = False,
         spread_sigma: float = 0.0,
+        differentiable: bool = False,
     ):
+        """
+        Args:
+            differentiable: If True, use straight-through Gumbel-Softmax to enable
+                gradient flow through the sampling process. Outputs selection_probs
+                that can be used to weight patch contributions in aggregation.
+        """
         super().__init__()
         self.patch_size = patch_size
         self.num_patches = num_patches
@@ -228,6 +235,7 @@ class ContinuousSampler(nn.Module):
         self.pad_after = pad_after
         self.extract_patches = extract_patches
         self.spread_sigma = spread_sigma
+        self.differentiable = differentiable
 
         # Precompute Gaussian kernel if spreading is enabled
         if spread_sigma > 0:
@@ -258,8 +266,19 @@ class ContinuousSampler(nn.Module):
         labels: torch.Tensor,
         weights: torch.Tensor,
         patch_features: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict, torch.Tensor]:
-        """Sample K patches whose center is inside the image (may extend beyond borders)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict, torch.Tensor, int, torch.Tensor | None]:
+        """Sample K patches whose center is inside the image (may extend beyond borders).
+
+        Returns:
+            patches: [B, K, C, ps, ps] or None
+            patch_labels: [B, K, C_mask, ps, ps]
+            coords: [B, K, 2]
+            aug_features: augmented patch features or None
+            aug_params: dict
+            patch_validity: [B, K, 1, ps, ps]
+            K: number of patches
+            selection_probs: [B, K] soft selection probabilities (only if differentiable=True)
+        """
         B, C, H, W = image.shape
         C_mask = labels.shape[1]
         ps = self.patch_size
@@ -299,6 +318,9 @@ class ContinuousSampler(nn.Module):
         if self.spread_sigma > 0:
             pooled_weights = self._gaussian_blur(pooled_weights)
 
+        # For differentiable sampling, we'll compute soft selection probabilities
+        selection_probs = None
+
         # Apply stride to space out possible sampling positions
         if self.stride > 1:
             # Subsample pooled_weights at stride intervals
@@ -311,7 +333,17 @@ class ContinuousSampler(nn.Module):
             gumbel = (-torch.log(-torch.log(u))).to(flat_weights.dtype)
             scores = flat_weights + gumbel
             _, indices = torch.topk(scores, K, dim=1)
-            
+
+            # Differentiable selection: compute soft probabilities for selected patches
+            if self.differentiable and self.training:
+                # Straight-through Gumbel-Softmax: soft probs for backward, hard selection for forward
+                # Compute softmax over scores (Gumbel-Softmax)
+                soft_probs = F.softmax(scores, dim=1)  # [B, N]
+                # Gather soft probabilities for selected indices
+                selection_probs = soft_probs.gather(1, indices)  # [B, K]
+                # Normalize to sum to 1 (since we're only using K out of N)
+                selection_probs = selection_probs / (selection_probs.sum(dim=1, keepdim=True) + eps)
+
             # Map indices back to original coordinate space
             strided_w = pooled_weights_strided.shape[3]
             h_coords_strided = indices // strided_w
@@ -329,6 +361,13 @@ class ContinuousSampler(nn.Module):
             gumbel = (-torch.log(-torch.log(u))).to(flat_weights.dtype)
             scores = flat_weights + gumbel
             _, indices = torch.topk(scores, K, dim=1)
+
+            # Differentiable selection: compute soft probabilities for selected patches
+            if self.differentiable and self.training:
+                soft_probs = F.softmax(scores, dim=1)  # [B, N]
+                selection_probs = soft_probs.gather(1, indices)  # [B, K]
+                selection_probs = selection_probs / (selection_probs.sum(dim=1, keepdim=True) + eps)
+
             h_coords_pad = indices // valid_w
             w_coords_pad = indices % valid_w
 
@@ -369,7 +408,7 @@ class ContinuousSampler(nn.Module):
             patch_labels = combined[:, :, :C_mask]
             patch_validity = combined[:, :, C_mask:]
 
-        return patches, patch_labels, coords, aug_features, aug_params, patch_validity, K
+        return patches, patch_labels, coords, aug_features, aug_params, patch_validity, K, selection_probs
 
 
 class SlidingWindowSampler(nn.Module):
@@ -402,7 +441,7 @@ class SlidingWindowSampler(nn.Module):
         labels: torch.Tensor,
         weights: torch.Tensor,  # Ignored for sliding window
         patch_features: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict, torch.Tensor, int, torch.Tensor | None]:
         """Extract all patches in a sliding window pattern (patches may extend beyond borders)."""
         B, C, H, W = image.shape
         C_mask = labels.shape[1]
@@ -466,7 +505,8 @@ class SlidingWindowSampler(nn.Module):
             patch_labels = combined[:, :, :C_mask]
             patch_validity = combined[:, :, C_mask:]
 
-        return patches, patch_labels, coords, aug_features, aug_params, patch_validity, K
+        # No differentiable selection for sliding window (deterministic grid)
+        return patches, patch_labels, coords, aug_features, aug_params, patch_validity, K, None
 
 
 def create_sampler(
@@ -481,8 +521,14 @@ def create_sampler(
     pad_after: int | None = None,
     extract_patches: bool = False,
     spread_sigma: float = 0.0,
+    differentiable: bool = False,
 ) -> nn.Module:
-    """Factory function to create samplers from config."""
+    """Factory function to create samplers from config.
+
+    Args:
+        differentiable: If True, enable straight-through Gumbel-Softmax for
+            end-to-end gradient flow through sampling. Only affects ContinuousSampler.
+    """
     if sampler_type == "continuous":
         return ContinuousSampler(
             patch_size=patch_size,
@@ -495,6 +541,7 @@ def create_sampler(
             pad_after=pad_after,
             extract_patches=extract_patches,
             spread_sigma=spread_sigma,
+            differentiable=differentiable,
         )
     elif sampler_type == "sliding_window":
         return SlidingWindowSampler(

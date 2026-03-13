@@ -289,6 +289,9 @@ class PatchICL(nn.Module):
         else:
             self.augmenter = None
 
+        # Differentiable sampling: enables end-to-end gradient flow through Gumbel sampling
+        self.differentiable_sampling = sampler_cfg.get('differentiable', False)
+
         # Per-level samplers (each level can override sampling_method)
         self.samplers = nn.ModuleList()
         self.context_samplers = nn.ModuleList()  # Separate samplers for context (fewer patches)
@@ -311,6 +314,7 @@ class PatchICL(nn.Module):
                 pad_before=level_cfg.get('pad_before'),
                 pad_after=level_cfg.get('pad_after'),
                 spread_sigma=target_spread,
+                differentiable=self.differentiable_sampling,
             ))
             # Context sampler (uses num_context_patches if specified, else same as target)
             # spread_sigma_context overrides spread_sigma for context patches
@@ -329,6 +333,8 @@ class PatchICL(nn.Module):
                 pad_before=level_cfg.get('pad_before'),
                 pad_after=level_cfg.get('pad_after'),
                 spread_sigma=context_spread,
+                # Context doesn't need differentiable (uses GT masks)
+                differentiable=False,
             ))
         self.sampler = self.samplers[0]  # backward compat
 
@@ -795,7 +801,7 @@ class PatchICL(nn.Module):
         ctx_out_flat = context_out.reshape(B * k, *context_out.shape[2:])
         ctx_w_flat = context_weights.reshape(B * k, *context_weights.shape[2:])
 
-        _, labels, coords, _, aug_params, validity, K_per = sampler(
+        _, labels, coords, _, aug_params, validity, K_per, _ = sampler(
             ctx_in_flat, ctx_out_flat, ctx_w_flat
         )
 
@@ -862,7 +868,7 @@ class PatchICL(nn.Module):
         image_ds = self._downsample(image, resolution)
 
         # Select target patches using sampling_weights (patches=None since extract_patches=False)
-        patches, patch_labels, coords, _, aug_params, target_validity, K = sampler(image_ds, labels_ds, sampling_weights, None)
+        patches, patch_labels, coords, _, aug_params, target_validity, K, selection_probs = sampler(image_ds, labels_ds, sampling_weights, None)
         coord_scale = H / resolution
 
         # Extract mask prior patches for target patches (if available)
@@ -1039,6 +1045,15 @@ class PatchICL(nn.Module):
         if self.augmenter is not None and aug_params:
             patch_logits_for_agg = self.augmenter.inverse(patch_logits, aug_params)
 
+        # Differentiable sampling: weight patches by their selection probability
+        # This creates the gradient path: loss → weighted_logits → selection_probs → sampling_weights → sampling_map
+        if selection_probs is not None:
+            # selection_probs: [B, K] → expand to [B, K, 1, 1, 1] for broadcasting
+            selection_weight = selection_probs.view(B, K, 1, 1, 1)
+            # Scale logits by selection probability (keeps gradient path open)
+            # Multiply by K to maintain expected magnitude (probs sum to 1)
+            patch_logits_for_agg = patch_logits_for_agg * selection_weight * K
+
         # Aggregate with sampling_map if available
         aggregated_sampling_map = None
         if patch_sampling_map is not None:
@@ -1071,6 +1086,7 @@ class PatchICL(nn.Module):
             'level_res': resolution,
             'patch_sampling_map': patch_sampling_map,
             'aggregated_sampling_map': aggregated_sampling_map,
+            'selection_probs': selection_probs,
         }
 
         return level_out, pred, aggregated_sampling_map
@@ -1423,6 +1439,15 @@ class PatchICL(nn.Module):
             alpha = level_out.get('alpha')
             if alpha is not None:
                 losses[f'level_{i}_alpha'] = alpha.mean().detach()
+
+            # Log selection probability statistics (for differentiable sampling)
+            selection_probs = level_out.get('selection_probs')
+            if selection_probs is not None:
+                with torch.no_grad():
+                    losses[f'level_{i}_selection_prob_mean'] = selection_probs.mean()
+                    losses[f'level_{i}_selection_prob_std'] = selection_probs.std()
+                    losses[f'level_{i}_selection_prob_max'] = selection_probs.max()
+                    losses[f'level_{i}_selection_prob_min'] = selection_probs.min()
 
             # Context patch loss
             ctx_patch_logits = level_out.get('context_patch_logits')

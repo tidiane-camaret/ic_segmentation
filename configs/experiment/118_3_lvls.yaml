@@ -1,0 +1,128 @@
+# @package _global_
+# End-to-end differentiable sampling: sampling head trained directly via segmentation loss
+#
+# Key difference from 116_gumbel_sampling:
+# - Uses straight-through Gumbel-Softmax to enable gradient flow through sampling
+# - Sampling head receives gradients from segmentation loss (not auxiliary objective)
+# - Each patch's contribution is weighted by its selection probability
+
+defaults:
+  - /augmentation
+  - override /method: patch_icl
+
+preprocessing:
+  image_size: 128
+model:
+  patch_icl:
+    feature_extractor:
+      output_grid_size: "${preprocessing.image_size}"
+      freeze: true
+    levels:
+      - resolution: 24
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 9
+        num_context_patches: 9
+        pad_before: 0
+        pad_after: 0
+      - resolution: 64
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 20
+        num_context_patches: 20  
+        pad_before: 0
+        pad_after: 0
+        spread_sigma_target: 4.0
+        spread_sigma_context: 4.0
+      - resolution: 128
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 30
+        num_context_patches: 30
+        pad_before: 0
+        pad_after: 0
+        spread_sigma_target: 4.0
+        spread_sigma_context: 4.0
+
+    oracle_levels_train: [false, true, true]
+    oracle_levels_valid: [false, false, false]
+
+    oracle_scheduling:
+      enabled: true
+      schedule: "linear"
+      start_prob: 0.3
+      end_prob: 0.0
+      warmup_epochs: 1
+      decay_epochs: 30
+
+    sampler:
+      target_sampling: "gt_foreground_entropy_balanced"
+      target_model_sampling: "sampling_map"
+      context_sampling: "gt_foreground_entropy_balanced"
+      # Enable end-to-end differentiable sampling
+      differentiable: true
+
+    aggregator:
+      type: "average"
+      min_coverage: 1e-6
+      use_sampling_map: false
+      sampling_map_mode: "multiply"
+      detach_sampling_map: true
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: "${preprocessing.image_size}"
+      embed_dim: 256
+      embed_proj_dim: 256
+      feature_grid_size: "${model.patch_icl.feature_extractor.output_grid_size}"
+      patch_feature_grid_size: 8
+      num_heads: 4
+      num_layers: 2
+      num_context_layers: 1
+      num_registers: 1
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: false
+      use_context_mask: true
+      mask_fusion_type: "concat"
+
+    # Learned sampling map with end-to-end training
+    sampling_map:
+      source: "learned"
+      # CRITICAL: Don't detach features - allow seg loss gradients to reach sampling head
+      detach_features: false
+      objectives:
+        # No auxiliary objective - sampling head trained purely via segmentation loss
+        uncertainty: 0.0
+        boundary_penalty: 0.0
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args: null
+      aggreg_loss:
+        type: "softdiceFocal"
+        args: null
+      weights:
+        default:
+          target_patch: 0.0
+          target_aggreg: 0.0
+          context_patch: 0.0
+          context_aggreg: 1.0
+          target_combined: 1.0
+      level_weights: [0.0, 0.0, 1.0]
+
+    cascade:
+      detach_between_levels: false
+      additive_fusion: true
+      sampling_map_blend: false
+      learned_alpha: false
+      cascade_registers: true
