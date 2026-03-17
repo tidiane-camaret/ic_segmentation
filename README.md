@@ -132,12 +132,20 @@ configs/
 
 src/
 ├── models/
-│   ├── patch_icl_v2/     # Main implementation
+│   ├── patch_icl_v3/     # Clean refactored implementation (recommended)
+│   │   ├── model.py      # PatchICL model with dataclass config
+│   │   ├── level.py      # Single level processing
+│   │   ├── sampling.py   # Patch samplers with unified weights
+│   │   ├── aggregate.py  # Simplified aggregators
+│   │   ├── utils.py      # Shared utilities (entropy, coverage, etc.)
+│   │   ├── metrics.py    # Dice and hierarchical metrics
+│   │   └── backbone/     # Modular backbone components
+│   ├── patch_icl_v2/     # Legacy implementation (preserved for existing experiments)
 │   │   ├── patch_icl.py  # PatchICL model
 │   │   ├── sampling.py   # Patch samplers
 │   │   ├── aggregate.py  # Patch aggregators
 │   │   └── metrics.py    # Dice and hierarchical metrics
-│   └── simple_backbone.py  # Cross-attention backbone
+│   └── simple_backbone.py  # Cross-attention backbone (used by v2)
 ├── train_utils.py        # Training/validation loops
 └── losses.py             # Loss functions
 

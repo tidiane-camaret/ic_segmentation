@@ -137,9 +137,14 @@ def main(cfg: DictConfig) -> None:
     print(f"Augmentation: {use_image_augmentation}, CarveMix: {use_carve_mix}, Advanced: {use_adv_aug}")
 
     # Create model
-    from src.models.patch_icl_v2 import PatchICL
-
     patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
+    model_version = patch_icl_cfg.get("model_version", "v2")
+    if model_version == "v3":
+        from src.models.patch_icl_v3 import PatchICL
+        print("Using PatchICL v3")
+    else:
+        from src.models.patch_icl_v2 import PatchICL
+        print("Using PatchICL v2")
     random_coloring_nb = cfg.get("random_coloring_nb", 0)
     patch_icl_cfg["num_mask_channels"] = 3 if random_coloring_nb > 0 else 1
 

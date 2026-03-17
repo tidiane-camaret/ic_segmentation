@@ -3,7 +3,7 @@ defaults:
   - config
   - _self_
 
-class_balanced: true
+class_balanced: false
 
 
 

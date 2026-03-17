@@ -1,4 +1,4 @@
-"""Centralized metrics computation for PatchICL.
+"""Centralized metrics computation for PatchICL v3.
 
 Essential metrics only - focused on what matters for segmentation and sampling quality.
 
@@ -20,30 +20,12 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .utils import resize_label
+
 
 # Thresholds for hard-dice metric binarization
-PRED_THRESHOLD = 0.5      # sigmoid probability -> binary
-GT_AREA_THRESHOLD = 0.5  # soft avg-pooled GT -> binary 
-
-
-def _resize_label(label: torch.Tensor, size: tuple[int, int], min_value: float = 1) -> torch.Tensor:
-    """Hybrid label resize: area interpolation + max pooling.
-
-    Mirrors the _resize_mask approach in the dataloader: area pooling gives soft
-    coverage fractions but erases small objects; max pooling preserves their
-    presence. The hybrid ensures any detected foreground contributes >= min_value.
-
-    Args:
-        label: [B, C, H, W] float tensor
-        size: target (H, W)
-        min_value: minimum foreground weight when max pool detects presence
-
-    Returns:
-        Resized label [B, C, *size]
-    """
-    area = F.interpolate(label, size=size, mode='area')
-    maxp = F.adaptive_max_pool2d(label, size)
-    return torch.maximum(area, maxp * min_value)
+PRED_THRESHOLD = 0.5
+GT_AREA_THRESHOLD = 0.5
 
 
 def compute_dice(
@@ -61,13 +43,13 @@ def compute_dice(
         pred: Prediction logits or probabilities [B, C, ...] or [B, K, C, ...]
         target: Ground truth [B, C, ...] or [B, K, C, ...]
         pred_threshold: Threshold for binarizing predictions
-        gt_threshold: Threshold for binarizing GT (for area-based soft labels)
-        spatial_dims: Dimensions to sum over. If None, auto-detected as all dims after first 2.
+        gt_threshold: Threshold for binarizing GT
+        spatial_dims: Dimensions to sum over. If None, auto-detected.
         return_soft: Whether to also compute soft dice
-        apply_sigmoid: Whether to apply sigmoid to pred (set False if already probabilities)
+        apply_sigmoid: Whether to apply sigmoid to pred
 
     Returns:
-        Dict with 'dice' and optionally 'soft_dice', each [B] or [B, K]
+        Dict with 'dice' and optionally 'soft_dice'
     """
     if apply_sigmoid:
         pred_probs = torch.sigmoid(pred)
@@ -81,7 +63,6 @@ def compute_dice(
     if spatial_dims is None:
         spatial_dims = tuple(range(2, pred.dim()))
 
-    # Detect empty GT from continuous values (threshold-free)
     gt_has_fg = target_float.sum(dim=spatial_dims) > 0
 
     # Hard dice
@@ -92,7 +73,6 @@ def compute_dice(
 
     result = {'dice': dice, 'gt_has_foreground': gt_has_fg}
 
-    # Soft dice (no binarization — uses continuous pred and GT directly)
     if return_soft:
         pred_probs_f32 = pred_probs.float()
         target_float_f32 = target_float.float()
@@ -112,15 +92,8 @@ def compute_level_metrics(
 ) -> dict[str, torch.Tensor]:
     """Compute per-level dice metrics.
 
-    Note: level_{i}_dice uses _resize_label (max-pooled GT) - biased for coarse levels.
+    Note: level_{i}_dice uses resize_label (max-pooled GT) - biased for coarse levels.
     Use level_{i}_dice_fair for unbiased comparison (upsamples pred to full res).
-
-    Args:
-        level_outputs: List of level output dicts from model forward
-        labels: Full-resolution ground truth [B, C, H, W]
-
-    Returns:
-        Dict with level_{i}_dice, level_{i}_soft_dice, level_{i}_dice_fair for each level
     """
     metrics = {}
     full_res = labels.shape[-2:]
@@ -130,7 +103,7 @@ def compute_level_metrics(
         level_res = level_pred.shape[-2:]
 
         # Standard metric (uses max-pooled GT at level resolution) - BIASED
-        labels_ds = _resize_label(labels.float(), size=level_res)
+        labels_ds = resize_label(labels.float(), size=level_res)
         dice_result = compute_dice(level_pred, labels_ds)
         metrics[f'level_{li}_dice'] = dice_result['dice'].mean()
         metrics[f'level_{li}_soft_dice'] = dice_result['soft_dice'].mean()
@@ -155,16 +128,7 @@ def compute_context_metrics(
     context_pred: torch.Tensor,
     context_labels: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Compute context prediction dice metrics.
-
-    Args:
-        context_pred: [B, k, C, H, W] context predictions
-        context_labels: [B, k, C, H, W] context ground truth
-
-    Returns:
-        Dict with context_dice, context_soft_dice
-    """
-    # Sum over (C, H, W), keep batch and context dims
+    """Compute context prediction dice metrics."""
     spatial_dims = (2, 3, 4)
     dice_result = compute_dice(context_pred, context_labels, spatial_dims=spatial_dims)
 
@@ -178,27 +142,10 @@ def compute_hierarchical_metrics(
     level_outputs: list[dict],
     labels: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Compute hierarchical metrics: level improvement and sampling quality.
-
-    Essential metrics for multi-level analysis:
-    - level_{i}_level_improvement: Does level i improve over level i-1?
-    - level_{i}_error_targeting_lift: Is sampling better than random? (>1 = yes)
-    - level_{i}_coverage_ratio: Patch budget utilization
-    - level_{i}_mean_entropy: Uncertainty calibration
-    - level_{i}_uncertainty_calibration_fair: Correlation between entropy and errors
-
-    Args:
-        level_outputs: List of level output dicts from model forward
-        labels: Full-resolution ground truth [B, C, H, W]
-
-    Returns:
-        Dict with essential per-level metrics
-    """
+    """Compute hierarchical metrics: level improvement and sampling quality."""
     metrics = {}
-    full_res = labels.shape[-2:]
 
     def masked_softdice(pred, gt, mask):
-        """Compute softdice only on masked region."""
         pred_prob = torch.sigmoid(pred)
         pred_masked = pred_prob * mask.float()
         gt_masked = gt * mask.float()
@@ -210,9 +157,10 @@ def compute_hierarchical_metrics(
         return dice.mean()
 
     def compute_entropy(pred):
-        """Compute binary entropy (normalized to [0, 1])."""
         p = torch.sigmoid(pred).clamp(1e-6, 1 - 1e-6)
         return -(p * p.log() + (1 - p) * (1 - p).log()) / math.log(2)
+
+    full_res = labels.shape[-2:]
 
     with torch.no_grad():
         # Per-level uncertainty calibration metrics
@@ -221,7 +169,7 @@ def compute_hierarchical_metrics(
             level_res = level_pred.shape[-2:]
 
             # Standard calibration (uses max-pooled GT) - BIASED for coarse levels
-            labels_li = _resize_label(labels.float(), size=level_res)
+            labels_li = resize_label(labels.float(), size=level_res)
             entropy = compute_entropy(level_pred)
             pred_binary = (torch.sigmoid(level_pred) > 0.5).float()
             gt_binary = (labels_li > 0.5).float()
@@ -270,7 +218,6 @@ def compute_hierarchical_metrics(
             else:
                 metrics[f'level_{li}_uncertainty_calibration_fair'] = calibration_corr
                 metrics[f'level_{li}_entropy_ratio_fair'] = metrics[f'level_{li}_entropy_ratio']
-
         for i in range(1, len(level_outputs)):
             prev_level = level_outputs[i - 1]
             curr_level = level_outputs[i]
@@ -284,16 +231,13 @@ def compute_hierarchical_metrics(
 
             curr_res = curr_pred.shape[-2:]
 
-            # Upsample prev_pred to current resolution
             prev_pred_up = F.interpolate(prev_pred, size=curr_res, mode='bilinear', align_corners=False)
-
-            # Area-only GT for fair comparison
             labels_curr = F.interpolate(labels.float(), size=curr_res, mode='area')
 
             covered = coverage_mask > 0.5
             covered_exp = covered.expand_as(curr_pred)
 
-            # Level improvement: does this level help?
+            # Level improvement
             prev_dice = masked_softdice(prev_pred_up, labels_curr, covered_exp)
             curr_dice = masked_softdice(curr_pred, labels_curr, covered_exp)
             metrics[f'level_{i}_level_improvement'] = curr_dice - prev_dice
@@ -301,7 +245,7 @@ def compute_hierarchical_metrics(
             # Coverage ratio
             metrics[f'level_{i}_coverage_ratio'] = covered.float().mean()
 
-            # Error targeting: does sampling focus on errors?
+            # Error targeting
             prev_prob = torch.sigmoid(prev_pred_up)
             prev_binary = (prev_prob > 0.5).float()
             gt_binary = (labels_curr > 0.5).float()
@@ -309,7 +253,6 @@ def compute_hierarchical_metrics(
             prev_error_any = prev_error.max(dim=1, keepdim=True)[0]
             covered_f = covered.float()
 
-            # Error recall & precision
             error_pixels = prev_error_any.sum(dim=(2, 3)) + 1e-6
             covered_error_pixels = (prev_error_any * covered_f).sum(dim=(2, 3))
             covered_pixels = covered_f.sum(dim=(2, 3)) + 1e-6
@@ -320,8 +263,6 @@ def compute_hierarchical_metrics(
 
             metrics[f'level_{i}_error_recall'] = error_recall
             metrics[f'level_{i}_error_precision'] = error_precision
-
-            # THE key metric: >1 means targeting errors better than random
             metrics[f'level_{i}_error_targeting_lift'] = error_precision / (error_ratio + 1e-6)
 
     return metrics
@@ -332,22 +273,7 @@ def compute_all_metrics(
     labels: torch.Tensor,
     return_per_sample: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Compute essential metrics from model outputs.
-
-    Essential metrics:
-    - final_dice, final_soft_dice: Ultimate segmentation quality
-    - level_{i}_dice: Per-level quality
-    - level_{i}_error_targeting_lift: Sampling quality
-    - level_{i}_level_improvement: Multi-level contribution
-
-    Args:
-        outputs: Model output dict from forward()
-        labels: Full-resolution ground truth [B, C, H, W]
-        return_per_sample: If True, also return per-sample dice in 'per_sample_dice'
-
-    Returns:
-        Dict with essential metrics
-    """
+    """Compute essential metrics from model outputs."""
     if labels.dim() == 3:
         labels = labels.unsqueeze(1)
 
@@ -355,14 +281,11 @@ def compute_all_metrics(
 
     level_outputs = outputs.get('level_outputs', [])
     if level_outputs:
-        # Per-level dice
         metrics.update(compute_level_metrics(level_outputs, labels))
 
-        # Hierarchical: level improvement + sampling quality
         if len(level_outputs) > 1:
             metrics.update(compute_hierarchical_metrics(level_outputs, labels))
 
-        # Final metrics
         final_logit = outputs.get('final_logit')
         if final_logit is not None:
             dice_result = compute_dice(final_logit, labels)
@@ -385,7 +308,6 @@ def compute_all_metrics(
         if return_per_sample:
             metrics['per_sample_dice'] = dice_result['dice']
 
-        # Context metrics (secondary, but useful)
         last_level = level_outputs[-1]
         context_pred = last_level.get('context_pred')
         context_labels = last_level.get('context_labels')
@@ -400,7 +322,6 @@ def compute_all_metrics(
             if return_per_sample:
                 metrics['per_sample_dice'] = dice_result['dice']
 
-    # Uncertainty metrics (secondary)
     metrics.update(compute_uncertainty_metrics(outputs, labels))
 
     return metrics
@@ -410,19 +331,7 @@ def compute_uncertainty_metrics(
     outputs: dict[str, torch.Tensor],
     labels: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Compute uncertainty/confidence metrics from model outputs.
-
-    Computes entropy-based metrics from final_conf (if provided) or from
-    final_logit. Reports mean confidence, mean entropy, and error-uncertainty
-    correlation (AUCO-like: whether uncertain pixels are also wrong).
-
-    Args:
-        outputs: Model output dict (needs 'final_logit', optionally 'final_conf')
-        labels: Ground truth [B, C, H, W]
-
-    Returns:
-        Dict with uncertainty metrics (all scalar tensors)
-    """
+    """Compute uncertainty/confidence metrics."""
     metrics = {}
     final_logit = outputs.get('final_logit')
     if final_logit is None:
@@ -434,13 +343,11 @@ def compute_uncertainty_metrics(
     with torch.no_grad():
         p = torch.sigmoid(final_logit).clamp(1e-6, 1 - 1e-6)
         entropy = -(p * p.log() + (1 - p) * (1 - p).log()) / math.log(2)
-        confidence = 1.0 - entropy  # [0, 1]
+        confidence = 1.0 - entropy
 
-        # Mean entropy and confidence across all pixels
         metrics['mean_entropy'] = entropy.mean()
         metrics['mean_confidence'] = confidence.mean()
 
-        # Error-weighted entropy: avg entropy where predictions are wrong
         pred_binary = (p > PRED_THRESHOLD).float()
         gt_binary = (labels.float() > GT_AREA_THRESHOLD).float()
         errors = (pred_binary != gt_binary).float()
@@ -458,24 +365,14 @@ def compute_per_sample_dice(
     outputs: dict[str, torch.Tensor],
     labels: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute per-sample final dice for per-label tracking.
-
-    Args:
-        outputs: Model output dict
-        labels: Ground truth [B, C, H, W]
-
-    Returns:
-        Per-sample dice tensor [B]
-    """
+    """Compute per-sample final dice for per-label tracking."""
     if labels.dim() == 3:
         labels = labels.unsqueeze(1)
 
-    # Use final_logit (upsampled combined_pred) which is the actual model output
     final_logit = outputs.get('final_logit')
     if final_logit is not None:
         dice_result = compute_dice(final_logit, labels)
     else:
-        # Fallback: upsample last level pred (legacy behavior)
         level_outputs = outputs.get('level_outputs', [])
         if level_outputs:
             last_pred = level_outputs[-1]['pred']

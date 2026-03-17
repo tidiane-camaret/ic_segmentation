@@ -59,7 +59,7 @@ def _save_sample_images(
     epoch: int,
     prefix: str = "train",
     max_samples: int = 20,
-    max_context: int = 2,
+    max_context: int = 3,
 ) -> None:
     """Save sample images with patches to disk.
 
@@ -323,7 +323,7 @@ def _save_sample_images_final(
     epoch: int,
     prefix: str = "train",
     max_samples: int = 20,
-    max_context: int = 2,
+    max_context: int = 3,
 ) -> None:
     """Save final prediction images upsampled to input resolution.
 
@@ -859,8 +859,7 @@ def validate(
         total_loss += loss.item()
 
         # Compute all dice metrics using centralized function (with per-sample dice)
-        # compute_fullres=True for expensive full-resolution hierarchical metrics
-        metrics = compute_all_metrics(outputs, labels, return_per_sample=True, compute_fullres=True)
+        metrics = compute_all_metrics(outputs, labels, return_per_sample=True)
 
         # Accumulate all scalar metrics dynamically
         for key, val in metrics.items():

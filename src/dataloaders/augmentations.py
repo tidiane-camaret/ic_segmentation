@@ -842,6 +842,13 @@ def apply_universeg_augmentation(
 
     # 4. Apply standard UniverSeg example-level
     if example_config and example_config.get("enabled", True):
+        # Optionally apply to target as well (for spatial independence)
+        if example_config.get("apply_to_target", False):
+            target_img, target_mask = apply_universeg_example_augmentation(
+                target_img, target_mask, example_config
+            )
+
+        # Apply to context images
         augmented_ctx_imgs, augmented_ctx_masks = [], []
         for ctx_img, ctx_mask in zip(context_imgs, context_masks):
             aug_img, aug_mask = apply_universeg_example_augmentation(ctx_img, ctx_mask, example_config)

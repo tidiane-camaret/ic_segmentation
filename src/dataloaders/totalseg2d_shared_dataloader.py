@@ -224,7 +224,12 @@ class TotalSeg2DSharedDataset(Dataset):
             self.windowing_jitter = 0
             self.spatial_transform = None
             self.intensity_transform = None
-            print(f"Augmentation enabled: type=universeg/custom (task+example level)")
+            example_cfg = cfg.get("example", {})
+            medical_cfg = cfg.get("medical_specialty", {})
+            print(f"Augmentation enabled: type=universeg "
+                  f"(apply_to_target={example_cfg.get('apply_to_target', False)}, "
+                  f"crop_p={medical_cfg.get('crop_p', 0)}, "
+                  f"rotation={example_cfg.get('rotation_range', 'default')})")
             return
 
         # Legacy: build albumentations transforms

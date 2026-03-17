@@ -33,14 +33,22 @@ def build_universeg_model(cfg: DictConfig, verbose: bool = True):
     model = UniverSegBaseline(
         pretrained=universeg_cfg.get("pretrained", True),
         input_size=universeg_cfg.get("input_size", 128),
+        freeze=universeg_cfg.get("freeze", False),  # Match train.py
     )
-    aggreg_criterion = build_loss_fn("dice", None)
-    patch_criterion = build_loss_fn("dice", None)
+
+    # Read loss config (match train.py behavior)
+    loss_cfg = cfg.get("loss", {})
+    patch_loss_cfg = loss_cfg.get("patch_loss", {"type": "dice", "args": None})
+    aggreg_loss_cfg = loss_cfg.get("aggreg_loss", {"type": "dice", "args": None})
+    patch_criterion = build_loss_fn(patch_loss_cfg.get("type", "dice"), patch_loss_cfg.get("args"))
+    aggreg_criterion = build_loss_fn(aggreg_loss_cfg.get("type", "dice"), aggreg_loss_cfg.get("args"))
     model.set_loss_functions(patch_criterion, aggreg_criterion)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if verbose:
-        print(f"Using UniverSeg baseline model (input_size={model.input_size})")
+        print(f"Using UniverSeg baseline model (input_size={model.input_size}, "
+              f"pretrained={universeg_cfg.get('pretrained', True)}, "
+              f"freeze={universeg_cfg.get('freeze', False)})")
         print(f"Model parameters: {num_params:,}")
 
     return model
@@ -63,8 +71,18 @@ def build_patch_icl_model(
     Returns:
         model: PatchICL model (not yet on device)
     """
-    from src.models.patch_icl_v2 import PatchICL
     from src.losses import build_loss_fn
+
+    # Select model version (v2 default for backward compat)
+    model_version = cfg.model.patch_icl.get("model_version", "v2")
+    if model_version == "v3":
+        from src.models.patch_icl_v3 import PatchICL
+        if verbose:
+            print("Using PatchICL v3")
+    else:
+        from src.models.patch_icl_v2 import PatchICL
+        if verbose:
+            print("Using PatchICL v2")
 
     patch_icl_cfg = OmegaConf.to_container(cfg.model.patch_icl, resolve=True)
     random_coloring_nb = cfg.get("random_coloring_nb", 0)
@@ -98,11 +116,25 @@ def build_patch_icl_model(
     ckpt_path = cfg.get("checkpoint", None)
     if ckpt_path:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        ckpt_state_dict = checkpoint["model_state_dict"]
+
+        # Filter out gaussian kernel buffers (shape depends on spread_sigma, not learned)
+        gaussian_keys = [k for k in ckpt_state_dict.keys() if '_gaussian_kernel' in k]
+        for k in gaussian_keys:
+            del ckpt_state_dict[k]
+        if gaussian_keys and verbose:
+            print(f"Filtered {len(gaussian_keys)} gaussian kernel buffers from checkpoint")
+
+        missing, unexpected = model.load_state_dict(ckpt_state_dict, strict=False)
         if verbose:
             epoch = checkpoint.get("epoch", "?")
             dice = checkpoint.get("best_dice", float("nan"))
             print(f"Loaded checkpoint from {ckpt_path} (epoch {epoch}, dice {dice:.4f})")
+            if missing:
+                fe_missing = [k for k in missing if k.startswith("feature_extractor.")]
+                other_missing = [k for k in missing if not k.startswith("feature_extractor.")]
+                if other_missing:
+                    print(f"Note: {len(other_missing)} keys missing from checkpoint: {other_missing[:5]}...")
     elif verbose:
         print("No checkpoint loaded, using default weights")
 
@@ -168,12 +200,13 @@ def _build_feature_extractor(cfg, patch_icl_cfg, device, verbose=True):
             freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
             output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
             input_size=fe_cfg.get("input_size", 128) if fe_cfg else 128,
+            skip_preprocess=fe_cfg.get("skip_preprocess", True) if fe_cfg else True,
         )
         if verbose:
             info = fe.get_feature_info()
             print(f"Feature mode: on_the_fly (UniverSeg layers={info['layer_indices']}, "
                   f"dim={info['feature_dim']}, input={info['input_size']}x{info['input_size']}, "
-                  f"grid={info['output_grid_size']})")
+                  f"grid={info['output_grid_size']}, skip_preprocess={info['skip_preprocess']})")
 
     elif extractor_type == "icl_encoder":
         from src.models.icl_encoder import ICLEncoder

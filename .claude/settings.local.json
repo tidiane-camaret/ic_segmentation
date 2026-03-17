@@ -29,7 +29,8 @@
       "Bash(du)",
       "Bash(ls $folder:*)",
       "WebFetch(domain:openaccess.thecvf.com)",
-      "WebFetch(domain:proceedings.mlr.press)"
+      "WebFetch(domain:proceedings.mlr.press)",
+      "Bash(wc:*)"
     ],
     "deny": [
       "Read(./old/**)"

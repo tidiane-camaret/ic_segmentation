@@ -161,8 +161,6 @@ def load_model(checkpoint_path: str, device: torch.device, config_override: dict
         device: torch device
         config_override: Optional config dict to override checkpoint config
     """
-    from src.models.patch_icl_v2.patch_icl import PatchICL
-
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint.get('config', {})
 
@@ -175,6 +173,15 @@ def load_model(checkpoint_path: str, device: torch.device, config_override: dict
     # Get model config
     patch_icl_cfg = config.get('model', {}).get('patch_icl', {})
     context_size = config.get('context_size', 1)
+
+    # Select model version
+    model_version = patch_icl_cfg.get("model_version", "v2")
+    if model_version == "v3":
+        from src.models.patch_icl_v3 import PatchICL
+        print("Using PatchICL v3")
+    else:
+        from src.models.patch_icl_v2 import PatchICL
+        print("Using PatchICL v2")
 
     # Set num_mask_channels
     random_coloring_nb = config.get('random_coloring_nb', 0)

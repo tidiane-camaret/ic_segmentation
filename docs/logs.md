@@ -4,6 +4,46 @@ Consolidated project log. Previous logs in `logs.md` and `configs/experiment/log
 
 ---
 
+## 2026-03-17: PatchICL v3 Refactoring
+
+**Goal:** Clean up v2 codebase by removing dead code and improving modularity.
+
+### Changes
+
+Created `src/models/patch_icl_v3/` with simplified, modular architecture:
+
+| Component | v2 Lines | v3 Lines | Changes |
+|-----------|----------|----------|---------|
+| patch_icl.py | 1510 | 724 (model.py) + 442 (level.py) | Split into model + level |
+| simple_backbone.py | 1158 | 690 (backbone/) | Split into encoder/decoder/attention |
+| sampling.py | 558 | 594 | Added unified `compute_sampling_weights()` |
+| aggregate.py | 266 | 216 | Removed unused `_combine_with_prev()` |
+| utils.py | - | 325 | New shared utilities |
+
+### Removed Dead Code
+
+- `use_learned_alpha`, `compute_alpha()`, `alpha_head` (never enabled in configs)
+- `sampling_map_blend` combination mode
+- `gt_border` sampling mode
+- `exponential`, `inverse_sigmoid` oracle schedules (only `linear` used)
+- Backward compat aliases (`patches`, `patch_labels` in return dict)
+- `_combine_with_prev()` in aggregator
+
+### Key Improvements
+
+1. **Single level combination mode**: Only additive fusion (removed 3 unused modes)
+2. **Unified entropy computation**: One `compute_binary_entropy()` function
+3. **Loop-based encoder/decoder**: No code duplication for 8x8 vs 16x16
+4. **Dataclass config**: `PatchICLConfig` for type-safe configuration
+5. **Separated concerns**: `level.py` handles single-level processing
+
+### Migration
+
+- New experiments: use `patch_icl_v3`
+- Existing experiments: continue using `patch_icl_v2` (unchanged)
+
+---
+
 ## 2026-03-12: Fair Hierarchical Metrics + Metrics Cleanup
 
 **Goal:** Fix biased hierarchical comparison metrics and remove redundant metrics.
