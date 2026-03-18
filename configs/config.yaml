@@ -50,16 +50,14 @@ min_coverage_ratio: 0  # Minimum ratio of max coverage
  # Slice subsampling (shared dataloader only)                                                                                                                                             
 max_slices_per_group: 10   # Max slices per (case, label, axis), null for unlimited
 slice_selection: "stride_peak"  # "all", "random", "stride", "stride_peak"
-# Dataloader
-train_batch_size: 50
-val_batch_size: 64
+
 max_ds_len:  # Can be null, int, or dict with train/val keys
   train: null
   val: null
 max_cases:                                                                                                                                                                               
-    train: 400                                                                                                                                                                             
+    train: null                                                                                                                                                                             
     val: null
-context_size: 6
+context_size: 10
 
 
 # Optimizer
@@ -67,7 +65,7 @@ optimizer:
   optimizer_type: "adamw"
   optimizer_args:
     lr: 0.0001
-    weight_decay: 0.01
+    weight_decay: 0.05
 
 # Schedulers
 train_scheduler:
@@ -83,7 +81,8 @@ training:
   num_workers: 12
   log_every: 20
   compute_metrics_every: 20
-  mixed_precision: fp16
+  val_compute_metrics_every: 20
+  mixed_precision: bf16 #fp16 #"no" #
   
 warmup_scheduler:
   enabled: true

@@ -789,9 +789,15 @@ def validate(
     accelerator=None,
     use_wandb: bool = False,
     epoch: int = 0,
+    compute_metrics_every: int = 1,
 ):
-    """Run validation."""
-    model.eval()  # Keep train mode for BatchNorm consistency
+    """Run validation.
+
+    Args:
+        compute_metrics_every: Compute detailed metrics every N batches (default 1 = every batch).
+            Set higher to speed up validation at cost of less frequent metric updates.
+    """
+    model.eval()
     is_main = accelerator is None or accelerator.is_main_process
     unwrapped_model = (
         accelerator.unwrap_model(model) if accelerator is not None else model
@@ -858,20 +864,26 @@ def validate(
             )
         total_loss += loss.item()
 
-        # Compute all dice metrics using centralized function (with per-sample dice)
-        metrics = compute_all_metrics(outputs, labels, return_per_sample=True)
+        # Gate metrics computation to every N batches (like training)
+        should_compute_metrics = (batch_idx % compute_metrics_every == 0) or (
+            batch_idx == len(val_loader) - 1
+        )
 
-        # Accumulate all scalar metrics dynamically
-        for key, val in metrics.items():
-            if key == "per_sample_dice":
-                continue
-            if hasattr(val, "item"):
-                dice_accum[key] += val.item()
-                dice_count[key] += 1
+        if should_compute_metrics:
+            # Compute all dice metrics using centralized function (with per-sample dice)
+            metrics = compute_all_metrics(outputs, labels, return_per_sample=True)
 
-        # Per-case tracking (reuse per_sample_dice from compute_all_metrics)
-        per_sample_dice = metrics.get("per_sample_dice")
-        if per_sample_dice is None:
+            # Accumulate all scalar metrics dynamically
+            for key, val in metrics.items():
+                if key == "per_sample_dice":
+                    continue
+                if hasattr(val, "item"):
+                    dice_accum[key] += val.item()
+                    dice_count[key] += 1
+
+            per_sample_dice = metrics.get("per_sample_dice")
+        else:
+            # Lightweight: only compute per-sample dice for tracking
             per_sample_dice = compute_per_sample_dice(outputs, labels)
         batch_case_ids = batch.get("target_case_ids") or batch.get(
             "case_id", [None] * images.shape[0]
@@ -910,9 +922,10 @@ def validate(
             label_dice_scores[label_id].append(dice_val)
 
             # Store one sample per label for visualization (only when saving)
-            # Use reservoir sampling so each sample has equal chance of being kept
-            should_save = (use_wandb or save_dir is not None) and is_main
+            # Gate to metrics batches to avoid CPU sync stalls on every sample
+            should_save = (use_wandb or save_dir is not None) and is_main and should_compute_metrics
             if should_save:
+                # Use reservoir sampling so each sample has equal chance of being kept
                 n_seen = len(label_dice_scores[label_id])
                 if label_id not in label_samples or random.random() < 1.0 / n_seen:
                     label_samples[label_id] = _collect_sample_for_viz(

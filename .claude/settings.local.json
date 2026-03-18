@@ -30,7 +30,9 @@
       "Bash(ls $folder:*)",
       "WebFetch(domain:openaccess.thecvf.com)",
       "WebFetch(domain:proceedings.mlr.press)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(wget:*)",
+      "Bash(pip install:*)"
     ],
     "deny": [
       "Read(./old/**)"

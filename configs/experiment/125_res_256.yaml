@@ -17,14 +17,17 @@
 # - Slower convergence per epoch
 
 defaults:
-  - /augmentation: custom
+  - /augmentation: custom2
   - override /method: patch_icl
 
-preprocessing:
-  image_size: 256
-  feature_image_size: 128
+max_ds_len:  # Can be null, int, or dict with train/val keys
+  train: 20000
 
-context_size: 6
+preprocessing:
+  image_size: 256 # [128, 256, 512] Random image size per batch 
+  feature_image_size: 256
+
+context_size: 6 #[5, 10]        # Random contexts per batch
 
 model:
   patch_icl:

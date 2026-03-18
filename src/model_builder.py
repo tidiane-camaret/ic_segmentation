@@ -234,6 +234,23 @@ def _build_feature_extractor(cfg, patch_icl_cfg, device, verbose=True):
             print(f"Feature mode: on_the_fly (RAD-DINO model={info['model_name']}, "
                   f"dim={info['feature_dim']}, grid={info['output_grid_size']}, frozen={info['frozen']})")
 
+    elif extractor_type == "medsam2":
+        from src.models.medsam2_extractor import MedSAM2Extractor
+        fe = MedSAM2Extractor(
+            layer_idx=fe_cfg.get("layer_idx", 0) if fe_cfg else 0,
+            device=device,
+            checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
+            freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+            output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+            input_size=fe_cfg.get("input_size", 512) if fe_cfg else 512,
+            compile_model=fe_cfg.get("compile_model", False) if fe_cfg else False,
+        )
+        if verbose:
+            info = fe.get_feature_info()
+            print(f"Feature mode: on_the_fly (MedSAM2 layers={info['layer_indices']}, "
+                  f"dim={info['feature_dim']}, input={info['input_size']}x{info['input_size']}, "
+                  f"grid={info['output_grid_size']})")
+
     else:
         raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
 

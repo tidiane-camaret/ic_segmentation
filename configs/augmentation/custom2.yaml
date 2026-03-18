@@ -51,7 +51,7 @@ augmentation:
   # Example-level: Position/scale independence, NO flips
   example:
     enabled: true
-    apply_to_target: true
+    apply_to_target: false
 
     # Translation and scale - safe for symmetric organs
     affine_p: 0.8

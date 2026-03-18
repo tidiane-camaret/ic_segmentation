@@ -130,8 +130,12 @@ def build_dataloader(cfg):
     )
 
     # TotalSeg2D dataloader - select based on dataloader_type config
-    dataloader_type = cfg.get("dataloader_type", "fast")  # "fast" or "shared"
-    if dataloader_type == "shared":
+    dataloader_type = cfg.get("dataloader_type", "zopt")  # "fast", "shared", or "zopt"
+    if dataloader_type == "zopt":
+        from src.dataloaders.totalseg2d_zopt_dataloader import (
+            get_dataloader as get_totalseg2d_dataloader,
+        )
+    elif dataloader_type == "shared":
         from src.dataloaders.totalseg2d_shared_dataloader import (
             get_dataloader as get_totalseg2d_dataloader,
         )
@@ -186,13 +190,16 @@ def build_dataloader(cfg):
     slice_selection = cfg.get("slice_selection", "all")
 
     # Resolve paths based on dataloader type
-    if dataloader_type == "shared":
-        # Use shared format paths: {base_dataset}_2d_shared/
+    base_dataset = cfg.get("base_dataset", "totalseg")
+    if dataloader_type in ("shared", "zopt"):
+        # Use shared/zopt format paths
         data_dir = Path(cfg.paths.DATA_DIR)
-        base_dataset = cfg.get("base_dataset", "totalseg")
-        shared_dir = data_dir / f"{base_dataset}_2d_shared"
-        root_dir = str(shared_dir)
-        stats_path = str(shared_dir / "stats.pkl")
+        if dataloader_type == "zopt":
+            data_subdir = data_dir / f"{base_dataset}_3d_zopt"
+        else:
+            data_subdir = data_dir / f"{base_dataset}_2d_shared"
+        root_dir = str(data_subdir)
+        stats_path = str(data_subdir / "stats.pkl")
     else:
         root_dir = cfg.paths.dataset
         stats_path = cfg.paths.dataset_stats
@@ -211,14 +218,15 @@ def build_dataloader(cfg):
         max_labels=cfg.get("max_labels", None),
         max_cases=max_cases_train,
     )
-    if dataloader_type == "shared":
-        # Shared dataloader params
+    if dataloader_type in ("shared", "zopt"):
+        # Shared/zopt dataloader params
         train_kwargs.update(
-            crop_to_bbox=cfg.preprocessing.crop_to_bbox,
-            bbox_padding=cfg.preprocessing.bbox_padding,
+            crop_to_bbox=cfg.preprocessing.get("crop_to_bbox", False),
+            bbox_padding=cfg.preprocessing.get("bbox_padding", 10),
             min_coverage=min_coverage,
             min_coverage_ratio=min_coverage_ratio,
             same_case_context=same_case_context,
+            same_case_context_ratio=cfg.get("same_case_context_ratio", 0.0),
             max_ds_len=max_ds_len_train,
             class_balanced=cfg.get("class_balanced", False),
             augmentation_config=augmentation_config,
@@ -330,6 +338,16 @@ def build_model(cfg, device):
                     output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
                     input_size=fe_cfg.get("input_size", 128) if fe_cfg else 128,
                     skip_preprocess=fe_cfg.get("skip_preprocess", True) if fe_cfg else True,
+                )
+            elif extractor_type == "medsam2":
+                from src.models.medsam2_extractor import MedSAM2Extractor
+                feature_extractor = MedSAM2Extractor(
+                    layer_idx=fe_cfg.get("layer_idx", 2) if fe_cfg else 2,
+                    device=device,
+                    checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    input_size=fe_cfg.get("input_size", 512) if fe_cfg else 512,
                 )
             elif extractor_type == "icl_encoder":
                 from src.models.icl_encoder import ICLEncoder

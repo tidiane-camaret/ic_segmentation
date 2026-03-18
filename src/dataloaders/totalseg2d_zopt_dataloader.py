@@ -31,6 +31,14 @@ from tqdm import tqdm
 
 from data.label_ids_totalseg import get_label_ids
 
+# Import augmentations eagerly to avoid fork deadlock
+# (all workers trying to import simultaneously after fork)
+from src.dataloaders.augmentations import (
+    apply_universeg_augmentation,
+    create_spatial_only_transform,
+    create_intensity_only_transform,
+)
+
 
 class TotalSeg2DZOptDataset(Dataset):
     """
@@ -44,8 +52,8 @@ class TotalSeg2DZOptDataset(Dataset):
         root_dir: str,
         stats_path: str,
         label_id_list: Union[List[str], str],
-        context_size: int = 3,
-        image_size: Optional[Tuple[int, int]] = None,
+        context_size: Union[int, Tuple[int, int]] = 3,  # int or (min, max) range
+        image_size: Optional[Union[int, Tuple[int, int]]] = None,  # int, (H,W), or (min,max) range
         crop_to_bbox: bool = False,
         bbox_padding: int = 10,
         min_coverage: int = 100,
@@ -78,8 +86,25 @@ class TotalSeg2DZOptDataset(Dataset):
         self.slice_selection = slice_selection
         self.min_coverage = min_coverage
         self.min_coverage_ratio = min_coverage_ratio
-        self.context_size = context_size
-        self.image_size = image_size
+        # Parse context_size: int or (min, max) range
+        if isinstance(context_size, (list, tuple)):
+            self.context_size_min, self.context_size_max = context_size
+            self.context_size = self.context_size_max  # For compatibility
+        else:
+            self.context_size_min = self.context_size_max = context_size
+            self.context_size = context_size
+        # Parse image_size: int (fixed) or (min, max) range. Always square.
+        if image_size is None:
+            self.image_size = None
+            self.image_size_min = self.image_size_max = None
+        elif isinstance(image_size, int):
+            self.image_size = (image_size, image_size)
+            self.image_size_min = self.image_size_max = image_size
+        elif isinstance(image_size, (list, tuple)):
+            self.image_size_min, self.image_size_max = image_size[0], image_size[-1]
+            self.image_size = (self.image_size_max, self.image_size_max)
+        else:
+            raise ValueError(f"image_size must be int or (min, max), got {image_size}")
         self.crop_to_bbox = crop_to_bbox
         self.bbox_padding = bbox_padding
         self.random_context = random_context
@@ -227,11 +252,6 @@ class TotalSeg2DZOptDataset(Dataset):
         self.augmentation_config_full = None
         self.windowing_jitter = cfg.get("windowing_jitter", 0)
         try:
-            from src.dataloaders.augmentations import (
-                create_spatial_only_transform,
-                create_intensity_only_transform,
-            )
-
             spatial_cfg = cfg.get("spatial", {})
             if spatial_cfg.get("enabled", True):
                 self.spatial_transform = create_spatial_only_transform(
@@ -454,6 +474,10 @@ class TotalSeg2DZOptDataset(Dataset):
         if self.class_balanced:
             label_id = random.choice(self.active_labels)
             target_case_id, z_idx = random.choice(self.label_to_samples[label_id])
+        elif self.max_ds_len is not None:
+            # Random sampling from full pool when max_ds_len is set
+            # This ensures different samples are seen across epochs
+            target_case_id, label_id, z_idx = random.choice(self.samples)
         else:
             target_case_id, label_id, z_idx = self.samples[idx]
 
@@ -467,11 +491,12 @@ class TotalSeg2DZOptDataset(Dataset):
 
         img = self._normalize_image(img, jitter=self.windowing_jitter if self.augment else 0)
 
+        # Resize to max image size (random sampling happens in collate_fn for batch consistency)
         if self.image_size:
             img = self._resize(img, self.image_size, "bilinear")
             mask = self._resize_mask(mask, self.image_size)
 
-        # Load context
+        # Load context (always load max, random sampling happens in collate_fn)
         context_imgs, context_masks, context_case_ids = [], [], []
 
         if self.context_size > 0:
@@ -545,7 +570,6 @@ class TotalSeg2DZOptDataset(Dataset):
         # Apply augmentation
         if self.augment:
             if self.augmentation_type in ("universeg", "custom"):
-                from src.dataloaders.augmentations import apply_universeg_augmentation
                 aug_cfg = dict(self.augmentation_config_full)
                 if self.image_size:
                     aug_cfg["img_size"] = self.image_size[0]
@@ -566,12 +590,19 @@ class TotalSeg2DZOptDataset(Dataset):
         target_in = torch.from_numpy(img.copy()).unsqueeze(0).float()
         target_out = torch.from_numpy(mask.copy()).unsqueeze(0).float()
 
+        # Include range info for collate_fn to sample batch-wide sizes
+        _range_info = {
+            "image_size_range": (self.image_size_min, self.image_size_max),
+            "context_size_range": (self.context_size_min, self.context_size_max),
+        }
+
         if self.context_size == 0:
             return {
                 "image": target_in,
                 "label": target_out,
                 "target_case_id": target_case_id,
                 "label_id": label_id,
+                "_range_info": _range_info,
             }
 
         context_in = torch.stack([
@@ -589,6 +620,7 @@ class TotalSeg2DZOptDataset(Dataset):
             "target_case_id": target_case_id,
             "context_case_ids": context_case_ids,
             "label_id": label_id,
+            "_range_info": _range_info,
         }
 
     def __len__(self) -> int:
@@ -607,32 +639,86 @@ class TotalSeg2DZOptDataset(Dataset):
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, Union[torch.Tensor, List]]:
-    """Custom collate function for batching."""
+    """Custom collate function for batching.
+
+    Samples batch-wide random sizes (if ranges configured):
+    - image_size_range: samples one size for entire batch, resizes all images
+    - context_size_range: samples one count for entire batch, truncates all contexts
+    """
+    # Get range info from first item (all items have same config)
+    range_info = batch[0].get("_range_info", {})
+    img_range = range_info.get("image_size_range", (None, None))
+    ctx_range = range_info.get("context_size_range", (None, None))
+
+    # Sample batch-wide image size
+    current_size = batch[0]["image"].shape[-1]
+    if img_range[0] is not None and img_range[0] != img_range[1]:
+        batch_image_size = random.randint(img_range[0], img_range[1])
+    else:
+        batch_image_size = current_size
+
+    needs_resize = (batch_image_size != current_size)
+
+    def resize_tensor(tensor: torch.Tensor, target_size: int) -> torch.Tensor:
+        """Resize [C, H, W] or [k, C, H, W] tensor to target size."""
+        if tensor.shape[-1] == target_size:
+            return tensor
+        if tensor.dim() == 3:
+            return torch.nn.functional.interpolate(
+                tensor.unsqueeze(0), size=(target_size, target_size),
+                mode='bilinear', align_corners=False
+            ).squeeze(0)
+        else:
+            return torch.nn.functional.interpolate(
+                tensor, size=(target_size, target_size),
+                mode='bilinear', align_corners=False
+            )
+
+    if needs_resize:
+        images = torch.stack([resize_tensor(item["image"], batch_image_size) for item in batch])
+        labels = torch.stack([resize_tensor(item["label"], batch_image_size) for item in batch])
+    else:
+        images = torch.stack([item["image"] for item in batch])
+        labels = torch.stack([item["label"] for item in batch])
+
     result = {
-        "image": torch.stack([item["image"] for item in batch]),
-        "label": torch.stack([item["label"] for item in batch]),
+        "image": images,
+        "label": labels,
         "target_case_ids": [item["target_case_id"] for item in batch],
         "label_ids": [item["label_id"] for item in batch],
     }
 
-    if any("context_in" in item for item in batch):
-        prototype_item = next((item for item in batch if "context_in" in item), None)
-        if prototype_item is not None:
-            context_size, _, h, w = prototype_item["context_in"].shape
+    items_with_context = [item for item in batch if "context_in" in item]
+    if items_with_context:
+        # Sample batch-wide context size
+        max_context = items_with_context[0]["context_in"].shape[0]
+        if ctx_range[0] is not None and ctx_range[0] != ctx_range[1]:
+            batch_context_size = random.randint(ctx_range[0], ctx_range[1])
+        else:
+            batch_context_size = max_context
 
-            default_in = torch.zeros(context_size, 1, h, w)
-            default_out = torch.zeros(context_size, 1, h, w)
-            default_ids = ["PAD"] * context_size
+        default_in = torch.zeros(batch_context_size, 1, batch_image_size, batch_image_size)
+        default_out = torch.zeros(batch_context_size, 1, batch_image_size, batch_image_size)
+        default_ids = ["PAD"] * batch_context_size
 
-            result["context_in"] = torch.stack([
-                item.get("context_in", default_in) for item in batch
-            ])
-            result["context_out"] = torch.stack([
-                item.get("context_out", default_out) for item in batch
-            ])
-            result["context_case_ids"] = [
-                item.get("context_case_ids", default_ids) for item in batch
-            ]
+        def process_context(ctx_tensor: torch.Tensor) -> torch.Tensor:
+            ctx = ctx_tensor[:batch_context_size]
+            if needs_resize:
+                ctx = resize_tensor(ctx, batch_image_size)
+            return ctx
+
+        result["context_in"] = torch.stack([
+            process_context(item["context_in"]) if "context_in" in item else default_in
+            for item in batch
+        ])
+        result["context_out"] = torch.stack([
+            process_context(item["context_out"]) if "context_out" in item else default_out
+            for item in batch
+        ])
+        result["context_case_ids"] = [
+            item["context_case_ids"][:batch_context_size] if "context_case_ids" in item else default_ids
+            for item in batch
+        ]
 
     return result
 
@@ -663,5 +749,4 @@ def get_dataloader(
         pin_memory=True,
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
-        multiprocessing_context="spawn" if num_workers > 0 else None,
     )

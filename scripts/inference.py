@@ -132,6 +132,17 @@ def create_feature_extractor(config: dict, device: str = "cuda"):
             input_size=fe_cfg.get('input_size', 128),
         )
 
+    elif extractor_type == 'medsam2':
+        from src.models.medsam2_extractor import MedSAM2Extractor
+        return MedSAM2Extractor(
+            layer_idx=fe_cfg.get('layer_idx', 2),
+            device=device,
+            checkpoint_path=fe_cfg.get('checkpoint_path'),
+            freeze=fe_cfg.get('freeze', True),
+            output_grid_size=fe_cfg.get('output_grid_size'),
+            input_size=fe_cfg.get('input_size', 512),
+        )
+
     else:
         raise ValueError(f"Unknown feature_extractor_type: {extractor_type}")
 

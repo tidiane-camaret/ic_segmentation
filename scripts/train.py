@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.losses import build_loss_fn
 from src.train_utils import seed_everything, train_epoch, validate, wait_for_image_saves
 
+torch.set_float32_matmul_precision('high')
 
 def _get_image_size(cfg) -> tuple[int, int]:
     """Get image size as tuple, handling both scalar and list formats."""
@@ -421,6 +422,29 @@ def main(cfg: DictConfig) -> None:
                         f"dim={info['feature_dim']}, input={info['input_size']}x{info['input_size']}, "
                         f"grid={info['output_grid_size']}, skip_preprocess={info['skip_preprocess']})"
                     )
+            elif extractor_type == "medsam2":
+                from src.models.medsam2_extractor import MedSAM2Extractor
+
+                if accelerator.is_main_process:
+                    print("Initializing MedSAM2 for on-the-fly feature extraction...")
+                feature_extractor = MedSAM2Extractor(
+                    layer_idx=fe_cfg.get("layer_idx", 2) if fe_cfg else 2,  # Default level 2 (32x32)
+                    device=device,
+                    checkpoint_path=fe_cfg.get("checkpoint_path") if fe_cfg else None,
+                    freeze=fe_cfg.get("freeze", True) if fe_cfg else True,
+                    output_grid_size=fe_cfg.get("output_grid_size") if fe_cfg else None,
+                    input_size=fe_cfg.get("input_size", 512) if fe_cfg else 512,
+                    compile_model=fe_cfg.get("compile", False) if fe_cfg else False,
+                )
+                if fe_cfg.get("compile", False):
+                    feature_extractor.warmup(batch_size=2)
+                if accelerator.is_main_process:
+                    info = feature_extractor.get_feature_info()
+                    print(
+                        f"Feature mode: on_the_fly (MedSAM2 layers={info['layer_indices']}, "
+                        f"dim={info['feature_dim']}, input={info['input_size']}x{info['input_size']}, "
+                        f"grid={info['output_grid_size']})"
+                    )
             elif extractor_type == "icl_encoder":
                 from src.models.icl_encoder import ICLEncoder
 
@@ -653,6 +677,7 @@ def main(cfg: DictConfig) -> None:
             use_wandb=cfg.logging.use_wandb,
             epoch=epoch,
             save_dir=val_save_dir,
+            compute_metrics_every=cfg.training.get("val_compute_metrics_every", 5),
         )
 
         scheduler.step()

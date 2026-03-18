@@ -2,8 +2,12 @@ import random
 from typing import Dict, List, Optional, Tuple
 
 import albumentations as A
-import numpy as np
 import cv2
+import numpy as np
+
+# Disable OpenCV threading to make it fork-safe with PyTorch DataLoader
+# Must be called before any cv2 functions are used
+cv2.setNumThreads(0)
 
 def create_augmentation_transforms(
     img_size: int = 512,
@@ -913,11 +917,11 @@ def apply_medical_specialty_augs(
 
     # 4. Resize back to target resolution (256x256)
     img_size = config.get("img_size", 256)
-    
+
     target_img = cv2.resize(target_img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
     # Always use INTER_NEAREST for masks to prevent creating floating point labels!
     target_mask = cv2.resize(target_mask, (img_size, img_size), interpolation=cv2.INTER_NEAREST)
-    
+
     context_imgs = [cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR) for img in new_ctx_imgs]
     context_masks = [cv2.resize(mask, (img_size, img_size), interpolation=cv2.INTER_NEAREST) for mask in new_ctx_masks]
 

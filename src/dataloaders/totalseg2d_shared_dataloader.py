@@ -486,6 +486,10 @@ class TotalSeg2DSharedDataset(Dataset):
             # Two-stage sampling: pick label uniformly, then pick a random sample
             label_id = random.choice(self.active_labels)
             target_case_id, axis, slice_idx = random.choice(self.label_to_samples[label_id])
+        elif self.max_ds_len is not None:
+            # Random sampling from full pool when max_ds_len is set
+            # This ensures different samples are seen across epochs
+            target_case_id, label_id, axis, slice_idx = random.choice(self.samples)
         else:
             target_case_id, label_id, axis, slice_idx = self.samples[idx]
 
@@ -705,5 +709,4 @@ def get_dataloader(
         pin_memory=True,
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
-        multiprocessing_context="spawn" if num_workers > 0 else None,
     )
