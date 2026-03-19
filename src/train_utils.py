@@ -667,12 +667,13 @@ def train_epoch(
                 per_sample_dice = metrics.get("per_sample_dice")
                 if per_sample_dice is None:
                     per_sample_dice = compute_per_sample_dice(outputs, labels)
+                per_sample_dice_list = per_sample_dice.flatten().tolist()  # Single GPU sync
                 batch_label_ids = batch.get("label_ids") or batch.get(
                     "label_id", [None] * images.shape[0]
                 )
                 for i in range(images.shape[0]):
                     label_id = batch_label_ids[i] if batch_label_ids else "unknown"
-                    dice_val = per_sample_dice[i].item()
+                    dice_val = per_sample_dice_list[i]
                     if label_id not in label_dice_scores:
                         label_dice_scores[label_id] = []
                     label_dice_scores[label_id].append(dice_val)
@@ -892,20 +893,27 @@ def validate(
             "label_id", [None] * images.shape[0]
         )
         batch_axes = batch.get("axes", [None] * images.shape[0])
+
+        # Batch convert tensors to lists (single GPU sync instead of per-sample)
+        per_sample_dice_list = per_sample_dice.flatten().tolist()
+        target_mask_sizes = (labels > 0.5).view(labels.shape[0], -1).sum(dim=1).tolist()  # [B]
+        if context_out is not None:
+            # [B, k, 1, H, W] -> [B, k] -> list of lists
+            ctx_shape = context_out.shape
+            context_mask_sizes_batch = (context_out > 0.5).view(ctx_shape[0], ctx_shape[1], -1).sum(dim=2).tolist()
+        else:
+            context_mask_sizes_batch = None
+
         for i in range(images.shape[0]):
             case_id = (
                 batch_case_ids[i] if batch_case_ids else f"batch{batch_idx}_sample{i}"
             )
             label_id = batch_label_ids[i] if batch_label_ids else "unknown"
             axis = batch_axes[i] if batch_axes else None
-            dice_val = per_sample_dice[i].item()
+            dice_val = per_sample_dice_list[i]
 
-            # Compute mask sizes (number of positive pixels)
-            target_mask_size = (labels[i] > 0.5).sum().item()
-            context_mask_sizes = None
-            if context_out is not None:
-                context_mask_sizes = [(context_out[i, c] > 0.5).sum().item()
-                                      for c in range(context_out.shape[1])]
+            target_mask_size = target_mask_sizes[i]
+            context_mask_sizes = context_mask_sizes_batch[i] if context_mask_sizes_batch is not None else None
 
             case_results.append(
                 {

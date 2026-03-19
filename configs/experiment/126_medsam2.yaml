@@ -28,7 +28,7 @@ model:
     feature_extractor:
       type: "medsam2"
       layer_idx: "all"             # All 3 FPN levels concatenated (768-dim total)
-      input_size: 512              # MedSAM2 native input
+      input_size: 128              # MedSAM2 native input
       output_grid_size: "${preprocessing.feature_image_size}"
       freeze: true
       compile: false  # Enable PyTorch 2.0 compilation for faster inference (with dynamic=True for variable batch sizes)
@@ -67,7 +67,7 @@ model:
         spread_sigma_context: 4.0
 
     # Oracle disabled - pure model-based sampling
-    oracle_levels_train: [false, false, false]
+    oracle_levels_train: [false, true, true]
     oracle_levels_valid: [false, false, false]
 
     oracle_scheduling:

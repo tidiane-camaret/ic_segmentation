@@ -494,7 +494,8 @@ def main(cfg: DictConfig) -> None:
         val_loss, val_final_dice, val_context_dice, detailed_results = validate(
             model, val_loader, device,
             save_dir=save_dir, max_save_batches=len(val_loader),
-            accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0
+            accelerator=accelerator, use_wandb=cfg.logging.use_wandb, epoch=0,
+            compute_metrics_every=cfg.training.get("val_compute_metrics_every", 1),
         )
         if accelerator.is_main_process:
             val_soft_dice = detailed_results.get("final_soft_dice", 0.0)
