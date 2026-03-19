@@ -23,6 +23,22 @@ def _get_image_size(cfg) -> tuple[int, int]:
     return (img_size, img_size)
 
 
+def _get_context_size(cfg, split: str = "train"):
+    """Get context_size for a specific split.
+
+    Supports both legacy format (context_size: 6) and new format:
+        context_size:
+          train: [3, 6]  # range for random sampling
+          val: 6         # fixed
+    """
+    ctx = cfg.context_size
+    # New format: dict with train/val keys
+    if hasattr(ctx, 'get') or isinstance(ctx, dict):
+        return ctx.get(split, ctx.get('train', 6))
+    # Legacy format: single value
+    return ctx
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     """Main training function."""
@@ -106,7 +122,7 @@ def main(cfg: DictConfig) -> None:
             data_root=cfg.paths.medsegbench,
             datasets=msb_train_datasets,
             split="train",
-            context_size=cfg.context_size,
+            context_size=_get_context_size(cfg, "train"),
             batch_size=cfg.train_batch_size,
             image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
@@ -119,7 +135,7 @@ def main(cfg: DictConfig) -> None:
             data_root=cfg.paths.medsegbench,
             datasets=msb_val_datasets,
             split="val",
-            context_size=cfg.context_size,
+            context_size=_get_context_size(cfg, "val"),
             batch_size=cfg.val_batch_size,
             image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
@@ -225,7 +241,7 @@ def main(cfg: DictConfig) -> None:
             root_dir=root_dir,
             stats_path=stats_path,
             label_id_list=train_labels,
-            context_size=cfg.context_size,
+            context_size=_get_context_size(cfg, "train"),
             batch_size=cfg.train_batch_size,
             image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
@@ -267,7 +283,7 @@ def main(cfg: DictConfig) -> None:
             root_dir=root_dir,
             stats_path=stats_path,
             label_id_list=val_labels,
-            context_size=cfg.context_size,
+            context_size=_get_context_size(cfg, "val"),
             batch_size=cfg.val_batch_size,
             image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
@@ -485,10 +501,16 @@ def main(cfg: DictConfig) -> None:
             if accelerator.is_main_process:
                 print("Feature mode: precomputed")
 
-        # Create PatchICL model
+        # Create PatchICL model (use max context size for model capacity)
+        ctx_train = _get_context_size(cfg, "train")
+        ctx_val = _get_context_size(cfg, "val")
+        # Get max: handle both scalar and range formats
+        ctx_train_max = ctx_train[-1] if hasattr(ctx_train, '__iter__') and not isinstance(ctx_train, str) else ctx_train
+        ctx_val_max = ctx_val[-1] if hasattr(ctx_val, '__iter__') and not isinstance(ctx_val, str) else ctx_val
+        model_context_size = max(ctx_train_max, ctx_val_max)
         model = PatchICL(
             patch_icl_cfg,
-            context_size=cfg.get("context_size", 0),
+            context_size=model_context_size,
             feature_extractor=feature_extractor,
         )
 

@@ -89,6 +89,7 @@ def process_level(
     mask_prior: torch.Tensor | None = None,
     prev_register_tokens: torch.Tensor | None = None,
     return_attn_weights: bool = False,
+    skip_context_decoding: bool = False,
 ) -> LevelOutput:
     """Process a single resolution level.
 
@@ -265,11 +266,12 @@ def process_level(
             mask_prior_patches=mask_prior_patches,
             context_mask_patches=context_mask_patches,
             prev_register_tokens=prev_register_tokens,
+            skip_context_decoding=skip_context_decoding,
         )
 
         all_logits = backbone_out['mask_patch_logit_preds']
         patch_logits = all_logits[:, :K]
-        context_patch_logits = all_logits[:, K:]
+        context_patch_logits = all_logits[:, K:] if not skip_context_decoding else None
 
         # Get sampling map
         patch_sampling_map = _get_patch_sampling_map(
@@ -277,22 +279,25 @@ def process_level(
             sampling_map_source, sampling_map_temperature
         )
 
-        # Aggregate context predictions
-        context_preds = []
-        for ctx_idx in range(k):
-            start_idx = ctx_idx * K_per_ctx
-            end_idx = (ctx_idx + 1) * K_per_ctx
-            ctx_logits = context_patch_logits[:, start_idx:end_idx]
-            ctx_coords_slice = context_coords[:, start_idx:end_idx]
-            if augmenter is not None and context_aug_params is not None:
-                for b in range(B):
-                    ctx_aug = context_aug_params[b][ctx_idx]
-                    if ctx_aug and any(v is not None for v in ctx_aug.values()):
-                        ctx_logits[b:b+1] = augmenter.inverse(ctx_logits[b:b+1], ctx_aug)
-            agg_result = aggregator(ctx_logits, ctx_coords_slice, (resolution, resolution))
-            ctx_pred = agg_result[0] if isinstance(agg_result, tuple) else agg_result
-            context_preds.append(ctx_pred)
-        context_pred = torch.stack(context_preds, dim=1)
+        # Aggregate context predictions (skip if not decoding context)
+        if skip_context_decoding:
+            context_pred = None
+        else:
+            context_preds = []
+            for ctx_idx in range(k):
+                start_idx = ctx_idx * K_per_ctx
+                end_idx = (ctx_idx + 1) * K_per_ctx
+                ctx_logits = context_patch_logits[:, start_idx:end_idx]
+                ctx_coords_slice = context_coords[:, start_idx:end_idx]
+                if augmenter is not None and context_aug_params is not None:
+                    for b in range(B):
+                        ctx_aug = context_aug_params[b][ctx_idx]
+                        if ctx_aug and any(v is not None for v in ctx_aug.values()):
+                            ctx_logits[b:b+1] = augmenter.inverse(ctx_logits[b:b+1], ctx_aug)
+                agg_result = aggregator(ctx_logits, ctx_coords_slice, (resolution, resolution))
+                ctx_pred = agg_result[0] if isinstance(agg_result, tuple) else agg_result
+                context_preds.append(ctx_pred)
+            context_pred = torch.stack(context_preds, dim=1)
     else:
         # No context
         ctx_id_labels = torch.zeros(B, K, dtype=torch.long, device=device)

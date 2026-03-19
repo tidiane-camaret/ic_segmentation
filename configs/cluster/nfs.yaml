@@ -17,7 +17,7 @@ paths:
     patch_icl: ${..RESULTS_DIR}/checkpoints/best_model_28_01_26.pt
     patch_icl_v2: null #${..RESULTS_DIR}/checkpoints/peach-plasma-179/best_model.pt
 # Cluster-specific training settings
-train_batch_size: 40
-val_batch_size: 40
+train_batch_size: 30
+val_batch_size: 30
 training:
   num_workers: 18

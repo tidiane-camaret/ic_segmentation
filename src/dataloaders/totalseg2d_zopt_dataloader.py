@@ -87,20 +87,24 @@ class TotalSeg2DZOptDataset(Dataset):
         self.min_coverage = min_coverage
         self.min_coverage_ratio = min_coverage_ratio
         # Parse context_size: int or (min, max) range
-        if isinstance(context_size, (list, tuple)):
+        # Note: Hydra passes ListConfig, not list, so check for __iter__ instead
+        if hasattr(context_size, '__iter__') and not isinstance(context_size, str):
+            context_size = list(context_size)  # Convert ListConfig to list
             self.context_size_min, self.context_size_max = context_size
             self.context_size = self.context_size_max  # For compatibility
         else:
             self.context_size_min = self.context_size_max = context_size
             self.context_size = context_size
         # Parse image_size: int (fixed) or (min, max) range. Always square.
+        # Note: Hydra passes ListConfig, not list, so check for __iter__ instead
         if image_size is None:
             self.image_size = None
             self.image_size_min = self.image_size_max = None
         elif isinstance(image_size, int):
             self.image_size = (image_size, image_size)
             self.image_size_min = self.image_size_max = image_size
-        elif isinstance(image_size, (list, tuple)):
+        elif hasattr(image_size, '__iter__') and not isinstance(image_size, str):
+            image_size = list(image_size)  # Convert ListConfig to list
             self.image_size_min, self.image_size_max = image_size[0], image_size[-1]
             self.image_size = (self.image_size_max, self.image_size_max)
         else:

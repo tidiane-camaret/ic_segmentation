@@ -142,6 +142,7 @@ class SimpleBackbone(nn.Module):
         mask_prior_patches: torch.Tensor | None = None,
         context_mask_patches: torch.Tensor | None = None,
         prev_register_tokens: torch.Tensor | None = None,
+        skip_context_decoding: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Forward pass: encode -> attention -> decode.
 
@@ -156,6 +157,7 @@ class SimpleBackbone(nn.Module):
             mask_prior_patches: [B, K_target, 1, h, h] - mask prior
             context_mask_patches: [B, K_ctx, 1, h, h] - GT context masks
             prev_register_tokens: [B, R, D] - registers from previous level
+            skip_context_decoding: If True, only decode target patches (~20% speedup)
 
         Returns:
             Dict with mask_patch_logit_preds and optional extras
@@ -220,7 +222,13 @@ class SimpleBackbone(nn.Module):
         )
 
         # Decode with resolution conditioning
-        seg_pred, sampling_map = self.decoder(attended, skips, scale_embed)
+        # Skip context decoding for ~20% speedup when context loss is disabled
+        if skip_context_decoding and num_target_patches is not None:
+            attended_to_decode = attended[:, :num_target_patches]
+            skips_to_decode = {k: v[:, :num_target_patches] for k, v in skips.items()} if skips else skips
+            seg_pred, sampling_map = self.decoder(attended_to_decode, skips_to_decode, scale_embed)
+        else:
+            seg_pred, sampling_map = self.decoder(attended, skips, scale_embed)
 
         result = {
             'mask_patch_logit_preds': seg_pred,

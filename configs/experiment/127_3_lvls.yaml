@@ -12,7 +12,7 @@ defaults:
   - override /method: patch_icl
 
 max_ds_len:
-  train: 200000
+  train: 20000
 max_cases:                                                                                                                                                                               
     val: null
 
@@ -20,7 +20,9 @@ preprocessing:
   image_size: 128
   feature_image_size: 128 
 
-context_size: 6
+context_size:
+  train: [3, 6]  # Range for random sampling during training
+  val: 6         # Fixed for validation
 
 model:
   patch_icl:
@@ -43,6 +45,17 @@ model:
         num_context_patches: 9
         pad_before: 0
         pad_after: 0
+      - resolution: 64
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 20
+        num_context_patches: 20
+        pad_before: 0
+        pad_after: 0
+        spread_sigma_target: 4.0
+        spread_sigma_context: 4.0
       - resolution: "${preprocessing.image_size}"
         patch_size: 8
         sampling_method: "continuous"
@@ -56,8 +69,8 @@ model:
         spread_sigma_context: 4.0
 
     # Oracle disabled - pure model-based sampling
-    oracle_levels_train: [false, true]
-    oracle_levels_valid: [false, false]
+    oracle_levels_train: [false, true, true]
+    oracle_levels_valid: [false, false, false]
 
     oracle_scheduling:
       enabled: true
@@ -111,13 +124,12 @@ model:
         type: "softdiceFocal"
         args: null
       weights:
-        default:
-          target_patch: 0.0
-          target_aggreg: 0.0
-          context_patch: 0.0
-          context_aggreg: 0.0
-          target_combined: 1.0
-      level_weights: [0.0, 1.0]
+        target_patch: 0.0
+        target_aggreg: 0.0
+        context_patch: 0.0
+        context_aggreg: 0.0
+        target_combined: 1.0
+      level_weights: [0.0, 0.0, 1.0] # "uniform",  "progressive", explicit list 
 
     cascade:
       detach_between_levels: false
@@ -125,3 +137,4 @@ model:
       sampling_map_blend: false
       learned_alpha: false
       cascade_registers: true
+      skip_context_decoding: true  # Skip decoder for context patches (~20% speedup, use when context_loss=0)

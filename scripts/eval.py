@@ -28,6 +28,22 @@ def _get_image_size(cfg) -> tuple[int, int]:
     return (img_size, img_size)
 
 
+def _get_context_size(cfg, split: str = "val"):
+    """Get context_size for a specific split.
+
+    Supports both legacy format (context_size: 6) and new format:
+        context_size:
+          train: [3, 6]  # range for random sampling
+          val: 6         # fixed
+    """
+    ctx = cfg.context_size
+    # New format: dict with train/val keys
+    if hasattr(ctx, 'get') or isinstance(ctx, dict):
+        return ctx.get(split, ctx.get('val', 6))
+    # Legacy format: single value
+    return ctx
+
+
 def measure_flops(model, val_loader, device, accelerator=None):
     """Measure forward-pass FLOPs on one batch using PyTorch's built-in counter."""
     try:
@@ -327,7 +343,7 @@ def main(cfg: DictConfig) -> None:
             root_dir=root_dir,
             stats_path=stats_path,
             label_id_list=val_labels,
-            context_size=cfg.context_size,
+            context_size=_get_context_size(cfg, "val"),
             batch_size=cfg.val_batch_size,
             image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),
@@ -382,7 +398,7 @@ def main(cfg: DictConfig) -> None:
             data_root=cfg.paths.medsegbench,
             datasets=msb_val_datasets,
             split="val",
-            context_size=cfg.context_size,
+            context_size=_get_context_size(cfg, "val"),
             batch_size=cfg.val_batch_size,
             image_size=_get_image_size(cfg),
             num_workers=cfg.training.get("num_workers", 4),

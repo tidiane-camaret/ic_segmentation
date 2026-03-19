@@ -44,6 +44,7 @@ class PatchICLConfig:
     # Cascade config
     detach_between_levels: bool = True
     cascade_registers: bool = False
+    skip_context_decoding: bool = False  # Skip decoder for context patches (~20% speedup)
 
     # Sampling config
     sampler_type: str = "continuous"
@@ -66,6 +67,7 @@ class PatchICLConfig:
     loss_target_combined: float = 1.0
     loss_context_patch: float = 0.0
     loss_context_aggreg: float = 1.0
+    level_weights: list[float] | str = field(default_factory=lambda: "uniform")
 
     # Augmentation
     augmentation_enabled: bool = False
@@ -85,6 +87,7 @@ class PatchICLConfig:
     backbone_dropout: float = 0.0
     backbone_decoder_use_skip_connections: bool = True
     backbone_gradient_checkpointing: bool = False
+    backbone_append_zero_attn: bool = False
     backbone_num_context_layers: int = 0
     backbone_use_mask_prior: bool = False
     backbone_use_context_mask: bool = False
@@ -146,6 +149,7 @@ class PatchICL(nn.Module):
         # Cascade config
         self.detach_between_levels = cfg.detach_between_levels
         self.cascade_registers = cfg.cascade_registers
+        self.skip_context_decoding = cfg.skip_context_decoding
 
         # Sampling config
         self.target_oracle_mode = cfg.target_sampling_oracle
@@ -174,6 +178,22 @@ class PatchICL(nn.Module):
         }
         self.patch_criterion = None
         self.aggreg_criterion = None
+
+        # Per-level loss weights
+        if cfg.level_weights == 'uniform':
+            self.level_weights = [1.0] * self.num_levels
+        elif cfg.level_weights == 'progressive':
+            if self.num_levels == 1:
+                self.level_weights = [1.0]
+            else:
+                self.level_weights = [
+                    0.3 + 0.7 * i / (self.num_levels - 1)
+                    for i in range(self.num_levels)
+                ]
+        else:
+            self.level_weights = list(cfg.level_weights)
+        while len(self.level_weights) < self.num_levels:
+            self.level_weights.append(1.0)
 
         # Feature extractor config
         fe_cfg = config.get('feature_extractor', {}) if isinstance(config, dict) else {}
@@ -254,6 +274,7 @@ class PatchICL(nn.Module):
             dropout=cfg.backbone_dropout,
             decoder_use_skip_connections=cfg.backbone_decoder_use_skip_connections,
             gradient_checkpointing=cfg.backbone_gradient_checkpointing,
+            append_zero_attn=cfg.backbone_append_zero_attn,
             use_mask_prior=cfg.backbone_use_mask_prior,
             mask_fusion_type=cfg.backbone_mask_fusion_type,
             predict_sampling_map=(self.sampling_map_source == 'learned'),
@@ -283,6 +304,7 @@ class PatchICL(nn.Module):
             oracle_scheduling_end=oracle_sched.get('end_prob', 0.3),
             detach_between_levels=cascade_cfg.get('detach_between_levels', True),
             cascade_registers=cascade_cfg.get('cascade_registers', False),
+            skip_context_decoding=cascade_cfg.get('skip_context_decoding', False),
             sampler_type=sampler_cfg.get('type', 'continuous'),
             target_sampling_oracle=sampler_cfg.get('target_sampling_oracle', 'gt_foreground'),
             target_model_sampling=sampler_cfg.get('target_model_sampling', 'predicted_entropy'),
@@ -297,6 +319,7 @@ class PatchICL(nn.Module):
             loss_target_combined=config.get('loss', {}).get('weights', {}).get('target_combined', 1.0),
             loss_context_patch=config.get('loss', {}).get('weights', {}).get('context_patch', 0.0),
             loss_context_aggreg=config.get('loss', {}).get('weights', {}).get('context_aggreg', 1.0),
+            level_weights=config.get('loss', {}).get('level_weights', 'uniform'),
             augmentation_enabled=aug_cfg.get('enabled', False),
             augmentation_rotation=aug_cfg.get('rotation', 'none'),
             augmentation_rotation_range=aug_cfg.get('rotation_range', 0.5),
@@ -312,6 +335,7 @@ class PatchICL(nn.Module):
             backbone_dropout=backbone_cfg.get('dropout', 0.0),
             backbone_decoder_use_skip_connections=backbone_cfg.get('decoder_use_skip_connections', True),
             backbone_gradient_checkpointing=backbone_cfg.get('gradient_checkpointing', False),
+            backbone_append_zero_attn=backbone_cfg.get('append_zero_attn', False),
             backbone_num_context_layers=backbone_cfg.get('num_context_layers', 0),
             backbone_use_mask_prior=backbone_cfg.get('use_mask_prior', False),
             backbone_use_context_mask=backbone_cfg.get('use_context_mask', False),
@@ -514,6 +538,7 @@ class PatchICL(nn.Module):
                 mask_prior=mask_prior,
                 prev_register_tokens=prev_register_tokens if self.cascade_registers else None,
                 return_attn_weights=return_attn_weights,
+                skip_context_decoding=self.skip_context_decoding,
             )
 
             pred = level_out.pred
@@ -631,6 +656,7 @@ class PatchICL(nn.Module):
         total_loss = 0.0
 
         for i, level_out in enumerate(outputs['level_outputs']):
+            lw = self.level_weights[i]
             patch_logits = level_out['patch_logits']
             patch_labels = level_out['patch_labels']
             target_validity = level_out.get('target_validity')
@@ -643,7 +669,7 @@ class PatchICL(nn.Module):
                     patch_labels.reshape(B * K, -1),
                     target_validity.reshape(B * K, -1) if target_validity is not None else None,
                 )
-                total_loss = total_loss + self.loss_weights['target_patch'] * target_patch_loss
+                total_loss = total_loss + lw * self.loss_weights['target_patch'] * target_patch_loss
 
             # Target aggreg loss
             pred = level_out['pred']
@@ -652,7 +678,7 @@ class PatchICL(nn.Module):
 
             if self.loss_weights['target_aggreg'] > 0:
                 target_aggreg_loss = self.aggreg_criterion(pred, labels_ds)
-                total_loss = total_loss + self.loss_weights['target_aggreg'] * target_aggreg_loss
+                total_loss = total_loss + lw * self.loss_weights['target_aggreg'] * target_aggreg_loss
 
             # Combined prediction loss
             combined_pred = level_out.get('combined_pred')
@@ -663,7 +689,7 @@ class PatchICL(nn.Module):
                     else resize_label(labels.float(), size=combined_res)
                 )
                 target_combined_loss = self.aggreg_criterion(combined_pred, labels_combined)
-                total_loss = total_loss + self.loss_weights['target_combined'] * target_combined_loss
+                total_loss = total_loss + lw * self.loss_weights['target_combined'] * target_combined_loss
 
             # Context losses
             ctx_patch_logits = level_out.get('context_patch_logits')
@@ -678,7 +704,7 @@ class PatchICL(nn.Module):
                         ctx_patch_labels.reshape(B * K_ctx, -1),
                         ctx_validity.reshape(B * K_ctx, -1) if ctx_validity is not None else None,
                     )
-                    total_loss = total_loss + self.loss_weights['context_patch'] * context_patch_loss
+                    total_loss = total_loss + lw * self.loss_weights['context_patch'] * context_patch_loss
 
             context_pred = level_out.get('context_pred')
             context_labels_fullres = level_out.get('context_labels_fullres')
@@ -692,7 +718,7 @@ class PatchICL(nn.Module):
                         context_pred.reshape(B_ctx * k_ctx, -1),
                         context_labels_ds.reshape(B_ctx * k_ctx, -1),
                     )
-                    total_loss = total_loss + self.loss_weights['context_aggreg'] * context_aggreg_loss
+                    total_loss = total_loss + lw * self.loss_weights['context_aggreg'] * context_aggreg_loss
 
         losses['total_loss'] = total_loss
 
