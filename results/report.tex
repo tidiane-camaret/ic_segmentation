@@ -95,9 +95,9 @@ Direct patch-based methods like Medverse \cite{huMedverseUniversalModel2025a} us
 
 Our method processes images through a coarse-to-fine cascade of $M$ resolution levels $\{r_1, \ldots, r_M\}$ (e.g., $24 \rightarrow 96 \rightarrow 128$). At each level:
 \begin{enumerate}
-    \item \textbf{Sampling:} Select $K$ patches using Gumbel-top-$K$ sampling, guided by uncertainty from the previous level.
+    \item \textbf{Sampling:} Select $K$ patches via Gumbel-top-$K$ sampling, using uncertainty from the previous level as sampling weights.
     \item \textbf{Attention:} Process target and context patches jointly through transformer layers.
-    \item \textbf{Aggregation:} Combine patch predictions via averaging.
+    \item \textbf{Aggregation:} Combine potentially overlapping patch predictions of that level via averaging.
     \item \textbf{Refinement:} Additively fuse with upsampled previous-level predictions.
 \end{enumerate}
 
@@ -109,17 +109,17 @@ We use Gumbel-top-$K$ sampling to select patches in a differentiable manner:
 \end{equation}
 where $w(x,y)$ are sampling weights and $\tau$ is a temperature parameter.
 
-At level $\ell > 1$, sampling is guided by the entropy of the previous level's prediction:
+At level $\ell > 1$, target patch sampling is guided by the entropy of the previous level's prediction:
 \begin{equation}
     w_\ell(x, y) = H(p_{\ell-1}(x,y)), \quad H(p) = -p\log p - (1-p)\log(1-p)
 \end{equation}
-where $p_{\ell-1} = \sigma(\text{logits}_{\ell-1})$, focusing computation on uncertain regions.
+where $p_{\ell-1} = \sigma(\text{logits}_{\ell-1})$, focusing computation on uncertain regions. Context patches are sampled using the entropy of the ground-truth mask, balancing foreground coverage with boundary regions.
 
 Patches are sampled such that their \textbf{center} lies within the image, allowing partial overlap with boundaries. This increases coverage of border regions often undersampled by interior-only methods.
 
 \subsection{Feature Extraction and Encoding}
 
-Patches are encoded using frozen pretrained features from MedSAM2~\cite{maMedSAM2SegmentMedical2024}, a medical imaging foundation model. We extract multi-scale features from all three FPN levels (128$\times$128, 64$\times$64, 32$\times$32 at 512 input), resize to a common grid, and concatenate along the channel dimension, yielding 768-dimensional features per spatial location. A lightweight CNN encoder projects these to embeddings $\mathbf{z}_k \in \mathbb{R}^{d}$, producing skip connections for the decoder.
+Patches are encoded using the frozen encoder from UniverSeg~\cite{butoiUniverSegUniversalMedical2023}. A lightweight CNN encoder projects these features to embeddings $\mathbf{z}_k \in \mathbb{R}^{d}$, producing skip connections for the decoder.
 
 To enable a single backbone across all resolution levels, we condition on resolution via sinusoidal encoding, allowing generalization to unseen resolutions.
 
@@ -127,7 +127,6 @@ To enable a single backbone across all resolution levels, we condition on resolu
 
 Target and context patch embeddings are processed jointly through $L$ transformer layers with:
 \begin{itemize}
-    \item \textbf{Register tokens:} $R$ learnable tokens prepended to the sequence, providing global context aggregation across patches.
     \item \textbf{2D RoPE:} Rotary position embeddings encode spatial patch coordinates $(y, x)$, enabling reasoning about relative patch positions.
     \item \textbf{Type embeddings:} Per-layer learnable embeddings distinguish target from context patches.
     \item \textbf{Bidirectional attention:} All patches attend to all others (Flash Attention compatible).
@@ -151,11 +150,11 @@ where $\hat{L}^t_{\ell-1,\uparrow}$ is the upsampled previous prediction and $M_
 
 \subsection{Training}
 
-The model is trained with supervision on the final combined prediction:
+The model is trained with supervision at each level using uniform weights:
 \begin{equation}
-    \mathcal{L} = \mathcal{L}_\text{combined}^M
+    \mathcal{L} = \sum_{\ell=1}^{M} \mathcal{L}_\text{combined}^\ell, \quad \mathcal{L}_\text{combined}^\ell = \mathcal{L}_\text{softdice}^\ell + \mathcal{L}_\text{focal}^\ell
 \end{equation}
-using soft Dice + Focal loss. During training, oracle sampling combines ground-truth foreground with entropy to balance coverage and uncertainty. \textbf{Oracle scheduling} linearly decays the oracle probability from 50\% to 0\% over the first epochs, transitioning to purely model-based (entropy-guided) sampling.
+using the sum of soft Dice and Focal loss. During training, oracle sampling combines ground-truth foreground with entropy to balance coverage and uncertainty. \textbf{Oracle scheduling} linearly decays the oracle probability from 50\% to 0\% over the first epochs, transitioning to purely model-based (entropy-guided) sampling.
 
 \begin{figure}[!htbp]
 \centering
@@ -202,73 +201,88 @@ We train and evaluate on TotalSegmentator~\cite{wasserthalTotalSegmentatorRobust
 \toprule
 Category & PatchICL & UniverSeg \\
 \midrule
-Organs (Thorax/Head/Spine)    & \textbf{0.460 $\pm$ 0.340} & 0.436 $\pm$ 0.375 \\
-Muscles                       & 0.405 $\pm$ 0.297 & \textbf{0.414 $\pm$ 0.333} \\
-Organs (Abd./Pelvis)          & 0.402 $\pm$ 0.291 & \textbf{0.437 $\pm$ 0.336} \\
-Other                         & 0.345 $\pm$ 0.272 & \textbf{0.368 $\pm$ 0.313} \\
-Vessels                       & 0.261 $\pm$ 0.288 & \textbf{0.305 $\pm$ 0.321} \\
+Bones (Limbs/Shoulder/Pelvis)  & \textbf{0.572 $\pm$ 0.296} & 0.523 $\pm$ 0.331 \\
+Organs (Thorax/Head/Spine)     & 0.568 $\pm$ 0.328 & \textbf{0.584 $\pm$ 0.316} \\
+Bones (Spine)                  & 0.464 $\pm$ 0.271 & \textbf{0.552 $\pm$ 0.281} \\
+Organs (Abd./Pelvis)           & 0.461 $\pm$ 0.314 & \textbf{0.470 $\pm$ 0.335} \\
+Muscles                        & 0.444 $\pm$ 0.328 & \textbf{0.454 $\pm$ 0.332} \\
+Bones (Ribs/Sternum)           & \textbf{0.390 $\pm$ 0.308} & 0.321 $\pm$ 0.334 \\
+Vessels                        & 0.340 $\pm$ 0.326 & \textbf{0.348 $\pm$ 0.339} \\
 \midrule
-\textbf{Overall}              & 0.349 $\pm$ 0.286 & \textbf{0.375 $\pm$ 0.324} \\
+\textbf{Overall}               & \textbf{0.417 $\pm$ 0.321} & 0.397 $\pm$ 0.343 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Per-class analysis.} PatchICL outperforms UniverSeg on 19 of 58 validation classes and wins the Organs (Thorax/Head/Spine) category (+2.4\%). Structure-wise, PatchICL shows strong gains on pelvic organs (prostate +14\%, kidney cysts +17\%), bones (+1.9\% avg, femur +9\%), and mid-thoracic vertebrae (T6--T9: +5\% avg). On medium-difficulty structures (UniverSeg Dice 0.3--0.5), PatchICL matches or exceeds UniverSeg (+0.7\% avg). The gap widens on thin tubular structures: iliac vessels ($-$8 to $-$12\%) and lower ribs ($-$8\%).
+\textbf{Per-class analysis.} PatchICL outperforms UniverSeg on 27 of 45 validation classes (60\%), winning two bone categories: Ribs/Sternum (+6.8\%) and Limbs/Shoulder/Pelvis (+4.9\%). The overall effect size is negligible (Cohen's $d$=0.058). PatchICL excels on repetitive skeletal structures---ribs 7--12 (+7 to +13\%), skull (+12.8\%), costal cartilages (+7.1\%), and femurs (+1.5 to +3.4\%). UniverSeg maintains advantage on spinal vertebrae ($-$8.7\% category), tubular vessels (iliac arteries/veins: $-$3.7 to $-$4.2\%), and paraspinal muscles (autochthon: $-$1.7 to $-$3.5\%).
 
 \subsection{Cross-Modality Generalization (MRI)}
-
-To evaluate cross-modality generalization, we test on TotalSegmentator MRI~\cite{dantonoliTotalSegmentatorMRIRobust2025} without any fine-tuning. Both methods were trained exclusively on CT data.
+                                                                                                                                                                                                                        
+To evaluate cross-modality transfer, we test on TotalSegmentator MRI~\cite{dantonoliTotalSegmentatorMRIRobust2025}, which contains 46 anatomical structures across abdominal and musculoskeletal regions. Both methods 
+were trained exclusively on CT data.
 
 \begin{table}[t]
 \centering
-\caption{Dice scores on TotalSegmentator MRI with 3 context pairs (mean $\pm$ std). Models trained on CT only. Best per category in \textbf{bold}.}\label{tab:dice_totalseg_mri}
+\caption{Dice scores on TotalSegmentator MRI with 3 context pairs (mean $\pm$ std). Best per category in \textbf{bold}.}\label{tab:dice_totalseg_mri}
 \begin{tabular}{lcc}
 \toprule
 Category & PatchICL & UniverSeg \\
 \midrule
-Organs (Thorax/Head/Spine)    & 0.641 $\pm$ 0.308 & \textbf{0.697 $\pm$ 0.312} \\
-Muscles                       & \textbf{0.488 $\pm$ 0.282} & 0.465 $\pm$ 0.301 \\
-Other                         & 0.484 $\pm$ 0.283 & \textbf{0.515 $\pm$ 0.307} \\
-Organs (Abd./Pelvis)          & 0.415 $\pm$ 0.294 & \textbf{0.437 $\pm$ 0.321} \\
-Bones (Spine)                 & 0.400 $\pm$ 0.210 & \textbf{0.449 $\pm$ 0.256} \\
-Bones (Limbs/Pelvis)          & 0.321 $\pm$ 0.309 & \textbf{0.376 $\pm$ 0.348} \\
-Vessels                       & 0.304 $\pm$ 0.271 & \textbf{0.379 $\pm$ 0.318} \\
+Organs (Thorax/Head/Spine)   & \textbf{0.550 $\pm$ 0.291} & 0.547 $\pm$ 0.294 \\
+Muscles (Trunk)              & 0.447 $\pm$ 0.304 & \textbf{0.488 $\pm$ 0.305} \\
+Organs (Abd./Pelvis)         & 0.436 $\pm$ 0.298 & \textbf{0.459 $\pm$ 0.307} \\
+Bones (Spine)                & 0.422 $\pm$ 0.229 & \textbf{0.504 $\pm$ 0.243} \\
+Bones (Limbs/Pelvis)         & 0.417 $\pm$ 0.340 & \textbf{0.423 $\pm$ 0.350} \\
+Vessels                      & 0.381 $\pm$ 0.312 & \textbf{0.398 $\pm$ 0.326} \\
 \midrule
-\textbf{Overall}              & 0.424 $\pm$ 0.286 & \textbf{0.455 $\pm$ 0.313} \\
+\textbf{Overall}             & 0.444 $\pm$ 0.300 & \textbf{0.473 $\pm$ 0.307} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Cross-modality analysis.} Despite training exclusively on CT, PatchICL wins the Muscles category (+2.3\%), with gains on autochthon (+4.5\%), gluteus maximus (+3.4\%), and stomach (+3.6\%). The gap narrows compared to in-domain CT ($-$3.1\% vs $-$2.6\% overall).
+\textbf{Cross-modality patterns.} UniverSeg outperforms PatchICL on 33/46 classes (72\%), with an overall advantage of +2.9\%. The performance gap widens on spine structures ($-$8.2\% on vertebrae/discs) and trunk
+muscles ($-$4.1\%), consistent with CT findings that UniverSeg excels on complex articulated anatomy. PatchICL maintains parity on thoracic organs and shows isolated wins on esophagus (+8.8\%), adrenal glands
+(+4.4\%), and inferior vena cava (+3.6\%)---structures with high shape variability or thin elongated morphology. The cross-modality degradation is comparable for both methods ($\sim$6\% drop from CT), suggesting
+neither approach has a systematic modality bias.
 
 \subsection{Out-of-Domain Generalization (MedSegBench)}
 
 To evaluate generalization beyond CT imaging, we test on MedSegBench~\cite{kusMedSegBenchComprehensiveBenchmark2024}, a comprehensive benchmark spanning 35 datasets across diverse modalities including ultrasound, X-ray, endoscopy, dermoscopy, fundus imaging, and microscopy. Both methods were trained exclusively on TotalSegmentator CT.
 
+
 \begin{table}[t]
 \centering
-\caption{Dice scores on MedSegBench with 3 context pairs (mean $\pm$ std). Models trained on CT only.}\label{tab:dice_medsegbench}
-\begin{tabular}{lccc}
+\caption{Dice scores on MedSegBench by resolution (3 context pairs). Only datasets with $\geq$256 resolution shown.}\label{tab:medsegbench_resolution}
+\small
+\begin{tabular}{llccc}
 \toprule
-Difficulty & N & PatchICL & UniverSeg \\
+Resolution & Dataset & PatchICL & UniverSeg & $\Delta$ \\
 \midrule
-Hard (Dice $<$ 0.3)      & 47 & \textbf{0.110} & 0.088 \\
-Medium (0.3--0.5)        & 12 & 0.286 & \textbf{0.383} \\
-Good (0.5--0.7)          & 11 & 0.437 & \textbf{0.606} \\
-Easy ($>$ 0.7)           & 15 & 0.601 & \textbf{0.800} \\
+\multirow{7}{*}{256$\times$256}
+& cystoidfluid    & 0.331 & 0.168 & \textbf{+0.163} \\
+& dca1            & 0.321 & 0.209 & \textbf{+0.113} \\
+& ultrasoundnerve & 0.421 & 0.330 & \textbf{+0.091} \\
+& robotool        & 0.228 & 0.143 & \textbf{+0.085} \\
+& pandental       & 0.696 & 0.898 & $-$0.201 \\
+& usforkidney     & 0.517 & 0.728 & $-$0.211 \\
+& \textbf{Mean (35 datasets)} & 0.346 & 0.366 & $-$0.020 \\
 \midrule
-\textbf{Overall (85 classes)} & -- & 0.412 $\pm$ 0.222 & \textbf{0.622 $\pm$ 0.287} \\
+\multirow{5}{*}{512$\times$512}
+& yeaz            & 0.754 & 0.680 & \textbf{+0.074} \\
+& dca1            & 0.281 & 0.208 & \textbf{+0.073} \\
+& abdomenus       & 0.283 & 0.078 & \textbf{+0.205} \\
+& wbc             & 0.689 & 0.712 & $-$0.023 \\
+& \textbf{Mean (4 datasets)} & 0.502 & 0.419 & \textbf{+0.082} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Analysis by difficulty.} Table~\ref{tab:dice_medsegbench} stratifies results by task difficulty (measured by UniverSeg baseline performance). PatchICL shows an advantage on the hardest tasks ($+$2.2\%), where both methods struggle to exceed 10\% Dice. On easier tasks where in-context cues are sufficient, UniverSeg's dense cross-attention provides more reliable transfer.
-
-\textbf{Analysis by modality.} PatchICL achieves strong gains on ultrasound datasets (AbdomenUS: $+$13--24\% on multiple organs) and endoscopy (Kvasir polyps: $+$9.8\%, M2caiSeg surgical instruments: $+$7.8\%). These modalities exhibit high spatial variability where selective patch attention may focus on diagnostically relevant regions. Conversely, UniverSeg dominates on standardized protocols: dental X-ray (PanDental: $-$24\%), blood cell microscopy (WBC: $-$29\%), and fundus imaging (IDRIB: $-$37\%), where consistent imaging conditions favor global feature matching.
+\textbf{Analysis by resolution.} Table~\ref{tab:medsegbench_resolution} stratifies MedSegBench results by native image resolution. At 256$\times$256, UniverSeg holds a slight edge ($-$2.0\%), though PatchICL wins on 15 of 35 datasets, particularly on ultrasound and angiography where localized features dominate. At 512$\times$512, PatchICL wins 3 of 4 datasets with a mean advantage of $+$8.2\%, driven by strong gains on abdomenus ($+$20.5\%) and microscopy (yeaz $+$7.4\%, dca1 $+$7.3\%). This reversal suggests patch-based attention scales favorably with resolution.
 
 \subsection{Generalization to unseen dimensions}
-Accuracy and flops
 \subsubsection{Input image size}
+
+We evaluate how both methods scale with input resolution on TotalSegmentator CT validation set (Figure~\ref{fig:dice_flops_per_input_size}). PatchICL achieves higher Dice scores at all resolutions while requiring significantly less compute at high resolutions: at 512$\times$512, PatchICL uses 308 GFLOPs compared to UniverSeg's 549 GFLOPs (44\% reduction) while maintaining a +1.7\% accuracy advantage. Both methods peak at 256$\times$256 resolution, suggesting diminishing returns from higher resolutions on this benchmark. The favorable scaling of PatchICL stems from its patch-based attention, which processes only selected regions rather than the full image.
 
 \begin{figure}[!htbp]
 \centering
@@ -277,16 +291,63 @@ Accuracy and flops
 \label{fig:dice_flops_per_input_size}
 \end{figure}
 
-\subsubsection{Number of context pairs}
 
-\begin{figure}[!htbp]
+\begin{table}[t]
 \centering
-\includegraphics[width=\textwidth]{imgs/plots/pareto_context_size.pdf}
-\caption{Accuracy and compute by number of context pairs}
-\label{fig:dice_flops_per_nb_context}
-\end{figure}
+\caption{Dice scores on MedSegBench by resolution (3 context pairs).}\label{tab:medsegbench_resolution}
+\small
+\begin{tabular}{llccc}
+\toprule
+Resolution & Dataset & PatchICL & UniverSeg & $\Delta$ \\
+\midrule
+\multirow{35}{*}{256$\times$256} & cystoidfluid & 0.331 & 0.168 & \textbf{+0.163} \\
+ & dca1 & 0.321 & 0.209 & \textbf{+0.113} \\
+ & ultrasoundnerve & 0.421 & 0.330 & \textbf{+0.091} \\
+ & robotool & 0.228 & 0.143 & \textbf{+0.085} \\
+ & brifiseg & 0.267 & 0.189 & \textbf{+0.078} \\
+ & covidquex & 0.405 & 0.336 & \textbf{+0.069} \\
+ & kvasir & 0.332 & 0.269 & \textbf{+0.063} \\
+ & idrib & 0.166 & 0.104 & \textbf{+0.062} \\
+ & bkai-igh & 0.085 & 0.030 & \textbf{+0.055} \\
+ & chuac & 0.240 & 0.185 & \textbf{+0.055} \\
+ & yeaz & 0.751 & 0.698 & \textbf{+0.053} \\
+ & cellnuclei & 0.367 & 0.328 & \textbf{+0.039} \\
+ & polypgen & 0.168 & 0.132 & \textbf{+0.036} \\
+ & isic2016 & 0.634 & 0.602 & \textbf{+0.032} \\
+ & isic2018 & 0.613 & 0.593 & \textbf{+0.020} \\
+ & busi & 0.196 & 0.180 & \textbf{+0.016} \\
+ & mosmedplus & 0.108 & 0.100 & \textbf{+0.008} \\
+ & m2caiseg & 0.129 & 0.133 & $-$0.004 \\
+ & nuclei & 0.019 & 0.034 & $-$0.014 \\
+ & uwaterlooskincancer & 0.637 & 0.654 & $-$0.017 \\
+ & tnbcnuclei & 0.220 & 0.253 & $-$0.033 \\
+ & wbc & 0.683 & 0.737 & $-$0.054 \\
+ & abdomenus & 0.100 & 0.158 & $-$0.058 \\
+ & bbbc010 & 0.499 & 0.561 & $-$0.061 \\
+ & fhpsaop & 0.541 & 0.613 & $-$0.072 \\
+ & chasedb1 & 0.200 & 0.276 & $-$0.076 \\
+ & monusac & 0.192 & 0.270 & $-$0.078 \\
+ & nuset & 0.253 & 0.334 & $-$0.080 \\
+ & covid19radio & 0.651 & 0.761 & $-$0.110 \\
+ & deepbacs & 0.084 & 0.207 & $-$0.124 \\
+ & promise12 & 0.417 & 0.570 & $-$0.152 \\
+ & drive & 0.216 & 0.372 & $-$0.156 \\
+ & dynamicnuclear & 0.256 & 0.431 & $-$0.175 \\
+ & pandental & 0.696 & 0.898 & $-$0.201 \\
+ & usforkidney & 0.517 & 0.728 & $-$0.211 \\
+& \textbf{Mean (35 datasets)} & 0.341 & 0.360 & $-$0.018 \\
+\midrule
+\multirow{4}{*}{512$\times$512} & yeaz & 0.754 & 0.680 & \textbf{+0.074} \\
+ & dca1 & 0.281 & 0.208 & \textbf{+0.073} \\
+ & abdomenus & 0.125 & 0.092 & \textbf{+0.033} \\
+ & wbc & 0.677 & 0.700 & $-$0.023 \\
+& \textbf{Mean (4 datasets)} & 0.459 & 0.420 & \textbf{+0.039} \\
+\midrule
+\bottomrule
+\end{tabular}
+\end{table}
 
-
+\begin{comment}
 \subsection{Explainability}
 \paragraph{Attention}
 
@@ -317,203 +378,36 @@ Since we operate on every level explicitly, we can explore multiple sampling and
     \item best sampling strategy ? Sample at highest probs ? Or most uncertain is better ? 
     \item best aggregation strategy ? replace previous probs everywhere ? Or only when certain ? 
 \end{itemize}
- 
+\end{comment}
 
 \bibliographystyle{splncs04}
 \bibliography{ref}
 
 \newpage
-
 \begin{table}[t]
 \centering
-\caption{Train/validation label split across 100 TotalSegmentator classes. Labels are split 50/50 while maintaining anatomical diversity in both sets.}\label{tab:label_splits}
+\caption{Train/validation label split across 92 TotalSegmentator classes. Labels are split 47/45 while maintaining anatomical diversity in both sets.}\label{tab:label_splits}
 \small
 \begin{tabular}{|p{3.2cm}|p{5.5cm}|p{5.5cm}|}
 \toprule
-\textbf{Category} & \textbf{Training (50)} & \textbf{Validation (50)} \\
+\textbf{Category} & \textbf{Training (47)} & \textbf{Validation (45)} \\
 \midrule
-Organs (Abd./Pelvis) & Duodenum, esophagus, R.~kidney & Colon, gallbladder, L.~kidney, liver, pancreas, prostate, small bowel, spleen, stomach, urinary bladder \\
+Organs (Abd./Pelvis) & Gallbladder, L.~adrenal gland, pancreas, R.~adrenal gland, spleen, stomach & Colon, duodenum, esophagus, L.~kidney, L.~kidney cyst, liver, prostate, R.~kidney, R.~kidney cyst, small bowel, urinary bladder \\
 \midrule
-Organs (Thorax/ Head/Spine) & Brain, heart, L.~lung (upper), R.~lung (middle) & L.~lung (lower), R.~lung (lower), R.~lung (upper), spinal cord, thyroid gland, trachea \\
+Organs (Thorax/ Head/Spine) & Heart, L.~lung (upper, lower), R.~lung (upper, middle, lower), spinal cord, thyroid gland, trachea & Brain, L.~atrial appendage \\
 \midrule
-Bones (Spine) & L1, L2, L4, L5, T2, T4, T7, T9, T10, T12 & C7, T1, T3, T5, T6, T8, T11, L3, S1, sacrum \\
+Bones (Spine) & --- & Sacrum \\
 \midrule
-Bones (Ribs/ Sternum) & Sternum, L.~ribs 1--4, 7; R.~ribs 5--10 & Costal cart., L.~ribs 5, 6, 8--11; R.~ribs 1--4, 11 \\
+Bones (Ribs/ Sternum) & L.~ribs 1--6; R.~ribs 1--6 & Costal cart., sternum, L.~ribs 7--12; R.~ribs 7--12 \\
 \midrule
-Bones (Limbs/ Shoulder/Pelvis) & Skull, L.~femur, L.~humerus, L.~scapula, R.~clavicula, R.~hip, R.~scapula & L.~clavicula, L.~hip, R.~femur, R.~humerus \\
+Bones (Limbs/ Shoulder/Pelvis) & L.~clavicula, L.~hip, L.~humerus, L.~scapula, R.~clavicula, R.~hip, R.~humerus, R.~scapula & Skull, L.~femur, R.~femur \\
 \midrule
-Muscles & L.~autochthon, R.~autochthon, L.~glut.~max., L.~glut.~med., L.~glut.~min., R.~glut.~min. & L.~iliopsoas, R.~iliopsoas, R.~glut.~max., R.~glut.~med. \\
+Muscles & L.~glut.~max., L.~glut.~med., L.~glut.~min., R.~glut.~max., R.~glut.~med., R.~glut.~min. & L.~autochthon, R.~autochthon, L.~iliopsoas, R.~iliopsoas \\
 \midrule
-Vessels & IVC, SVC, L.~brachioceph.~v., L.~iliac~v., R.~iliac~v., L.~subclavian~a., R.~iliac~a., portal/splenic~v. & Aorta, L.~iliac~a., pulmonary~v., R.~subclavian~a. \\
+Vessels & Aorta, L.~common carotid~a., L.~subclavian~a., pulmonary~v., R.~common carotid~a., R.~subclavian~a. & Brachiocephalic trunk, IVC, L.~brachioceph.~v., L.~iliac~a., L.~iliac~v., portal/splenic~v., R.~brachioceph.~v., R.~iliac~a., R.~iliac~v., SVC \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\newpage
 
-\section{Important Messages to MICCAI Authors}
-
-This is a modified version of Springer's LNCS template suitable for anonymized MICCAI 2026 main conference submissions. The author section has already been anonymized for you.  You cannot remove the author section to gain extra writing space.  You must not remove the abstract and keyword sections in your submission.
-
-To avoid an accidental anonymity breach, you are not required to include the \textbf{Acknowledgments} and the \textbf{Disclosure of Interest} sections for the initial submission phase.  If your paper is accepted, you must reinsert these sections in your final paper.  If you opted to include these sections in the initial submission phase, they will count toward the 8-page limit.
-
-To avoid desk rejection of your paper, you are encouraged to read "Avoiding Desk Rejection" by the MICCAI submission platform manager.  A few important rules are summarized below for your reference:  
-\begin{enumerate}
-    \item Do not modify or remove the provided anonymized author section except for inserting your paper ID.
-    \item Do not remove the keyword section to gain extra writing space. Authors must provide at least one keyword.
-    \item Do not remove the abstract sections to gain extra writing space. 
-    \item Inline figures (wrapping text around a figure) are not allowed.
-    \item Authors are not allowed to change the default margins, font size, font type, and document style.  If you are using any additional packages, it is the author's responsibility to ensure they do not inherently alter the document's layout.
-    \item It is prohibited to use commands such as \verb|\vspace| and \verb|\hspace| to reduce the pre-set white space in the document.  Shrinking the white space between your figures/tables and their captions, and between sections and subsections, is strictly prohibited.
-    \item Please make sure your figures and tables do not span into the margins.
-    \item If you have tables, the smallest font size allowed is 8pt.  Your tables should not be inserted as figures.
-    \item Please ensure your paper is properly anonymized.  Refer to your previously published paper in the third person.  Data collection location of private dataset should be masked.
-        \item  If you are including a link to your code repository or datasets or submitting supplementary materials, you must ensure your repository and supplementary materials are anonymized.
-    \item Your paper must not exceed the page limit.  You can have 8 pages of the main content (text (including paper title, author section, abstract, keyword section), figures and tables, conclusion, acknowledgment and disclaimer) plus up to 2 pages of references.  The reference section does not need to start on a new page.  
-    \item *Beginning in 2025* 
-    Supplementary materials are limited to multimedia content (e.g., videos) as warranted by the technical application (e.g., robotics, surgery, ...). These files should not display any proofs, analysis, additional results, or embedded slides, and should not show any identification markers either. Violation of this guideline will lead to desk rejection. PDF files may not be submitted as supplementary materials in 2026 unless authors are citing a paper that has not yet been published. In such a case, authors are required to submit an anonymized version of the cited paper. ACs will perform checks to ensure the integrity.
-\end{enumerate}
-
-
-\section{Section}
-\subsection{A Subsection Sample}
-Please note that the first paragraph of a section or subsection is
-not indented. The first paragraph that follows a table, figure,
-equation etc. does not need an indent, either.
-
-Subsequent paragraphs, however, are indented.
-
-\subsubsection{Sample Heading (Third Level)} Only two levels of
-headings should be numbered. Lower level headings remain unnumbered;
-they are formatted as run-in headings.
-
-\paragraph{Sample Heading (Fourth Level)}
-The contribution should contain no more than four levels of
-headings. Table~\ref{tab1} gives a summary of all heading levels.
-
-\begin{table}
-\caption{Table captions should be placed above the
-tables.}\label{tab1}
-\begin{tabular}{|l|l|l|}
-\hline
-Heading level &  Example & Font size and style\\
-\hline
-Title (centered) &  {\Large\bfseries Lecture Notes} & 14 point, bold\\
-1st-level heading &  {\large\bfseries 1 Introduction} & 12 point, bold\\
-2nd-level heading & {\bfseries 2.1 Printing Area} & 10 point, bold\\
-3rd-level heading & {\bfseries Run-in Heading in Bold.} Text follows & 10 point, bold\\
-4th-level heading & {\itshape Lowest Level Heading.} Text follows & 10 point, italic\\
-\hline
-\end{tabular}
-\end{table}
-
-
-\begin{table}
-\caption{Test table.}\label{tab2}
-%\scalebox{0.8}
-{
-\begin{tabular}{|l|l|l|}
-\hline
-Heading level &  Example & Font size and style\\
-\hline
-\small small &  {\Large\bfseries Lecture Notes} & 14 point, bold\\
-\tiny tiny &  {\large\bfseries 1 Introduction} & 12 point, bold\\
-\normalfont normal & {\bfseries 2.1 Printing Area} & 10 point, bold\\
-\fontsize{8}{9} 8pt & {\bfseries Run-in Heading in Bold.} Text follows & 10 point, bold\\
-\scriptsize script & {\itshape Lowest Level Heading.} Text follows & 10 point, italic\\
-\hline
-\end{tabular}}
-\end{table}
-
-\noindent Displayed equations are centered and set on a separate
-line.
-\begin{equation}
-x + y = z
-\end{equation}
-Please try to avoid rasterized images for line-art diagrams and
-schemas. Whenever possible, use vector graphics instead (see
-Fig.~\ref{fig1}).
-
-\begin{figure}
-\includegraphics[width=\textwidth]{fig1.eps}
-\caption{A figure caption is always placed below the illustration.
-Please note that short captions are centered, while long ones are
-justified by the macro package automatically.} \label{fig1}
-\end{figure}
-
-\begin{theorem}
-This is a sample theorem. The run-in heading is set in bold, while
-the following text appears in italics. Definitions, lemmas,
-propositions, and corollaries are styled the same way.
-\end{theorem}
-%
-% the environments 'definition', 'lemma', 'proposition', 'corollary',
-% 'remark', and 'example' are defined in the LLNCS documentclass as well.
-%
-\begin{proof}
-Proofs, examples, and remarks have the initial word in italics,
-while the following text appears in normal font.
-\end{proof}
-For citations of references, we prefer the use of square brackets
-and consecutive numbers. Citations using labels or the author/year
-convention are also acceptable. The following bibliography provides
-a sample reference list with entries for journal
-articles~\cite{ref_article1}, an LNCS chapter~\cite{ref_lncs1}, a
-book~\cite{ref_book1}, proceedings without editors~\cite{ref_proc1},
-and a homepage~\cite{ref_url1}. Multiple citations are grouped
-\cite{ref_article1,ref_lncs1,ref_book1},
-\cite{ref_article1,ref_book1,ref_proc1,ref_url1}.
-
- %% removed for anonymized MICCAI submission.
-    
-    % The following acknowledgement and disclaimer sections can be removed for the double-blind review process.  If and when your paper is accepted, reinsert the acknowledgement and the disclaimer clause in your final camera-ready version.
-    % IF you opted to include the acknowledgement and disclaimer sections, they will count towards the 8-page limit.
-
-\begin{credits}
-\subsubsection{\ackname} A bold run-in heading in small font size at the end of the paper is
-used for general acknowledgments, for example: This study was funded
-by X (grant number Y).
-
-\subsubsection{\discintname}
-It is now necessary to declare any competing interests or to specifically
-state that the authors have no competing interests. Please place the
-statement with a bold run-in heading in small font size beneath the
-(optional) acknowledgments\footnote{If EquinOCS, our proceedings submission
-system, is used, then the disclaimer can be provided directly in the system.},
-for example: The authors have no competing interests to declare that are
-relevant to the content of this article. Or: Author A has received research
-grants from Company W. Author B has received a speaker honorarium from
-Company X and owns stock in Company Y. Author C is a member of committee Z.
-\end{credits}
-
-
-%
-% ---- Bibliography ----
-%
-% BibTeX users should specify bibliography style 'splncs04'.
-% References will then be sorted and formatted in the correct style.
-%
-% \bibliographystyle{splncs04}
-% \bibliography{mybibliography}
-%
-\begin{thebibliography}{8}
-\bibitem{ref_article1}
-Author, F.: Article title. Journal \textbf{2}(5), 99--110 (2016)
-
-\bibitem{ref_lncs1}
-Author, F., Author, S.: Title of a proceedings paper. In: Editor,
-F., Editor, S. (eds.) CONFERENCE 2016, LNCS, vol. 9999, pp. 1--13.
-Springer, Heidelberg (2016). \doi{10.10007/1234567890}
-
-\bibitem{ref_book1}
-Author, F., Author, S., Author, T.: Book title. 2nd edn. Publisher,
-Location (1999)
-
-\bibitem{ref_proc1}
-Author, A.-B.: Contribution title. In: 9th International Proceedings
-on Proceedings, pp. 1--2. Publisher, Location (2010)
-
-\bibitem{ref_url1}
-LNCS Homepage, \url{http://www.springer.com/lncs}, last accessed 2023/10/25
-\end{thebibliography}
 \end{document}

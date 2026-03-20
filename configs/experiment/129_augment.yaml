@@ -8,7 +8,7 @@
 # Note: 128x128 output grid hits CUDA kernel limits in attention layers.
 
 defaults:
-  - /augmentation: custom2
+  - /augmentation: custom
   - override /method: patch_icl
 
 max_ds_len:
@@ -43,17 +43,6 @@ model:
         pad_before: 0
         pad_after: 0
       - resolution: 64
-        patch_size: 8
-        sampling_method: "continuous"
-        sampling_temperature: 0.1
-        stride: 8
-        num_patches: 20
-        num_context_patches: 20
-        pad_before: 0
-        pad_after: 0
-        spread_sigma_target: 4.0
-        spread_sigma_context: 4.0
-      - resolution: 128
         patch_size: 8
         sampling_method: "continuous"
         sampling_temperature: 0.1
