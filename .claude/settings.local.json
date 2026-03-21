@@ -33,7 +33,8 @@
       "Bash(wc:*)",
       "Bash(wget:*)",
       "Bash(pip install:*)",
-      "WebFetch(domain:medsegbench.github.io)"
+      "WebFetch(domain:medsegbench.github.io)",
+      "WebFetch(domain:zenodo.org)"
     ],
     "deny": [
       "Read(./old/**)"

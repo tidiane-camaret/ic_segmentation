@@ -32,7 +32,8 @@
       "WebFetch(domain:proceedings.mlr.press)",
       "Bash(wc:*)",
       "Bash(wget:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "WebFetch(domain:medsegbench.github.io)"
     ],
     "deny": [
       "Read(./old/**)"

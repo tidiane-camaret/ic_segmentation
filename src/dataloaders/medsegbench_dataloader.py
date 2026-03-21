@@ -131,9 +131,17 @@ class MedSegBenchDataset(Dataset):
                   f"degrade_p={self.adv_degrade_p}, asym_intensity_p={self.adv_asym_p}")
 
         # Find dataset files
+        # Filter by image_size suffix (e.g., abdomenus_256.npz for image_size=(256, 256))
+        size_suffix = f"_{image_size[0]}"
         if datasets is None:
-            npz_files = glob.glob(os.path.join(data_root, "*.npz"))
+            npz_files = glob.glob(os.path.join(data_root, f"*{size_suffix}.npz"))
             datasets = [os.path.basename(f).replace(".npz", "") for f in npz_files]
+        else:
+            # Append size suffix to dataset names if not already present
+            datasets = [
+                ds if ds.endswith(size_suffix) else f"{ds}{size_suffix}"
+                for ds in datasets
+            ]
 
         # Load all data to RAM
         # Structure: self.data[dataset_name] = {"images": np.array, "labels": np.array}
@@ -143,12 +151,9 @@ class MedSegBenchDataset(Dataset):
         # Label index: label_value -> [(dataset_name, sample_idx), ...]
         self.label_to_samples: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
 
-        print(f"Loading {len(datasets)} datasets to RAM...")
+        print(f"Loading {len(datasets)} datasets (size={image_size[0]}) to RAM...")
         for ds_name in datasets:
             npz_path = os.path.join(data_root, f"{ds_name}.npz")
-            if not os.path.exists(npz_path):
-                # Try with _256 suffix
-                npz_path = os.path.join(data_root, f"{ds_name}_256.npz")
             if not os.path.exists(npz_path):
                 print(f"  [Skip] {ds_name}: file not found")
                 continue

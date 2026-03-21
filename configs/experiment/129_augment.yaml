@@ -53,6 +53,17 @@ model:
         pad_after: 0
         spread_sigma_target: 4.0
         spread_sigma_context: 4.0
+      - resolution: 128
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 20
+        num_context_patches: 20
+        pad_before: 0
+        pad_after: 0
+        spread_sigma_target: 4.0
+        spread_sigma_context: 4.0
       - resolution: "${preprocessing.image_size}"
         patch_size: 8
         sampling_method: "continuous"

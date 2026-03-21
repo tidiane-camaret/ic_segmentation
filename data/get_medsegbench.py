@@ -14,7 +14,7 @@ with initialize_config_dir(config_dir=str(config_path), version_base=None):
     cfg = compose(config_name="train")
 
 DOWNLOAD_ROOT = cfg.paths.medsegbench
-IMG_SIZE = 256
+IMG_SIZE = 128
 stats_list = []
 
 print(f"Loaded path from config: {DOWNLOAD_ROOT}")
@@ -87,7 +87,10 @@ for cls in dataset_classes:
 # 4. Save safely
 df = pd.DataFrame(stats_list)
 
-csv_save_path = os.path.join(DOWNLOAD_ROOT, "medsegbench_stats.csv")
+csv_file_name = "medsegbench_stats"+ str(IMG_SIZE)+".csv"
+
+
+csv_save_path = os.path.join(DOWNLOAD_ROOT, csv_file_name)
 df.to_csv(csv_save_path, index=False)
 print(f"\nCompleted! Stats saved to {csv_save_path}")
 
