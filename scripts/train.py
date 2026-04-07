@@ -113,6 +113,15 @@ def main(cfg: DictConfig) -> None:
 
         max_samples = msb_cfg.get("max_samples_per_dataset", None)
 
+        # Support separate max_ds_len for train/val
+        max_ds_len_cfg = cfg.get("max_ds_len")
+        if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
+            max_ds_len_train = max_ds_len_cfg.get("train")
+            max_ds_len_val = max_ds_len_cfg.get("val")
+        else:
+            max_ds_len_train = max_ds_len_cfg
+            max_ds_len_val = max_ds_len_cfg
+
         if accelerator.is_main_process:
             print(
                 f"MedSegBench train datasets: {msb_train_datasets}, val datasets: {msb_val_datasets}"
@@ -130,6 +139,7 @@ def main(cfg: DictConfig) -> None:
             augment=augmentation_config is not None,
             augment_config=augmentation_config,
             max_samples_per_dataset=max_samples,
+            max_ds_len=max_ds_len_train,
         )
         val_loader = get_medsegbench_dataloader(
             data_root=cfg.paths.medsegbench,
@@ -142,6 +152,7 @@ def main(cfg: DictConfig) -> None:
             shuffle=False,
             augment=False,
             max_samples_per_dataset=max_samples,
+            max_ds_len=max_ds_len_val,
         )
 
     else:

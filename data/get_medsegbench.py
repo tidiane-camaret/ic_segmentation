@@ -9,9 +9,13 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 # Load config to get paths.medsegbench
+# Accept optional cluster override via CLI: uv run data/get_medsegbench.py cluster=dlclarge
+cluster_override = next((arg for arg in sys.argv[1:] if arg.startswith("cluster=")), None)
+overrides = [cluster_override] if cluster_override else []
+
 config_path = Path(__file__).resolve().parents[1] / "configs"
 with initialize_config_dir(config_dir=str(config_path), version_base=None):
-    cfg = compose(config_name="train")
+    cfg = compose(config_name="train", overrides=overrides)
 
 DOWNLOAD_ROOT = cfg.paths.medsegbench
 IMG_SIZE = 128

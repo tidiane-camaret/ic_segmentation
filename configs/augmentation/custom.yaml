@@ -6,7 +6,6 @@
 augmentation:
   enabled: true
   type: "universeg"
-  img_size: 256
 
   medical_specialty:
     enabled: true

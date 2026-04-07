@@ -13,9 +13,21 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+
+# Load medsegbench label name mapping if available
+try:
+    from medsegbench.info import INFO as _MSB_INFO
+    _LABEL_NAMES: Dict[str, Dict[str, str]] = {
+        ds: info.get("pixel_labels", {}) for ds, info in _MSB_INFO.items()
+    }  # ds_name -> {str(label_value) -> label_name}
+except ImportError:
+    _LABEL_NAMES = {}
 import torch
 from src.dataloaders.augmentations import (
+    apply_universeg_augmentation,
     create_augmentation_transforms,
+    create_spatial_only_transform,
+    create_intensity_only_transform,
     carve_mix_2d,
     foreground_random_crop,
     perturb_mask,
@@ -65,7 +77,9 @@ class MedSegBenchDataset(Dataset):
         image_size: Tuple[int, int] = (256, 256),
         augment: bool = False,
         augment_config: Optional[Dict] = None,
+        augmentation_config: Optional[Dict] = None,
         max_samples_per_dataset: Optional[int] = None,
+        max_ds_len: Optional[int] = None,
         carve_mix: bool = False,
         carve_mix_config: Optional[Dict] = None,
         advanced_augmentation: bool = False,
@@ -76,24 +90,19 @@ class MedSegBenchDataset(Dataset):
         self.context_size = context_size
         self.image_size = image_size
         self.augment = augment
+        self.max_ds_len = max_ds_len
 
         # Setup augmentation
-        if augment:
-            cfg = augment_config or {}
-            self.spatial_transform, self.intensity_transform = (
-                create_augmentation_transforms(
-                    rotation_limit=cfg.get("rotation_limit", 15.0),
-                    scale_limit=cfg.get("scale_limit", 0.1),
-                    elastic_alpha=cfg.get("elastic_alpha", 50.0),
-                    elastic_sigma=cfg.get("elastic_sigma", 5.0),
-                    brightness_limit=cfg.get("brightness_limit", 0.1),
-                    contrast_limit=cfg.get("contrast_limit", 0.1),
-                    gamma_limit=cfg.get("gamma_limit", (80, 120)),
-                    noise_std_range=cfg.get("noise_std_range", (0.02, 0.05)),
-                )
-            )
+        augmentation_config = augmentation_config or augment_config
+        self.augment = augment or (augmentation_config is not None and augmentation_config.get("enabled", False))
+        if self.augment and augmentation_config is not None:
+            self._setup_augmentation(augmentation_config)
+        elif augment:
+            # Legacy: augment=True but no config — use defaults
+            self._setup_augmentation({})
         else:
-            self.augment = False
+            self.augmentation_type = "legacy"
+            self.augmentation_config_full = None
             self.spatial_transform = None
             self.intensity_transform = None
 
@@ -236,7 +245,53 @@ class MedSegBenchDataset(Dataset):
         )
         print(f"Found {len(self.label_to_samples)} unique label values")
 
+    def _setup_augmentation(self, cfg: Dict):
+        """Setup augmentation from config (mirrors TotalSeg2DZOpt)."""
+        aug_type = cfg.get("type", "legacy")
+        self.augmentation_type = aug_type
+
+        if aug_type in ("universeg", "custom"):
+            self.augmentation_config_full = cfg
+            self.spatial_transform = None
+            self.intensity_transform = None
+            example_cfg = cfg.get("example", {})
+            medical_cfg = cfg.get("medical_specialty", {})
+            print(f"Augmentation enabled: type=universeg "
+                  f"(apply_to_target={example_cfg.get('apply_to_target', False)}, "
+                  f"crop_p={medical_cfg.get('crop_p', 0)}, "
+                  f"rotation={example_cfg.get('rotation_range', 'default')})")
+            return
+
+        # Legacy: albumentations spatial + intensity
+        self.augmentation_config_full = None
+        spatial_cfg = cfg.get("spatial", cfg)  # flat config for backwards compat
+        intensity_cfg = cfg.get("intensity", cfg)
+        try:
+            if cfg.get("spatial", {}).get("enabled", True) if "spatial" in cfg else True:
+                self.spatial_transform, self.intensity_transform = create_augmentation_transforms(
+                    rotation_limit=spatial_cfg.get("rotation_limit", 15.0),
+                    scale_limit=spatial_cfg.get("scale_limit", 0.1),
+                    elastic_alpha=spatial_cfg.get("elastic_alpha", 50.0),
+                    elastic_sigma=spatial_cfg.get("elastic_sigma", 5.0),
+                    brightness_limit=intensity_cfg.get("brightness_limit", 0.1),
+                    contrast_limit=intensity_cfg.get("contrast_limit", 0.1),
+                    gamma_limit=tuple(intensity_cfg.get("gamma_limit", [80, 120])),
+                    noise_std_range=tuple(intensity_cfg.get("noise_std_range", [0.02, 0.05])),
+                )
+            else:
+                self.spatial_transform = None
+                self.intensity_transform = None
+            print(f"Augmentation enabled: type=legacy "
+                  f"spatial={self.spatial_transform is not None}, "
+                  f"intensity={self.intensity_transform is not None}")
+        except Exception as e:
+            print(f"Warning: Could not setup augmentation: {e}")
+            self.spatial_transform = None
+            self.intensity_transform = None
+
     def __len__(self) -> int:
+        if self.max_ds_len is not None:
+            return min(self.max_ds_len, len(self.samples))
         return len(self.samples)
 
     def _normalize_image(self, img: np.ndarray) -> np.ndarray:
@@ -442,7 +497,10 @@ class MedSegBenchDataset(Dataset):
             - 'context_case_ids': List[str], e.g. ["datasetname_10", ...]
             - 'label_id': str, e.g. "datasetname_3"
         """
-        ds_name, sample_idx = self.samples[idx]
+        if self.max_ds_len is not None:
+            ds_name, sample_idx = random.choice(self.samples)
+        else:
+            ds_name, sample_idx = self.samples[idx]
         images = self.data[ds_name]["images"]
         labels = self.data[ds_name]["labels"]
 
@@ -518,19 +576,25 @@ class MedSegBenchDataset(Dataset):
         context_imgs = context_imgs or []
         context_masks = context_masks or []
 
-        # Apply spatial/intensity augmentation (different random transform per image)
+        # Apply augmentation
         if self.augment:
-            target_img, target_binary = self._apply_augmentation(
-                target_img, target_binary
-            )
-            aug_context_imgs = []
-            aug_context_masks = []
-            for ci, cm in zip(context_imgs, context_masks):
-                ci_aug, cm_aug = self._apply_augmentation(ci, cm)
-                aug_context_imgs.append(ci_aug)
-                aug_context_masks.append(cm_aug)
-            context_imgs = aug_context_imgs
-            context_masks = aug_context_masks
+            if self.augmentation_type in ("universeg", "custom"):
+                aug_cfg = dict(self.augmentation_config_full)
+                aug_cfg["img_size"] = self.image_size[0]
+                target_img, target_binary, context_imgs, context_masks = apply_universeg_augmentation(
+                    target_img, target_binary, context_imgs, context_masks,
+                    full_config=aug_cfg,
+                )
+            else:
+                # Legacy: per-image spatial + intensity
+                target_img, target_binary = self._apply_augmentation(target_img, target_binary)
+                aug_context_imgs, aug_context_masks = [], []
+                for ci, cm in zip(context_imgs, context_masks):
+                    ci_aug, cm_aug = self._apply_augmentation(ci, cm)
+                    aug_context_imgs.append(ci_aug)
+                    aug_context_masks.append(cm_aug)
+                context_imgs = aug_context_imgs
+                context_masks = aug_context_masks
 
         # Convert to tensors
         target_in = torch.from_numpy(target_img.copy()).unsqueeze(0).float()
@@ -538,7 +602,8 @@ class MedSegBenchDataset(Dataset):
 
         # Build case/label IDs
         target_case_id = f"{ds_name}_{sample_idx}"
-        label_id = f"{ds_name}_{label_value}"
+        label_name = _LABEL_NAMES.get(ds_name, {}).get(str(label_value), str(label_value))
+        label_id = f"{ds_name}_{label_name}"
         context_case_ids = [
             f"{ctx_ds}_{ctx_idx}" for ctx_ds, ctx_idx in context_samples
         ]
@@ -612,6 +677,8 @@ def get_dataloader(
     shuffle: bool = True,
     augment: bool = False,
     augment_config: Optional[Dict] = None,
+    augmentation_config: Optional[Dict] = None,
+    max_ds_len: Optional[int] = None,
     **kwargs,
 ) -> DataLoader:
     """Create a DataLoader for MedSegBench."""
@@ -623,6 +690,8 @@ def get_dataloader(
         image_size=image_size,
         augment=augment,
         augment_config=augment_config,
+        augmentation_config=augmentation_config,
+        max_ds_len=max_ds_len,
         **kwargs,
     )
 

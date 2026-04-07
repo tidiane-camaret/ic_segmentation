@@ -622,12 +622,15 @@ class TotalSeg2DDataset(Dataset):
         1. Task-level: Same transform applied to all images (target + context)
         2. Example-level: Different transform per context image
         """
+        aug_cfg = dict(self.universeg_full_config)
+        if self.image_size:
+            aug_cfg["img_size"] = self.image_size[0]
         return apply_universeg_augmentation(
             target_img=target_img,
             target_mask=target_mask,
             context_imgs=context_imgs,
             context_masks=context_masks,
-            full_config=self.universeg_full_config,
+            full_config=aug_cfg,
         )
 
     def _apply_unified_augmentation(

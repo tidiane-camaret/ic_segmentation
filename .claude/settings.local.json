@@ -34,7 +34,11 @@
       "Bash(wget:*)",
       "Bash(pip install:*)",
       "WebFetch(domain:medsegbench.github.io)",
-      "WebFetch(domain:zenodo.org)"
+      "WebFetch(domain:zenodo.org)",
+      "Bash(pip list:*)",
+      "Bash(conda list:*)",
+      "WebFetch(domain:storage.googleapis.com)",
+      "WebFetch(domain:openreview.net)"
     ],
     "deny": [
       "Read(./old/**)"

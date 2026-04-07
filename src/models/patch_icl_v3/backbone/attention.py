@@ -121,11 +121,31 @@ class TransformerBlock(nn.Module):
             k = torch.cat([k, zero_k], dim=2)
             v = torch.cat([v, zero_v], dim=2)
 
+        # Asymmetric mask: context patches cannot attend to target patches.
+        # Registers (first num_registers tokens) are exempt and attend freely.
+        # This is a no-op in context-only stages (all tokens are context → key_is_target=False).
+        is_context_patch = is_context.clone()
+        if num_registers > 0:
+            is_context_patch[:, :num_registers] = False
+        key_is_target = ~is_context  # [B, K_total]
+        block = is_context_patch.unsqueeze(2) & key_is_target.unsqueeze(1)  # [B, K_total, K_total]
+        if self.append_zero_attn:
+            # Zero token column: no restriction (context can always attend to it)
+            block = torch.cat(
+                [block, torch.zeros(B, K_total, 1, dtype=torch.bool, device=x.device)], dim=2
+            )
+        attn_mask = None
+        if block.any():
+            attn_mask = torch.zeros(B, 1, K_total, k.shape[2], dtype=q.dtype, device=x.device)
+            attn_mask.masked_fill_(block.unsqueeze(1), float('-inf'))
+
         # Compute attention
         attn_weights = None
         if return_attn_weights:
             scale = 1.0 / math.sqrt(q.shape[-1])
             attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if attn_mask is not None:
+                attn_scores = attn_scores + attn_mask
             attn_weights = F.softmax(attn_scores, dim=-1)
             if self.training and self.dropout.p > 0:
                 attn_weights = self.dropout(attn_weights)
@@ -133,6 +153,7 @@ class TransformerBlock(nn.Module):
         else:
             out = F.scaled_dot_product_attention(
                 q, k, v,
+                attn_mask=attn_mask,
                 dropout_p=self.dropout.p if self.training else 0.0,
             )
 
@@ -183,21 +204,14 @@ class CrossPatchAttention(nn.Module):
         else:
             self.register_tokens = None
 
-        # Context-first layers
+        # Context-first layers (share register_tokens with Stage 2)
         if num_context_layers > 0:
             self.context_layers = nn.ModuleList([
                 TransformerBlock(embed_dim, num_heads, dropout, append_zero_attn=append_zero_attn)
                 for _ in range(num_context_layers)
             ])
-            if num_registers > 0:
-                self.context_registers = nn.Parameter(
-                    torch.randn(1, num_registers, embed_dim) * 0.02
-                )
-            else:
-                self.context_registers = None
         else:
             self.context_layers = None
-            self.context_registers = None
 
         # RoPE cache
         rope_cache = build_rope_cache_2d(max_seq_len, embed_dim)
@@ -236,7 +250,12 @@ class CrossPatchAttention(nn.Module):
         B, K, D = x.shape
         device = x.device
 
-        # Stage 1: Context-first attention
+        # Stage 1: Context-first attention.
+        # Shared register_tokens are prepended, enriched alongside context patches,
+        # then carried directly into Stage 2 (no discard, no re-init).
+        stage1_regs = None
+        num_fresh_reg = self.num_registers if self.register_tokens is not None else 0
+
         if (self.context_layers is not None
                 and num_target_patches is not None
                 and num_target_patches < K):
@@ -244,12 +263,12 @@ class CrossPatchAttention(nn.Module):
             ctx_x = x[:, K_t:]
             ctx_coords = coords[:, K_t:]
 
-            # Add context registers
+            # Prepend shared register tokens
             num_ctx_reg = 0
-            if self.context_registers is not None:
-                ctx_regs = self.context_registers.expand(B, -1, -1)
-                ctx_x = torch.cat([ctx_regs, ctx_x], dim=1)
-                num_ctx_reg = self.context_registers.shape[1]
+            if self.register_tokens is not None:
+                regs = self.register_tokens.expand(B, -1, -1)
+                ctx_x = torch.cat([regs, ctx_x], dim=1)
+                num_ctx_reg = self.num_registers
 
             ctx_is_context = torch.ones(
                 B, ctx_x.shape[1], dtype=torch.bool, device=device
@@ -269,16 +288,20 @@ class CrossPatchAttention(nn.Module):
                         self.rope_cache, self.image_size, num_ctx_reg, False,
                     )
 
-            # Remove context registers
+            # Separate enriched registers from context patches
             if num_ctx_reg > 0:
+                stage1_regs = ctx_x[:, :num_ctx_reg]  # [B, R, D] — carries context summary
                 ctx_x = ctx_x[:, num_ctx_reg:]
             x = torch.cat([x[:, :K_t], ctx_x], dim=1)
 
-        # Stage 2: Joint attention
-        num_fresh_reg = self.num_registers if self.register_tokens is not None else 0
-        if self.register_tokens is not None:
-            registers = self.register_tokens.expand(B, -1, -1)
-            x = torch.cat([registers, x], dim=1)
+        # Stage 2: Joint attention.
+        # Use enriched registers from Stage 1 if available, otherwise fresh init.
+        if stage1_regs is not None:
+            x = torch.cat([stage1_regs, x], dim=1)
+        elif self.register_tokens is not None:
+            x = torch.cat([self.register_tokens.expand(B, -1, -1), x], dim=1)
+
+        if num_fresh_reg > 0:
             reg_mask = torch.ones(B, num_fresh_reg, dtype=torch.bool, device=device)
             is_context_with_reg = torch.cat([reg_mask, is_context], dim=1)
         else:

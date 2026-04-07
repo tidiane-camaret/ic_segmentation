@@ -1,0 +1,119 @@
+# @package _global_
+
+defaults:
+  - /augmentation: custom2
+  - override /method: patch_icl
+
+max_ds_len:
+  train: 10000
+max_cases:                                                                                                                                                                               
+    val: null
+
+preprocessing:
+  image_size: 128
+  feature_image_size: 128 
+
+context_size:
+  train: 3
+  val: 3         # Fixed for validation
+
+model:
+  patch_icl:
+    model_version: "v3"
+    feature_extractor:
+      type: "universeg"
+      output_grid_size: "${preprocessing.feature_image_size}"
+      freeze: true
+
+    levels:
+      - resolution: 24
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 9
+        num_context_patches: 9
+        pad_before: 0
+        pad_after: 0
+      - resolution: "${preprocessing.image_size}"
+        patch_size: 8
+        sampling_method: "continuous"
+        sampling_temperature: 0.1
+        stride: 8
+        num_patches: 30
+        num_context_patches: 30
+        pad_before: 0
+        pad_after: 0
+        spread_sigma_target: 4.0
+        spread_sigma_context: 4.0
+
+    # Oracle disabled - pure model-based sampling
+    oracle_levels_train: [false, false]
+    oracle_levels_valid: [false, false]
+
+    oracle_scheduling:
+      enabled: true
+      schedule: "linear"
+      start_prob: 0.5
+      end_prob: 0.0
+      warmup_epochs: 1
+      decay_epochs: 5
+
+    sampler:
+      target_sampling_oracle: "gt_foreground_entropy_balanced" #"gt_previous_pred_error"
+      target_model_sampling: "predicted_entropy"
+      context_sampling: "gt_foreground_entropy_balanced"
+      differentiable: true
+
+    aggregator:
+      type: "average"
+      min_coverage: 1e-6
+      use_sampling_map: false
+
+    backbone:
+      compile: false
+      decoder_use_skip_connections: false
+      image_size: "${preprocessing.image_size}"
+      embed_dim: 256               # 256 * 3 FPN levels concatenated
+      embed_proj_dim: 256
+      feature_grid_size: "${model.patch_icl.feature_extractor.output_grid_size}"
+      patch_feature_grid_size: 8
+      num_heads: 4
+      num_layers: 4
+      num_context_layers: 3
+      num_registers: 1
+      target_self_attention: true
+      dropout: 0.1
+      append_zero_attn: true
+      use_mask_prior: false
+      use_context_mask: true
+      mask_fusion_type: "concat"
+      gradient_checkpointing: false
+
+    sampling_map:
+      source: "entropy"
+      temperature: 1.0
+      learn_temperature: true
+
+    loss:
+      patch_loss:
+        type: "softdiceFocal"
+        args: null
+      aggreg_loss:
+        type: "softdiceFocal"
+        args: null
+      weights:
+        target_patch: 0.0
+        target_aggreg: 0.0
+        context_patch: 0.0
+        context_aggreg: 0.0
+        target_combined: 1.0
+      level_weights: [0.0, 1.0] # "uniform",  "progressive", explicit list 
+
+    cascade:
+      detach_between_levels: false
+      additive_fusion: true
+      sampling_map_blend: false
+      learned_alpha: false
+      cascade_registers: true
+      skip_context_decoding: true  # Skip decoder for context patches (~20% speedup, use when context_loss=0)
