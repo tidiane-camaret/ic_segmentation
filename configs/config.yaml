@@ -16,7 +16,7 @@ logging:
   save_imgs_masks: true
   save_every_n_epochs: 1  # Save train images every N epochs
   save_register_tokens: false  # Save register tokens per case during eval
-  save_register_images: false  # Also save img/gt/pred as .npy (slower)
+  save_imgs_masks_npy: false  # Also save img/gt/pred as .npy (slower)
   
 # Dataset: "totalseg2d" or "medsegbench"
 base_dataset: totalseg

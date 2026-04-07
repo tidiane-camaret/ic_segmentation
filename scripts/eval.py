@@ -106,15 +106,21 @@ def save_register_tokens_eval(
     save_dir: Path,
     accelerator=None,
     save_images: bool = False,
+    save_tokens: bool = True,
+    filter_case_ids: list = None,
 ):
-    """Run evaluation and save register tokens per case to disk.
+    """Run evaluation and save outputs per case to disk.
 
     Saves for each case:
+    - metadata.npz: case_id, label_id, axis, dice score
+    If save_tokens=True:
     - level{i}_register_tokens.npy: [R, D] register tokens per level
     - level{i}_patch_mask_pct.npy: [K] mask percentage per patch
-    - metadata.npz: case_id, label_id, axis, dice score
-    Optionally (if save_images=True):
+    If save_images=True:
     - img.npy, gt_mask.npy, pred_mask.npy (uncompressed numpy for speed)
+
+    Args:
+        filter_case_ids: If provided, only process samples with case_id in this list.
     """
     from src.models.patch_icl_v2.metrics import compute_per_sample_dice
 
@@ -183,6 +189,11 @@ def save_register_tokens_eval(
         # Process each sample in batch
         for i in range(images.shape[0]):
             case_id = batch_case_ids[i] if batch_case_ids else f"case{case_count:04d}"
+
+            # Filter by case_id if specified
+            if filter_case_ids is not None and case_id not in filter_case_ids:
+                continue
+
             label_id = batch_label_ids[i] if batch_label_ids else "unk"
             axis = batch_axes[i] if batch_axes else "unk"
             dice = per_sample_dice[i].item()
@@ -190,24 +201,25 @@ def save_register_tokens_eval(
             case_dir.mkdir(parents=True, exist_ok=True)
 
             # Save register tokens and patch mask percentages per level
-            for level_idx, level_out in enumerate(level_outputs):
-                register_tokens = level_out.get("register_tokens")
-                if register_tokens is not None:
-                    reg_np = register_tokens[i].cpu().numpy()  # [R, D]
-                    np.save(case_dir / f"level{level_idx}_register_tokens.npy", reg_np)
+            if save_tokens:
+                for level_idx, level_out in enumerate(level_outputs):
+                    register_tokens = level_out.get("register_tokens")
+                    if register_tokens is not None:
+                        reg_np = register_tokens[i].cpu().numpy()  # [R, D]
+                        np.save(case_dir / f"level{level_idx}_register_tokens.npy", reg_np)
 
-                # Save patch mask percentages
-                patch_labels = level_out.get("patch_labels")
-                if patch_labels is not None:
-                    # patch_labels: [B, K, 1, ps, ps] -> compute mean per patch
-                    mask_pct = patch_labels[i].mean(dim=(1, 2, 3)).cpu().numpy()  # [K]
-                    np.save(case_dir / f"level{level_idx}_patch_mask_pct.npy", mask_pct)
+                    # Save patch mask percentages
+                    patch_labels = level_out.get("patch_labels")
+                    if patch_labels is not None:
+                        # patch_labels: [B, K, 1, ps, ps] -> compute mean per patch
+                        mask_pct = patch_labels[i].mean(dim=(1, 2, 3)).cpu().numpy()  # [K]
+                        np.save(case_dir / f"level{level_idx}_patch_mask_pct.npy", mask_pct)
 
-                # Save alpha (learned level combination weight) if present
-                alpha = level_out.get("alpha")
-                if alpha is not None:
-                    alpha_val = alpha[i].cpu().numpy().item()  # [1, 1, 1] -> scalar
-                    np.save(case_dir / f"level{level_idx}_alpha.npy", alpha_val)
+                    # Save alpha (learned level combination weight) if present
+                    alpha = level_out.get("alpha")
+                    if alpha is not None:
+                        alpha_val = alpha[i].cpu().numpy().item()  # [1, 1, 1] -> scalar
+                        np.save(case_dir / f"level{level_idx}_alpha.npy", alpha_val)
 
             # Save minimal metadata
             np.savez(
@@ -218,14 +230,52 @@ def save_register_tokens_eval(
                 dice=dice,
             )
 
-            # Optionally save images (uncompressed .npy for speed)
+            # Optionally save images and patch coords (uncompressed .npy for speed)
             if save_images:
+                # Target image and masks
                 np.save(case_dir / "img.npy", images[i, 0].cpu().numpy())
                 np.save(case_dir / "gt_mask.npy", labels[i, 0].cpu().numpy())
                 final_logit = outputs.get("final_logit")
                 if final_logit is not None:
                     pred_prob = torch.sigmoid(final_logit[i, 0]).cpu().numpy()
                     np.save(case_dir / "pred_mask.npy", pred_prob)
+
+                # Context images and masks
+                if context_in is not None:
+                    np.save(case_dir / "context_imgs.npy", context_in[i].cpu().numpy())  # [k, 1, H, W]
+                if context_out is not None:
+                    np.save(case_dir / "context_masks.npy", context_out[i].cpu().numpy())  # [k, 1, H, W]
+
+                # Patch coordinates and predictions per level (for recreating visualizations)
+                for level_idx, level_out in enumerate(level_outputs):
+                    level_data = {}
+                    # Target patch coords
+                    coords = level_out.get("coords")
+                    if coords is not None:
+                        level_data["target_coords"] = coords[i].cpu().numpy()  # [K, 2]
+                    # Context patch coords
+                    ctx_coords = level_out.get("context_coords")
+                    if ctx_coords is not None:
+                        level_data["context_coords"] = ctx_coords[i].cpu().numpy()  # [K_ctx, 2]
+                    # Patch size and level resolution for box drawing
+                    level_data["patch_size"] = level_out.get("patch_size", 16)
+                    level_data["level_res"] = level_out.get("level_res", 32)
+
+                    # Level predictions
+                    level_pred = level_out.get("pred")
+                    if level_pred is not None:
+                        level_data["pred"] = torch.sigmoid(level_pred[i]).cpu().numpy()  # [1, H, W]
+                    # Context prediction (aggregated from context patches)
+                    ctx_pred = level_out.get("context_pred")
+                    if ctx_pred is not None:
+                        level_data["context_pred"] = torch.sigmoid(ctx_pred[i]).cpu().numpy()
+                    # Combined prediction (blended with previous levels)
+                    combined_pred = level_out.get("combined_pred")
+                    if combined_pred is not None:
+                        level_data["combined_pred"] = torch.sigmoid(combined_pred[i]).cpu().numpy()
+
+                    if level_data:
+                        np.savez(case_dir / f"level{level_idx}_data.npz", **level_data)
 
             case_count += 1
 
@@ -492,19 +542,35 @@ def main(cfg: DictConfig) -> None:
     else:
         save_dir = None
 
-    # Save register tokens per case (skips full validation to avoid double iteration)
+    # Save register tokens and/or raw images per case
     save_register_tokens = cfg.logging.get("save_register_tokens", False)
-    if save_register_tokens:
+    save_imgs_masks_npy = cfg.logging.get("save_imgs_masks_npy", False)
+
+    # Optional case_id filter (e.g., ["s0625", "s1357"])
+    filter_case_ids = cfg.get("filter_case_ids", None)
+    if filter_case_ids is not None:
+        filter_case_ids = list(filter_case_ids)
+        if accelerator.is_main_process:
+            print(f"Filtering to case_ids: {filter_case_ids}")
+
+    if save_register_tokens or save_imgs_masks_npy:
         if accelerator.is_main_process:
             date_str = datetime.today().strftime('%Y-%m-%d')
-            register_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}_register_tokens"
-            print(f"Saving register tokens to: {register_dir}")
-            save_register_images = cfg.logging.get("save_register_images", False)
+            suffix = "_register_tokens" if save_register_tokens else "_npy"
+            output_dir = Path(cfg.paths.ckpts.save_dir) / f"{date_str}_{run_name}{suffix}"
+            print(f"Saving outputs to: {output_dir}")
             n_cases = save_register_tokens_eval(
-                model, val_loader, device, register_dir, accelerator,
-                save_images=save_register_images,
+                model, val_loader, device, output_dir, accelerator,
+                save_images=save_imgs_masks_npy,
+                save_tokens=save_register_tokens,
+                filter_case_ids=filter_case_ids,
             )
-            print(f"Saved register tokens for {n_cases} cases")
+            what_saved = []
+            if save_register_tokens:
+                what_saved.append("register tokens")
+            if save_imgs_masks_npy:
+                what_saved.append("images/masks")
+            print(f"Saved {', '.join(what_saved)} for {n_cases} cases")
     else:
         # Full validation with detailed metrics
         val_loss, val_final_dice, val_context_dice, detailed_results = validate(
