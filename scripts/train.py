@@ -155,6 +155,67 @@ def main(cfg: DictConfig) -> None:
             max_ds_len=max_ds_len_val,
         )
 
+    elif base_dataset == "synthmorph":
+        from src.dataloaders.synthmorph_dataloader import (
+            get_synthmorph_dataloader,
+        )
+
+        synth_cfg = cfg.get("synthmorph", {})
+
+        # Support separate max_ds_len for train/val
+        max_ds_len_cfg = cfg.get("max_ds_len")
+        if isinstance(max_ds_len_cfg, dict) or OmegaConf.is_dict(max_ds_len_cfg):
+            max_ds_len_train = max_ds_len_cfg.get("train")
+            max_ds_len_val = max_ds_len_cfg.get("val")
+        else:
+            max_ds_len_train = max_ds_len_cfg
+            max_ds_len_val = max_ds_len_cfg
+
+        epoch_length_train = synth_cfg.get("epoch_length", max_ds_len_train or 10000)
+        epoch_length_val = synth_cfg.get("epoch_length_val", max_ds_len_val or 1000)
+
+        if accelerator.is_main_process:
+            print(
+                f"SynthMorph: num_tasks={synth_cfg.get('num_tasks', 1000)}, "
+                f"num_labels={synth_cfg.get('num_labels', 16)}, "
+                f"epoch_length={epoch_length_train}"
+            )
+
+        train_loader = get_synthmorph_dataloader(
+            num_tasks=synth_cfg.get("num_tasks", 1000),
+            num_labels=synth_cfg.get("num_labels", 16),
+            context_size=_get_context_size(cfg, "train"),
+            batch_size=cfg.train_batch_size,
+            image_size=_get_image_size(cfg),
+            epoch_length=epoch_length_train,
+            num_workers=cfg.training.get("num_workers", 4),
+            shuffle=True,
+            augment=augmentation_config is not None,
+            augmentation_config=augmentation_config,
+            master_seed=synth_cfg.get("master_seed", 42),
+            max_cache_size=synth_cfg.get("max_cache_size", 500),
+            sigma_range=tuple(synth_cfg.get("sigma_range", [5.0, 15.0])),
+            sigma_def=synth_cfg.get("sigma_def", 2.0),
+            sigma_smooth=synth_cfg.get("sigma_smooth", 8.0),
+        )
+        # For validation, use real data if available, else synthetic
+        val_loader = get_synthmorph_dataloader(
+            num_tasks=synth_cfg.get("num_tasks", 1000),
+            num_labels=synth_cfg.get("num_labels", 16),
+            context_size=_get_context_size(cfg, "val"),
+            batch_size=cfg.val_batch_size,
+            image_size=_get_image_size(cfg),
+            epoch_length=epoch_length_val,
+            num_workers=cfg.training.get("num_workers", 4),
+            shuffle=False,
+            augment=False,
+            master_seed=synth_cfg.get("master_seed", 42) + 1000,  # Different seed for val
+            max_cache_size=synth_cfg.get("max_cache_size", 500),
+            sigma_range=tuple(synth_cfg.get("sigma_range", [5.0, 15.0])),
+            sigma_def=synth_cfg.get("sigma_def", 2.0),
+            sigma_smooth=synth_cfg.get("sigma_smooth", 8.0),
+        )
+
     else:
         # TotalSeg2D dataloader - select based on dataloader_type config
         dataloader_type = cfg.get("dataloader_type", "fast")  # "fast", "shared", or "zopt"
