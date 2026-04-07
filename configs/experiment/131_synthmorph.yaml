@@ -1,15 +1,19 @@
 # @package _global_
-# Experiment: SynthMorph synthetic data training
+# Experiment: Mixed training (50% TotalSeg + 50% SynthMorph), val on TotalSeg
 # Based on 130_2_lvls.yaml with synthetic data generation
 
 defaults:
-  - /augmentation: custom2
+  - /augmentation: custom
   - override /method: patch_icl
 
-# Use synthetic data (or "mixed" for both)
-base_dataset: synthmorph
+# Use TotalSeg as base (for validation), mix with synthetic for training
+base_dataset: totalseg
 
-# Synthetic data configuration
+# TotalSeg label configuration
+train_label_ids: "train"
+val_label_ids: "val"
+
+# Synthetic data configuration (used for mixed training)
 synthmorph:
   num_tasks: 1000              # Number of unique anatomies
   num_labels: 16               # Regions per task
@@ -21,9 +25,9 @@ synthmorph:
   sigma_def: 2.0               # Deformation magnitude
   sigma_smooth: 8.0            # Deformation smoothness
 
-# Mixed training (when base_dataset: mixed)
+# Mixed training: 50% TotalSeg + 50% SynthMorph
 mixed_training:
-  enabled: false
+  enabled: true
   synth_ratio: 0.5             # 50% synthetic, 50% real
 
 max_ds_len:

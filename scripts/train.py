@@ -391,6 +391,47 @@ def main(cfg: DictConfig) -> None:
             )
         val_loader = get_totalseg2d_dataloader(**val_kwargs)
 
+    # Mixed training: wrap train_loader with synthetic data if enabled
+    mixed_cfg = cfg.get("mixed_training", {})
+    if mixed_cfg.get("enabled", False) and base_dataset != "synthmorph":
+        from src.dataloaders.synthmorph_dataloader import (
+            get_synthmorph_dataloader,
+            MixedDataLoader,
+        )
+
+        synth_ratio = mixed_cfg.get("synth_ratio", 0.5)
+        synth_cfg = cfg.get("synthmorph", {})
+
+        # Create synthetic dataloader with same settings
+        synth_loader = get_synthmorph_dataloader(
+            num_tasks=synth_cfg.get("num_tasks", 1000),
+            num_labels=synth_cfg.get("num_labels", 16),
+            context_size=_get_context_size(cfg, "train"),
+            batch_size=cfg.train_batch_size,
+            image_size=_get_image_size(cfg),
+            epoch_length=synth_cfg.get("epoch_length", len(train_loader)),
+            num_workers=cfg.training.get("num_workers", 4),
+            shuffle=True,
+            augment=augmentation_config is not None,
+            augmentation_config=augmentation_config,
+            master_seed=synth_cfg.get("master_seed", 42),
+            max_cache_size=synth_cfg.get("max_cache_size", 500),
+            sigma_range=tuple(synth_cfg.get("sigma_range", [5.0, 15.0])),
+            sigma_def=synth_cfg.get("sigma_def", 2.0),
+            sigma_smooth=synth_cfg.get("sigma_smooth", 8.0),
+        )
+
+        # Wrap train_loader with MixedDataLoader
+        train_loader = MixedDataLoader(
+            real_loader=train_loader,
+            synth_loader=synth_loader,
+            synth_ratio=synth_ratio,
+            seed=cfg.training.seed,
+        )
+
+        if accelerator.is_main_process:
+            print(f"Mixed training enabled: {synth_ratio:.0%} synthetic, {1-synth_ratio:.0%} real")
+
     # Model selection based on method config
 
     if method == "universeg":

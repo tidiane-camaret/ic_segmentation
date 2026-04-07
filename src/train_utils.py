@@ -770,7 +770,7 @@ def train_epoch(
             save_dir,
             epoch,
             prefix="train",
-            max_samples=len(label_samples),
+            max_samples=min(len(label_samples), 100),  # Cap to avoid overload
         )
 
     # Build result dict from all accumulated loss and metric keys
@@ -969,7 +969,7 @@ def validate(
             save_dir,
             epoch,
             prefix="val",
-            max_samples=len(label_samples),
+            max_samples=min(len(label_samples), 100),  # Cap to avoid overload
         )
 
     detailed_results = {"per_case": case_results, "per_label": label_avg_dice}
