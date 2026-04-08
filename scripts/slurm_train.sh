@@ -29,6 +29,6 @@ uv run accelerate launch \
     --multi_gpu \
     --num_processes=2 \
     scripts/train.py \
-    experiment=107_4_lvls \
+    experiment=131_synthmorph \
     cluster=dlclarge \
     #checkpoint=/work/dlclarge2/ndirt-SegFM3D/ic_segmentation/results/checkpoints/2026-02-15_alluring-ring-271/best_model.pt

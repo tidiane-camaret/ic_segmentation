@@ -3,11 +3,11 @@
 # Based on 130_2_lvls.yaml with synthetic data generation
 
 defaults:
-  - /augmentation: custom
+  - /augmentation: custom2
   - override /method: patch_icl
 
 # Use TotalSeg as base (for validation), mix with synthetic for training
-base_dataset: totalseg
+base_dataset: medsegbench
 
 # TotalSeg label configuration
 train_label_ids: "train"
@@ -36,8 +36,8 @@ max_cases:
   val: null
 
 preprocessing:
-  image_size: 128
-  feature_image_size: 128
+  image_size: 64
+  feature_image_size: "${preprocessing.image_size}"
 
 context_size:
   train: 3
@@ -48,11 +48,11 @@ model:
     model_version: "v3"
     feature_extractor:
       type: "universeg"
-      output_grid_size: "${preprocessing.feature_image_size}"
-      freeze: true
+      output_grid_size: "${preprocessing.image_size}"
+      freeze: false
 
     levels:
-      - resolution: 24
+      - resolution: "${preprocessing.image_size}"
         patch_size: 8
         sampling_method: "continuous"
         sampling_temperature: 0.1
@@ -61,17 +61,6 @@ model:
         num_context_patches: 9
         pad_before: 0
         pad_after: 0
-      - resolution: "${preprocessing.image_size}"
-        patch_size: 8
-        sampling_method: "continuous"
-        sampling_temperature: 0.1
-        stride: 8
-        num_patches: 30
-        num_context_patches: 30
-        pad_before: 0
-        pad_after: 0
-        spread_sigma_target: 4.0
-        spread_sigma_context: 4.0
 
     # Oracle disabled - pure model-based sampling
     oracle_levels_train: [false, false]
@@ -105,8 +94,8 @@ model:
       feature_grid_size: "${model.patch_icl.feature_extractor.output_grid_size}"
       patch_feature_grid_size: 8
       num_heads: 4
-      num_layers: 4
-      num_context_layers: 3
+      num_layers: 6
+      num_context_layers: 6
       num_registers: 1
       target_self_attention: true
       dropout: 0.1
@@ -130,11 +119,11 @@ model:
         args: null
       weights:
         target_patch: 0.0
-        target_aggreg: 0.0
+        target_aggreg: 1.0
         context_patch: 0.0
         context_aggreg: 0.0
-        target_combined: 1.0
-      level_weights: [0.0, 1.0]
+        target_combined: 0.0
+      level_weights: [1.0]
 
     cascade:
       detach_between_levels: false

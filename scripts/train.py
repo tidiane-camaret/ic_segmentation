@@ -44,7 +44,7 @@ def main(cfg: DictConfig) -> None:
     """Main training function."""
     # Initialize accelerator with optional mixed precision
     method = cfg.get("method", "patch_icl")
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=(method == "universeg"))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     mixed_precision = cfg.training.get(
         "mixed_precision", None
     )  # "fp16", "bf16", or None

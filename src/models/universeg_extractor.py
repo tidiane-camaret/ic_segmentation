@@ -196,7 +196,6 @@ class UniverSegExtractor(nn.Module):
 
         return captured
 
-    @torch.no_grad()
     def extract_features(
         self,
         images: torch.Tensor,
@@ -214,6 +213,17 @@ class UniverSegExtractor(nn.Module):
             features: [B, N, D] where N = output_grid_size^2,
                       D = 64 (single layer) or 64*L (multi-layer concat)
         """
+        if self._frozen:
+            with torch.no_grad():
+                return self._extract_features_impl(images, masks)
+        return self._extract_features_impl(images, masks)
+
+    def _extract_features_impl(
+        self,
+        images: torch.Tensor,
+        masks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Internal feature extraction (called with or without no_grad)."""
         was_training = self.model.training
         self.model.eval()
 
