@@ -141,7 +141,17 @@ class MedSegBenchDataset(Dataset):
 
         # Find dataset files
         # Filter by image_size suffix (e.g., abdomenus_256.npz for image_size=(256, 256))
-        size_suffix = f"_{image_size[0]}"
+        # If no files exist at requested size, fall back to next larger available size
+        requested_size = image_size[0]
+        available_sizes = sorted(set(
+            int(os.path.basename(f).rsplit("_", 1)[-1].replace(".npz", ""))
+            for f in glob.glob(os.path.join(data_root, "*.npz"))
+            if os.path.basename(f).rsplit("_", 1)[-1].replace(".npz", "").isdigit()
+        ))
+        load_size = next((s for s in available_sizes if s >= requested_size), available_sizes[-1] if available_sizes else requested_size)
+        if load_size != requested_size:
+            print(f"No datasets found at size {requested_size}, using size {load_size}")
+        size_suffix = f"_{load_size}"
         if datasets is None:
             npz_files = glob.glob(os.path.join(data_root, f"*{size_suffix}.npz"))
             datasets = [os.path.basename(f).replace(".npz", "") for f in npz_files]
