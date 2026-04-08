@@ -31,7 +31,7 @@ mixed_training:
   synth_ratio: 0.5             # 50% synthetic, 50% real
 
 max_ds_len:
-  train: 100000
+  train: 10000
 max_cases:
   val: null
 
@@ -57,8 +57,8 @@ model:
         sampling_method: "continuous"
         sampling_temperature: 0.1
         stride: 8
-        num_patches: 9
-        num_context_patches: 9
+        num_patches: 64
+        num_context_patches: 16
         pad_before: 0
         pad_after: 0
 
