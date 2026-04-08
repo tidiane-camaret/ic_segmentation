@@ -58,7 +58,7 @@ model:
         sampling_temperature: 0.1
         stride: 8
         num_patches: 64
-        num_context_patches: 16
+        num_context_patches: 64
         pad_before: 0
         pad_after: 0
 
