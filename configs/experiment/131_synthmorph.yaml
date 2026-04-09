@@ -7,7 +7,7 @@ defaults:
   - override /method: patch_icl
 
 # Use TotalSeg as base (for validation), mix with synthetic for training
-base_dataset: medsegbench
+base_dataset: totalseg
 
 # TotalSeg label configuration
 train_label_ids: "train"
@@ -36,8 +36,8 @@ max_cases:
   val: null
 
 preprocessing:
-  image_size: 64
-  feature_image_size: "${preprocessing.image_size}"
+  image_size: 128
+  feature_image_size: 64
 
 context_size:
   train: 3
@@ -48,11 +48,11 @@ model:
     model_version: "v3"
     feature_extractor:
       type: "universeg"
-      output_grid_size: "${preprocessing.image_size}"
+      output_grid_size: "${preprocessing.feature_image_size}"
       freeze: false
 
     levels:
-      - resolution: "${preprocessing.image_size}"
+      - resolution: "${preprocessing.feature_image_size}"
         patch_size: 8
         sampling_method: "continuous"
         sampling_temperature: 0.1
@@ -88,7 +88,7 @@ model:
     backbone:
       compile: false
       decoder_use_skip_connections: false
-      image_size: "${preprocessing.image_size}"
+      image_size: "${preprocessing.feature_image_size}"
       embed_dim: 256
       embed_proj_dim: 256
       feature_grid_size: "${model.patch_icl.feature_extractor.output_grid_size}"
