@@ -20,14 +20,14 @@ from scipy.ndimage import zoom
 # ---------------------------------------------------------------------------
 # Style constants – tweak these to taste
 # ---------------------------------------------------------------------------
-PRED_COLOR = "#2ecc71"  # green prediction contour + fill
+PRED_COLOR = "#8fa3fd"  # green prediction contour + fill
 PRED_ALPHA = 0.25  # fill opacity for prediction
-GT_COLOR = "#e74c3c"  # red/crimson GT contour + fill
-PATCH_COLOR = "#ffff00"  # yellow patch boxes
+GT_COLOR = "#6f56fd"  # red/crimson GT contour + fill
+PATCH_COLOR = "#ffffb2"  # yellow patch boxes
 PATCH_BG_COLOR = "black"  # shadow outline for patch boxes
 CONTOUR_LW = 1.2  # contour line width
-PATCH_LW = 1.5  # patch box line width
-PATCH_SHADOW_LW = 2.5  # shadow behind patch box
+PATCH_LW = 0.5  # patch box line width
+PATCH_SHADOW_LW = 0.5  # shadow behind patch box
 FONT_FAMILY = "DejaVu Sans"
 LABEL_FONTSIZE = 7  # row / column labels
 TITLE_FONTSIZE = 8  # example titles (structure + dice)
