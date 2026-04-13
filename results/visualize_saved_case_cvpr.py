@@ -4,8 +4,8 @@ Layout per example: 3 rows (levels) x 3 columns [Target + patches, Prediction, G
 Two examples side-by-side (success + failure) in a single figure.
 
 Usage:
-    python visualize_case_cvpr.py case_dir_win case_dir_loss -o imgs/figures/patch_selection_qualitative.pdf
-    python visualize_case_cvpr.py case_dir_single -o imgs/figures/patch_selection_single.pdf
+    python visualize_saved_case_cvpr.py case_dir_win case_dir_loss -o imgs/figures/patch_selection_qualitative.pdf
+    python visualize_saved_case_cvpr.py case_dir_single -o imgs/figures/patch_selection_single.pdf
 """
 
 import argparse
@@ -20,13 +20,13 @@ from scipy.ndimage import zoom
 # ---------------------------------------------------------------------------
 # Style constants – tweak these to taste
 # ---------------------------------------------------------------------------
-PRED_COLOR = "#8fa3fd"  # green prediction contour + fill
-PRED_ALPHA = 0.25  # fill opacity for prediction
-GT_COLOR = "#6f56fd"  # red/crimson GT contour + fill
-PATCH_COLOR = "#ffffb2"  # yellow patch boxes
+PRED_COLOR = "#b1bffd"  # green prediction contour + fill
+PRED_ALPHA = 0.5  # fill opacity for prediction
+GT_COLOR = "#fbf2a3"  # red/crimson GT contour + fill
+PATCH_COLOR = "#ffffff"  # yellow patch boxes
 PATCH_BG_COLOR = "black"  # shadow outline for patch boxes
 CONTOUR_LW = 1.2  # contour line width
-PATCH_LW = 0.5  # patch box line width
+PATCH_LW = 1.0  # patch box line width
 PATCH_SHADOW_LW = 0.5  # shadow behind patch box
 FONT_FAMILY = "DejaVu Sans"
 LABEL_FONTSIZE = 7  # row / column labels
@@ -126,8 +126,8 @@ def render_example(axes, data, max_levels=3, show_col_titles=False, example_titl
         gt_ds = downsample(gt_mask, level_res)
 
         ax_target = axes[li][0]
-        ax_pred = axes[li][1]
-        ax_gt = axes[li][2]
+        ax_gt = axes[li][1]
+        ax_pred = axes[li][2]
 
         # --- Column 1: Target + patch boxes ---
         ax_target.imshow(img_ds, cmap="gray", interpolation="none")
@@ -174,7 +174,7 @@ def render_example(axes, data, max_levels=3, show_col_titles=False, example_titl
 
     # Column titles (only on first row)
     if show_col_titles:
-        col_titles = ["Target", "Prediction", "Ground truth"]
+        col_titles = ["Target", "Ground truth", "Prediction"]
         for ci, title in enumerate(col_titles):
             axes[0][ci].set_title(title, fontsize=LABEL_FONTSIZE, fontfamily=FONT_FAMILY,
                                   pad=3)
