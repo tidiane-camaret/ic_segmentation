@@ -259,7 +259,7 @@ def main(cfg: DictConfig) -> None:
     print(f"Total cases to process: {len(tasks)}")
 
     # Process in parallel
-    n_workers = min(mp.cpu_count(), 20)
+    n_workers = min(mp.cpu_count(), 5)
     print(f"Using {n_workers} workers...")
 
     dataset_stats = {}
