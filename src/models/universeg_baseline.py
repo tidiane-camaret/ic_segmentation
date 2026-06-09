@@ -26,7 +26,7 @@ class UniverSegBaseline(nn.Module):
 
     def __init__(self, pretrained: bool = True, input_size: int = 128, freeze: bool = False):
         super().__init__()
-        sys.path.append("/work/dlclarge2/ndirt-SegFM3D/repos/UniVerseg")  # Add path to import universeg
+        sys.path.append("/home/dpxuser/repos/UniverSeg")  # Add path to import universeg
         from universeg import universeg
         self.model = universeg(pretrained=pretrained)
         self.input_size = input_size  # Configurable eval resolution (trained on 128)

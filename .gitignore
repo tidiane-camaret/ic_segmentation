@@ -29,3 +29,12 @@ results/totalseg2d_universeg_eval/
 results/profiling/trace.json
 results/artifacts/
 .claude/.nfs00000000010ad1e400001538
+results/presentation/plots/pareto.pdf
+results/presentation/dice_flops/.ipynb_checkpoints/
+results/presentation/dice_flops/*.pdf
+results/presentation/dice_flops/*.pkl
+results/presentation/*.pdf
+results/presentation/.ipynb_checkpoints/
+results/presentation/slices/*.pdf
+results/presentation/slices/*.png
+pareto_context_size.pdf

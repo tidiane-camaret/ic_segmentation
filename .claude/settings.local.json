@@ -38,7 +38,9 @@
       "Bash(pip list:*)",
       "Bash(conda list:*)",
       "WebFetch(domain:storage.googleapis.com)",
-      "WebFetch(domain:openreview.net)"
+      "WebFetch(domain:openreview.net)",
+      "Bash(/software/anaconda3/envs/tid_env/bin/python results/presentation/universeg_totalseg.py --size 256 --n-pairs 20)",
+      "Bash(/software/anaconda3/envs/tid_env/bin/python *)"
     ],
     "deny": [
       "Read(./old/**)"
