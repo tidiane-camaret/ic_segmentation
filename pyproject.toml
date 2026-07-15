@@ -26,6 +26,7 @@ dependencies = [
     "transformers>=4.57.6",
     "universeg",
     "wandb>=0.24.0",
+    "marimo>=0.23.13",
 ]
 
 [[tool.uv.index]]

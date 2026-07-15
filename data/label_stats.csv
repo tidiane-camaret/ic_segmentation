@@ -1,0 +1,118 @@
+label_id,category,occurrences,avg_volume,split
+spinal_cord,Organs (Thorax/Head/Spine),1183,15882.99661876585,train
+autochthon_left,Muscles,1133,84760.71315092675,val
+autochthon_right,Muscles,1131,84166.48187444739,val
+aorta,Vessels,1104,55447.71286231884,train
+esophagus,Organs (Abd/Pelvis),1033,8074.079380445305,val
+lung_upper_lobe_left,Organs (Thorax/Head/Spine),1024,222578.1201171875,train
+costal_cartilages,Bones (Ribs/Sternum),1017,33461.92822025566,val
+lung_lower_lobe_left,Organs (Thorax/Head/Spine),1006,198957.60536779324,train
+lung_lower_lobe_right,Organs (Thorax/Head/Spine),991,228107.64783047428,train
+inferior_vena_cava,Vessels,977,17155.522006141247,val
+sternum,Bones (Ribs/Sternum),959,14121.30031282586,val
+liver,Organs (Abd/Pelvis),939,392488.88072417467,val
+heart,Organs (Thorax/Head/Spine),924,147998.1277056277,train
+colon,Organs (Abd/Pelvis),913,155435.3033953998,val
+rib_left_6,Bones (Ribs/Sternum),909,4891.4466446644665,train
+stomach,Organs (Abd/Pelvis),905,84356.18784530387,train
+lung_upper_lobe_right,Organs (Thorax/Head/Spine),894,209568.44966442953,train
+rib_left_7,Bones (Ribs/Sternum),891,5314.369248035915,val
+rib_left_9,Bones (Ribs/Sternum),890,4431.049438202247,val
+rib_left_8,Bones (Ribs/Sternum),888,4694.040540540541,val
+vertebrae_T11,Bones (Spine),887,11791.255918827508,val
+spleen,Organs (Abd/Pelvis),886,63364.87584650113,train
+lung_middle_lobe_right,Organs (Thorax/Head/Spine),881,97875.15664018161,train
+rib_left_10,Bones (Ribs/Sternum),880,3733.434090909091,val
+vertebrae_T10,Bones (Spine),877,10747.15621436716,val
+vertebrae_T12,Bones (Spine),871,12752.2411021814,val
+rib_right_6,Bones (Ribs/Sternum),869,5047.527042577675,train
+rib_left_5,Bones (Ribs/Sternum),868,4390.672811059908,train
+rib_right_10,Bones (Ribs/Sternum),866,3778.7690531177827,val
+rib_right_11,Bones (Ribs/Sternum),866,2355.942263279446,val
+rib_right_8,Bones (Ribs/Sternum),860,5012.416279069767,val
+rib_right_9,Bones (Ribs/Sternum),860,4687.497674418604,val
+rib_left_11,Bones (Ribs/Sternum),857,2442.2835472578763,val
+rib_right_7,Bones (Ribs/Sternum),851,5555.027027027027,val
+vertebrae_T9,Bones (Spine),849,9207.590106007066,val
+iliopsoas_right,Muscles,842,51886.94536817102,val
+rib_right_5,Bones (Ribs/Sternum),840,4594.960714285714,train
+iliopsoas_left,Muscles,836,54901.77990430622,val
+portal_vein_and_splenic_vein,Vessels,830,5985.227710843374,val
+adrenal_gland_right,Organs (Abd/Pelvis),827,1048.8996372430472,train
+pancreas,Organs (Abd/Pelvis),811,17176.72009864365,train
+small_bowel,Organs (Abd/Pelvis),811,199832.49691738596,val
+scapula_left,Bones (Limbs/Shoulder/Pelvis),809,23186.943139678617,train
+rib_left_4,Bones (Ribs/Sternum),806,4145.274193548387,train
+kidney_left,Organs (Abd/Pelvis),802,35374.63216957606,val
+vertebrae_L1,Bones (Spine),801,14196.722846441948,val
+adrenal_gland_left,Organs (Abd/Pelvis),800,1199.74875,train
+vertebrae_T8,Bones (Spine),796,8195.2324120603,val
+pulmonary_vein,Vessels,793,6019.4161412358135,train
+trachea,Organs (Thorax/Head/Spine),792,9750.941919191919,train
+rib_left_12,Bones (Ribs/Sternum),790,1005.0050632911392,val
+rib_right_4,Bones (Ribs/Sternum),787,4182.161372299873,train
+scapula_right,Bones (Limbs/Shoulder/Pelvis),786,23539.212468193386,train
+rib_right_12,Bones (Ribs/Sternum),785,986.428025477707,val
+kidney_right,Organs (Abd/Pelvis),782,35655.15217391304,val
+superior_vena_cava,Vessels,777,5567.118404118404,val
+rib_left_3,Bones (Ribs/Sternum),773,3524.139715394567,train
+duodenum,Organs (Abd/Pelvis),768,13457.016927083334,val
+rib_right_3,Bones (Ribs/Sternum),766,3463.9334203655353,train
+common_carotid_artery_left,Vessels,753,1397.277556440903,train
+rib_left_2,Bones (Ribs/Sternum),752,3165.152925531915,train
+rib_right_2,Bones (Ribs/Sternum),751,3144.8002663115844,train
+subclavian_artery_left,Vessels,751,2414.596537949401,train
+vertebrae_T7,Bones (Spine),745,7671.187919463087,val
+rib_left_1,Bones (Ribs/Sternum),742,2800.495956873315,train
+vertebrae_T3,Bones (Spine),742,6304.711590296496,train
+vertebrae_T4,Bones (Spine),738,6633.334688346884,train
+rib_right_1,Bones (Ribs/Sternum),738,2818.8834688346883,train
+brachiocephalic_vein_right,Vessels,735,1745.413605442177,val
+vertebrae_T5,Bones (Spine),733,6902.763983628923,train
+vertebrae_T6,Bones (Spine),732,6981.310109289618,val
+brachiocephalic_vein_left,Vessels,731,3466.50341997264,val
+subclavian_artery_right,Vessels,731,2204.313269493844,train
+brachiocephalic_trunk,Vessels,731,1640.1928864569084,val
+clavicula_left,Bones (Limbs/Shoulder/Pelvis),727,6610.177441540578,train
+vertebrae_T2,Bones (Spine),724,6623.769337016574,train
+clavicula_right,Bones (Limbs/Shoulder/Pelvis),723,6995.015214384509,train
+common_carotid_artery_right,Vessels,721,928.2760055478502,train
+vertebrae_L2,Bones (Spine),712,15277.518258426966,val
+vertebrae_T1,Bones (Spine),704,6488.806818181818,train
+thyroid_gland,Organs (Thorax/Head/Spine),704,4103.613636363636,train
+vertebrae_C7,Bones (Spine),691,3777.7467438494937,train
+atrial_appendage_left,Organs (Thorax/Head/Spine),673,2174.74294205052,val
+gallbladder,Organs (Abd/Pelvis),655,6653.470229007634,train
+iliac_artery_left,Vessels,651,4934.239631336405,val
+hip_left,Bones (Limbs/Shoulder/Pelvis),646,96016.82043343653,train
+vertebrae_L3,Bones (Spine),645,17634.716279069766,val
+iliac_artery_right,Vessels,644,4973.79347826087,val
+hip_right,Bones (Limbs/Shoulder/Pelvis),639,96081.75899843505,train
+vertebrae_L4,Bones (Spine),636,17891.83647798742,val
+iliac_vena_left,Vessels,636,8305.033018867925,val
+iliac_vena_right,Vessels,629,6880.257551669316,val
+gluteus_medius_left,Muscles,625,63771.12,train
+vertebrae_L5,Bones (Spine),619,17854.004846526655,val
+humerus_right,Bones (Limbs/Shoulder/Pelvis),618,16550.388349514564,train
+sacrum,Bones (Spine),618,48168.145631067964,val
+humerus_left,Bones (Limbs/Shoulder/Pelvis),614,15661.965798045603,train
+gluteus_medius_right,Muscles,613,63119.30995106036,train
+vertebrae_S1,Bones (Spine),597,13758.237855946398,val
+gluteus_maximus_left,Muscles,595,131553.67058823528,train
+gluteus_maximus_right,Muscles,594,136316.2558922559,train
+gluteus_minimus_left,Muscles,578,16693.892733564015,train
+urinary_bladder,Organs (Abd/Pelvis),571,54574.21366024519,val
+gluteus_minimus_right,Muscles,569,17989.084358523727,train
+femur_left,Bones (Limbs/Shoulder/Pelvis),566,55048.32862190813,val
+femur_right,Bones (Limbs/Shoulder/Pelvis),557,54017.653500897664,val
+vertebrae_C6,Bones (Spine),556,2359.8075539568345,train
+skull,Bones (Limbs/Shoulder/Pelvis),473,81618.87949260042,val
+vertebrae_C5,Bones (Spine),349,2824.730659025788,train
+prostate,Organs (Abd/Pelvis),345,7643.373913043478,val
+vertebrae_C2,Bones (Spine),253,4588.324110671937,train
+vertebrae_C1,Bones (Spine),250,3866.256,train
+vertebrae_C4,Bones (Spine),250,3465.568,train
+brain,Organs (Thorax/Head/Spine),249,204927.8232931727,val
+vertebrae_C3,Bones (Spine),229,3623.1353711790393,train
+kidney_cyst_left,Organs (Abd/Pelvis),30,23475.466666666667,val
+kidney_cyst_right,Organs (Abd/Pelvis),25,28289.76,val
